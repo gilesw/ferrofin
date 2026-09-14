@@ -1,7 +1,8 @@
 # Ferrofin media server — example systemd unit for a bare-metal install.
 #
 # Assumes the layout described in docs/INSTALL.md:
-#   /opt/ferrofin/current/ferrofin-server   the release binary (a symlink to a versioned dir)
+#   /usr/bin/ferrofin-server                the binary (the .deb puts it here; a tarball
+#                                           install overrides ExecStart= with a drop-in)
 #   /etc/ferrofin/config.toml               configuration (docs/CONFIG.md)
 #   /var/lib/ferrofin/data                  data dir: jellyfin.db, cache/, log/, plugins/
 #   /usr/lib/jellyfin-ffmpeg/               jellyfin-ffmpeg from the Jellyfin apt repository
@@ -34,7 +35,7 @@ ExecStartPre=/usr/bin/test -r /usr/share/jellyfin/web/index.html
 Environment=FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg
 Environment=FERROFIN_FFPROBE_PATH=/usr/lib/jellyfin-ffmpeg/ffprobe
 Environment=FERROFIN_WEB_DIR=/usr/share/jellyfin/web
-ExecStart=/opt/ferrofin/current/ferrofin-server --config /etc/ferrofin/config.toml
+ExecStart=/usr/bin/ferrofin-server --config /etc/ferrofin/config.toml
 
 Restart=on-failure
 RestartSec=5

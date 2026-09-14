@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Ferrofin server binary — the composition root (port of Jellyfin.Server): config, DB, ffmpeg, wire, serve."
+description = "Ferrofin media server — a Rust implementation of the Jellyfin server speaking the same API"
 
 [lints]
 workspace = true
@@ -84,3 +84,37 @@ tracing-opentelemetry.workspace = true
 # allocator the same way, so Windows falls back to the system allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator.workspace = true
+
+# ── Debian package (cargo-deb; built by the release workflow, `cargo deb` locally) ──
+# The package is named `ferrofin`, not `ferrofin-server`, and depends on the
+# same jellyfin-ffmpeg8 + jellyfin-web the Docker image bundles — apt resolves
+# them from Jellyfin's repository (docs/INSTALL.md adds it). Depends is spelled
+# out rather than `$auto` because the aarch64 package is built --no-build from
+# a cross-compiled binary that dpkg-shlibdeps cannot inspect on the x86 runner;
+# the binary links nothing beyond libc (rustls, bundled SQLite).
+[package.metadata.deb]
+name = "ferrofin"
+maintainer = "Giles Westwood <giles.westwood@gmail.com>"
+copyright = "Ferrofin contributors; GPL-3.0-only"
+license-file = ["../../LICENSE", "0"]
+section = "video"
+priority = "optional"
+depends = "libc6 (>= 2.34), adduser, jellyfin-ffmpeg8, jellyfin-web"
+extended-description = """\
+Ferrofin is a from-scratch Rust implementation of the Jellyfin media server
+speaking the same HTTP API, so existing Jellyfin clients connect unchanged.
+It adopts an existing Jellyfin 10.11.x database in place. This package installs
+the server, a hardened systemd unit (not enabled by default), a config file at
+/etc/ferrofin/config.toml and the service user; ffmpeg and the web client come
+from the jellyfin-ffmpeg8 and jellyfin-web packages."""
+conf-files = ["/etc/ferrofin/config.toml"]
+maintainer-scripts = "../../contrib/debian"
+assets = [
+    ["target/release/ferrofin-server", "usr/bin/ferrofin-server", "755"],
+    ["../../contrib/systemd/ferrofin.service", "lib/systemd/system/ferrofin.service", "644"],
+    ["../../contrib/debian/config.toml", "etc/ferrofin/config.toml", "644"],
+    ["../../README.md", "usr/share/doc/ferrofin/README.md", "644"],
+    ["../../docs/INSTALL.md", "usr/share/doc/ferrofin/INSTALL.md", "644"],
+    ["../../docs/CONFIG.md", "usr/share/doc/ferrofin/CONFIG.md", "644"],
+    ["../../docs/UPGRADING.md", "usr/share/doc/ferrofin/UPGRADING.md", "644"],
+]

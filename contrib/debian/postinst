@@ -1,0 +1,27 @@
+#!/bin/sh
+# Ferrofin .deb postinst: create the service user and data directory, register
+# the unit. The service is deliberately NOT enabled or started — the first boot
+# logs the generated admin password once, and the operator should be watching
+# `journalctl -u ferrofin` when that happens (see INSTALL.md).
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd ferrofin >/dev/null; then
+        adduser --system --group --quiet \
+            --home /var/lib/ferrofin --no-create-home \
+            --shell /usr/sbin/nologin \
+            --gecos "Ferrofin media server" ferrofin
+    fi
+    # 0750: the database inside is nobody else's business.
+    install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # An upgrade restarts a running server so the new binary takes over.
+        if [ -n "$2" ] && systemctl is-active --quiet ferrofin.service; then
+            systemctl restart ferrofin.service >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+
+exit 0

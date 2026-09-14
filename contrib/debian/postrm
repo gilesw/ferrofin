@@ -1,0 +1,17 @@
+#!/bin/sh
+# Ferrofin .deb postrm. `remove` keeps everything the operator owns
+# (/etc/ferrofin, /var/lib/ferrofin); `purge` drops the configuration but
+# still keeps /var/lib/ferrofin — it holds the media database and the
+# pre-adoption Jellyfin backup, which no package should delete silently.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/ferrofin
+    echo "ferrofin: /var/lib/ferrofin (database, cache, logs) was left in place; remove it by hand if unwanted." >&2
+fi
+
+exit 0

@@ -213,6 +213,58 @@ jobs:
           cargo zigbuild --release -p ferrofin-server --target ${{ matrix.target }}
       - if: ${{ !matrix.cross }}
         run: cargo build --release -p ferrofin-server --target ${{ matrix.target }}
+      # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
+      # image bundles); metadata lives in apps/ferrofin-server/Cargo.toml.
+      # --no-build reuses the binary built above (zigbuild's, for aarch64);
+      # --no-strip because the runner has no aarch64 strip and the tarball ships
+      # the same binary (CARGO_PROFILE_RELEASE_DEBUG=0 keeps it small).
+      - name: build the Debian package
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        run: |
+          set -eu
+          cargo install cargo-deb --version 3.8.0 --locked
+          mkdir -p dist
+          cargo deb --no-build --no-strip -p ferrofin-server --target ${{ matrix.target }} \
+            --deb-version "${GITHUB_REF_NAME#v}" -o dist/
+          ls -l dist
+      # Install it the way a user will: Jellyfin's apt repository first, then
+      # the package, which must pull jellyfin-ffmpeg8 + jellyfin-web, create the
+      # service user, and boot against jellyfin-ffmpeg (libfdk_aac present).
+      - name: smoke-install the Debian package
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -eu
+          docker run --rm -v "$PWD/dist:/dist:ro" debian:trixie-slim bash -eu -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq ca-certificates curl gnupg >/dev/null
+            curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
+              | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg
+            echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] https://repo.jellyfin.org/debian trixie main" \
+              > /etc/apt/sources.list.d/jellyfin.list
+            apt-get update -qq
+            apt-get install -y -qq /dist/ferrofin_*.deb >/dev/null
+            dpkg -s jellyfin-ffmpeg8 >/dev/null
+            dpkg -s jellyfin-web >/dev/null
+            id ferrofin
+            test -x /usr/lib/jellyfin-ffmpeg/ffmpeg
+            test -r /usr/share/jellyfin/web/index.html
+            test -f /etc/ferrofin/config.toml
+            test -f /lib/systemd/system/ferrofin.service
+            su -s /bin/sh ferrofin -c "FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg \
+              FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
+              /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \
+              > /tmp/smoke.log 2>&1 &
+            for _ in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8096/health/live > /tmp/live.json 2>/dev/null; then break; fi
+              sleep 1
+            done
+            cat /tmp/live.json
+            curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; cat /tmp/smoke.log; exit 1; }
+            grep -Eq "libfdk_aac[=\":]+true" /tmp/smoke.log || { echo "server did not probe jellyfin-ffmpeg"; cat /tmp/smoke.log; exit 1; }
+          '
       - name: smoke-boot the binary
         if: ${{ !matrix.cross }}
         shell: bash

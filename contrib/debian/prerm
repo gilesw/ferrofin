@@ -1,0 +1,9 @@
+#!/bin/sh
+# Ferrofin .deb prerm: stop the server before its binary disappears.
+set -e
+
+if [ "$1" = "remove" ] && [ -d /run/systemd/system ]; then
+    systemctl stop ferrofin.service >/dev/null 2>&1 || true
+fi
+
+exit 0

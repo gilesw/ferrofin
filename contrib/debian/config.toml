@@ -1,0 +1,17 @@
+# Ferrofin configuration — installed by the .deb as /etc/ferrofin/config.toml
+# (a conffile: dpkg never overwrites your edits on upgrade).
+#
+# Every key is documented in /usr/share/doc/ferrofin/CONFIG.md. Environment
+# variables set in the unit (FERROFIN_FFMPEG_PATH, FERROFIN_FFPROBE_PATH,
+# FERROFIN_WEB_DIR) take precedence over values here.
+
+data_dir = "/var/lib/ferrofin/data"
+bind_addr = "0.0.0.0"
+port = 8096
+
+# Set for a headless first boot; otherwise the generated admin password is
+# logged once to the journal.
+#admin_password = ""
+
+# Public URL clients should be told to use, when behind a reverse proxy.
+#published_url = "https://media.example.org"
