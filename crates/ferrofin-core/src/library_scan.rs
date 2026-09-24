@@ -136,7 +136,6 @@ impl RemoteMetadata {
 /// every await in it (that alone puts the scan future over clippy's
 /// `large_futures` ceiling).
 struct StoredText {
-    name: Option<String>,
     overview: Option<String>,
     /// Whether the stored `name` is a real title rather than the resolver's
     /// file-stem placeholder. Computed at read time, while the row's path is
@@ -150,7 +149,6 @@ impl StoredText {
     fn from_entity(row: &BaseItemEntity) -> Self {
         Self {
             titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
-            name: row.name.clone(),
             overview: row.overview.clone(),
         }
     }
@@ -1454,8 +1452,14 @@ impl LibraryScanner {
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
+            // The providers fill a row that starts WITHOUT the resolver's
+            // path guesses (upstream's `temp` starts empty), so every value
+            // they leave on it is one they supplied. The guesses ride along
+            // as lookup info and fill only what is still empty at the end.
+            let guesses = ResolverGuesses::take(&mut entity, stored_row.row());
             let (media_info, is_audio) = probes.take(scanned).await;
             let rows = Self::apply_probe(&mut entity, media_info.as_ref(), is_audio);
+            let probe_ran = media_info.is_some();
             let tag_provider_ids = rows.provider_ids.clone();
             // Local Kodi/XBMC NFO sidecar first — this is Jellyfin's default local
             // metadata reader, which runs before any remote fetch. It fills
@@ -1463,33 +1467,23 @@ impl LibraryScanner {
             // `tvshow.nfo` / `<episode>.nfo`, and yields the credited cast/crew
             // plus the external ids the file pins.
             //
-            // OPEN WORK ITEM — the metadata CHANGE MONITOR is not ported, so this
-            // read is unconditional where upstream's is gated. C# runs the local
-            // readers only when one reports a change:
-            // `BaseNfoProvider.HasChanged` is
+            // OPEN WORK ITEM (PLAN_SCAN_CHANGE_DETECTION Phase 4) — the metadata
+            // CHANGE MONITOR is not ported, so this read is unconditional where
+            // upstream's is gated. C# runs the local readers only when one
+            // reports a change: `BaseNfoProvider.HasChanged` is
             // `nfoLastWriteTimeUtc - item.DateLastSaved > TimeSpan.FromMinutes(1)`
-            // (v10.11.8 MediaBrowser.XbmcMetadata/Providers/BaseNfoProvider.cs),
-            // and `MetadataService.GetProviders` returns an EMPTY provider list
-            // when nothing changed, so a scan over an item saved more recently
-            // than its sidecar merges nothing. Ferrofin re-derives every unlocked
-            // row from disk on every pass, which is why a library scan reverts
-            // what the Identify dialog's Apply just wrote — measured on the lab
-            // pair and recorded as the `unlocked_after_scan` red on
-            // `POST /Items/RemoteSearch/Apply/{itemId}`.
+            // (MediaBrowser.XbmcMetadata/Providers/BaseNfoProvider.cs), and
+            // `MetadataService.GetProviders` returns an EMPTY provider list when
+            // nothing changed, so a scan over an item saved more recently than
+            // its sidecar merges nothing.
             //
-            // UN-DEFER PATH (all three together, or the fix loses data — the
-            // full argument is on that row in suite/parity/classifications.json):
-            //   1. write `BaseItems.DateLastSaved` on every save
-            //      (`FerrofinItemPersistenceService::save_items` binds the column
-            //      but only ever from an entity carrying `None`). This alone
-            //      changes `Etag` (dto_service.rs hashes DateLastSaved) and the
-            //      `minDateLastSaved` query filter on every DTO, so it needs its
-            //      own batch and its own perf run;
-            //   2. gate this call and `fetch_remote_metadata` on the
-            //      sidecar-mtime-vs-DateLastSaved comparison;
-            //   3. a scan-upsert variant that PRESERVES the provider-supplied
-            //      columns when no provider ran — without it, skipping the read
-            //      wipes the very fields the gate exists to protect.
+            // The two prerequisites are in place: every update stamps
+            // `DateLastSaved`, and an existing row is saved as its stored row
+            // with this pass merged on (`merge_onto_stored`), so skipping a
+            // provider no longer wipes what it supplied. What remains is the
+            // gate itself: this call and `fetch_remote_metadata` on the
+            // sidecar-mtime-vs-`DateLastSaved` comparison and upstream's
+            // first-refresh / requires-refresh rules.
             let (mut people, nfo_ids) = if locked {
                 (Vec::new(), Vec::new())
             } else {
@@ -1516,6 +1510,7 @@ impl LibraryScanner {
                     policy,
                     stored,
                     &known_ids,
+                    &guesses,
                 ))
                 .await
             };
@@ -1531,7 +1526,6 @@ impl LibraryScanner {
             if people.is_empty() {
                 people = remote.people;
             }
-            self.apply_parental_rating_score(&mut entity);
             // Dynamic (Tier-1b WASM plugin) metadata sources run last and
             // supplement whatever the built-in chain left unfilled; the
             // helper merges their (filtered) ids with the built-ins'.
@@ -1543,8 +1537,19 @@ impl LibraryScanner {
                     tag_provider_ids,
                     locked,
                     policy,
+                    &guesses,
                 )
                 .await;
+            // An existing item is saved as its stored row with this scan's
+            // file facts and provider results merged on (upstream's Default
+            // refresh), never as the row rebuilt from disk.
+            entity = saved_row(
+                stored_row.row(),
+                &guesses,
+                &entity,
+                SaveFacts { locked, probe_ran },
+            );
+            self.apply_parental_rating_score(&mut entity);
             // A series' presentation key depends on the ids just settled;
             // its children take the settled key (see `sync_series_key`).
             let moved_series_key = self.sync_series_key(
@@ -1554,10 +1559,10 @@ impl LibraryScanner {
                 &known_ids,
                 &mut series_keys,
             );
-            // Scan-variant save: preserves `PrimaryVersionId` (merge-versions
-            // links) and the stored `DateCreated` on rows that already exist —
-            // this entity is rebuilt from disk and would otherwise reset both
-            // on every scan.
+            // Scan-variant save: its SQL guards back the merge above up for a
+            // row it could not read (and for a writer that raced this scan):
+            // `PrimaryVersionId`, the first-import `DateCreated`, the refresh
+            // dates and a locked row's metadata and `Data` are never lost.
             self.persistence
                 .save_scanned_items(std::slice::from_ref(&entity))
                 .await?;
@@ -1729,15 +1734,44 @@ impl LibraryScanner {
         all_provider_ids: Vec<(String, String)>,
         art_cache: &mut ArtworkCache,
     ) -> Result<(), ServiceError> {
-        for (key, value) in &all_provider_ids {
-            if let Err(err) = self.persistence.save_provider_id(item_id, key, value).await {
-                tracing::warn!(%err, item = %item_id, provider = key, "failed to persist provider id");
+        // `MergeBaseItemData`'s ProviderIds rule over the ids the scan
+        // pre-read for this row: a fetched id replaces the stored one (the
+        // Default scan replaces), a stored id nothing fetched is kept, and an
+        // id that cannot belong to its provider is never written — nor kept.
+        let stored = art_cache.item_provider_ids.get(&entity.id);
+        let merged = ferrofin_providers::metadata_merge::merge_provider_ids(
+            &all_provider_ids,
+            stored.map_or(&[][..], Vec::as_slice),
+            true,
+        );
+        let drops_stored = stored.is_some_and(|ids| {
+            ids.iter()
+                .any(|(k, v)| !ferrofin_providers::metadata_merge::is_valid_provider_id(k, v))
+        });
+        if drops_stored {
+            // Only an assignment removes rows; the set is complete because
+            // it started from the stored one.
+            if let Err(err) = self
+                .persistence
+                .replace_provider_ids(item_id, &merged)
+                .await
+            {
+                tracing::warn!(%err, item = %item_id, "failed to persist provider ids");
+            }
+        } else {
+            for (key, value) in all_provider_ids
+                .iter()
+                .filter(|(k, v)| ferrofin_providers::metadata_merge::is_valid_provider_id(k, v))
+            {
+                if let Err(err) = self.persistence.save_provider_id(item_id, key, value).await {
+                    tracing::warn!(%err, item = %item_id, provider = key, "failed to persist provider id");
+                }
             }
         }
-        if !all_provider_ids.is_empty() {
+        if !merged.is_empty() {
             art_cache
                 .item_provider_ids
-                .insert(entity.id.clone(), all_provider_ids);
+                .insert(entity.id.clone(), merged);
         }
         let item_values = item_values_of(entity);
         if !item_values.is_empty() {
@@ -2927,7 +2961,10 @@ impl LibraryScanner {
         };
         let source = &probed.media_source;
         entity.run_time_ticks = source.run_time_ticks.or(entity.run_time_ticks);
-        entity.size = source.size.or(entity.size);
+        // A file's stat'ed length outranks the probe's: `SaveInternal` stamps
+        // `Size = file.Length` after every provider ran. Only a directory
+        // (a disc rip, which has no length of its own) keeps the probe's.
+        entity.size = entity.size.or(source.size);
         // Both probers persist the container bitrate onto the item row
         // (`FFProbeVideoInfo.cs:216` / `AudioFileProber.cs:133`, both
         // `TotalBitrate = mediaInfo.Bitrate`). `BaseItem.GetVersionInfo` seeds
@@ -3107,9 +3144,10 @@ impl LibraryScanner {
     /// an overview (a local NFO or a prior scan), or the item isn't a movie/series.
     /// Best-effort — a network/parse failure returns no people and leaves the row.
     /// Runs every registered [`DynamicMetadataProvider`] for one item and
-    /// applies the results **supplement-only**: a field is taken only when
-    /// the entity still lacks a value, so dynamic sources can never
-    /// overwrite the built-in chain or user edits. Returns the FULL
+    /// applies the results **supplement-only within this pass**: a field is
+    /// taken only when the built-in chain left it empty. The pass's result is
+    /// then merged onto a stored row like every provider's (Default mode), so
+    /// a value a plugin supplies does replace the stored one. Returns the FULL
     /// provider-id list to persist: the built-ins' (remote + tag) followed
     /// by the sources' contributions, filtered so a plugin id can never
     /// replace a built-in one (`save_provider_id` is INSERT OR REPLACE).
@@ -3122,6 +3160,7 @@ impl LibraryScanner {
         tag_ids: Vec<(String, String)>,
         locked: bool,
         policy: FetcherPolicy<'_>,
+        lookup: &ResolverGuesses,
     ) -> Vec<(String, String)> {
         let known_ids: Vec<(String, String)> = remote_ids.iter().cloned().chain(tag_ids).collect();
         // Locked items and provider-less scans skip the pass entirely;
@@ -3146,8 +3185,8 @@ impl LibraryScanner {
                 .next()
                 .unwrap_or(&entity.type_)
                 .to_owned(),
-            name: entity.name.clone().unwrap_or_default(),
-            production_year: entity.production_year.and_then(|y| i32::try_from(y).ok()),
+            name: lookup.name(entity).unwrap_or_default(),
+            production_year: lookup.year(entity),
             path: entity.path.clone(),
             provider_ids: known_ids.clone(),
         };
@@ -3241,6 +3280,7 @@ impl LibraryScanner {
         policy: FetcherPolicy<'_>,
         stored: Option<&StoredText>,
         known_ids: &[(String, String)],
+        lookup: &ResolverGuesses,
     ) -> RemoteMetadata {
         let short = entity
             .type_
@@ -3262,7 +3302,9 @@ impl LibraryScanner {
             <= policy.metadata_rank(&short, fetcher_names::TMDB);
         if tvdb_on
             && (tvdb_first || !tmdb_on)
-            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+            && let Some(result) = self
+                .fetch_tvdb_metadata(entity, &short, cache, lookup)
+                .await
         {
             // A TVDB hit is authoritative. A miss falls through to TMDB — for
             // an episode as well as a series.
@@ -3273,14 +3315,14 @@ impl LibraryScanner {
             // Each fetcher's checkbox gates only itself: unchecking TheMovieDb
             // must not silently disable OMDb as well.
             return if omdb_on {
-                self.fetch_omdb_metadata(entity, &short, cache, policy, known_ids)
+                self.fetch_omdb_metadata(entity, &short, cache, policy, known_ids, lookup)
                     .await
             } else {
                 RemoteMetadata::default()
             };
         }
         if let Some(result) = self
-            .fetch_tmdb_metadata(entity, &short, omdb_on, cache, stored, known_ids)
+            .fetch_tmdb_metadata(entity, &short, omdb_on, cache, stored, known_ids, lookup)
             .await
         {
             return result;
@@ -3293,7 +3335,9 @@ impl LibraryScanner {
         if tvdb_on
             && matches!(short.as_str(), "Series" | "Episode")
             && !tvdb_first
-            && let Some(result) = self.fetch_tvdb_metadata(entity, &short, cache).await
+            && let Some(result) = self
+                .fetch_tvdb_metadata(entity, &short, cache, lookup)
+                .await
         {
             return result;
         }
@@ -3301,7 +3345,7 @@ impl LibraryScanner {
         // `Order = 2` (behind TMDB and TVDB, ahead of nothing).
         if omdb_on {
             return self
-                .fetch_omdb_metadata(entity, &short, cache, policy, known_ids)
+                .fetch_omdb_metadata(entity, &short, cache, policy, known_ids, lookup)
                 .await;
         }
         RemoteMetadata::default()
@@ -3413,6 +3457,7 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
         policy: FetcherPolicy<'_>,
         known_ids: &[(String, String)],
+        lookup: &ResolverGuesses,
     ) -> RemoteMetadata {
         let Some(omdb) = self.omdb.as_ref().filter(|o| o.is_enabled()) else {
             return RemoteMetadata::default();
@@ -3421,8 +3466,9 @@ impl LibraryScanner {
         if has_overview && entity.community_rating.is_some() && entity.critic_rating.is_some() {
             return RemoteMetadata::default();
         }
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-        let name = entity.name.as_deref().filter(|n| !n.is_empty());
+        let year = lookup.year(entity);
+        let name = lookup.name(entity);
+        let name = name.as_deref();
         // The id this item already carries — from its NFO sidecar, or from the
         // fetcher that ran before OMDb in this same pass.
         let own_imdb = imdb_id_in(known_ids);
@@ -3453,10 +3499,8 @@ impl LibraryScanner {
                     .and_then(|series| imdb_id_of(cache.item_provider_ids.get(series)));
                 match (
                     series_imdb,
-                    entity
-                        .parent_index_number
-                        .and_then(|n| i32::try_from(n).ok()),
-                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                    lookup.parent_index(entity),
+                    lookup.index(entity),
                 ) {
                     (Some(series), Some(season), Some(number)) => {
                         omdb.episode(&series, season, number, own_imdb.as_deref())
@@ -3504,6 +3548,9 @@ impl LibraryScanner {
     /// `Some(default)` means the item needed no fetch at all. `omdb_on`
     /// gates the OMDb (Rotten Tomatoes) supplement, which rides TMDB's
     /// IMDb id.
+    // The lookup info joined the item, its cache and its stored text; the
+    // arguments are each a separate input the TMDB arm genuinely reads.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_tmdb_metadata(
         &self,
         entity: &mut BaseItemEntity,
@@ -3512,6 +3559,7 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
         stored: Option<&StoredText>,
         known_ids: &[(String, String)],
+        lookup: &ResolverGuesses,
     ) -> Option<RemoteMetadata> {
         let tmdb = self.tmdb.as_ref()?;
         // TMDB is Jellyfin's default episode provider, and on a library
@@ -3520,14 +3568,14 @@ impl LibraryScanner {
         // reads the season response rather than `/movie|tv/{id}`, so it
         // branches before the `TmdbKind` split below.
         if short == "Episode" {
-            return self.fetch_tmdb_episode(entity, cache, stored).await;
+            return self.fetch_tmdb_episode(entity, cache, stored, lookup).await;
         }
         let kind = match short {
             "Movie" => TmdbKind::Movie,
             "Series" => TmdbKind::Series,
             _ => return None,
         };
-        let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
+        let year = lookup.year(entity);
         // Fetch when the row still lacks core metadata OR still lacks a Rotten
         // Tomatoes rating (with OMDb enabled) — the latter backfills the RT score
         // for titles scanned before OMDb was configured. A fully-enriched title is
@@ -3558,7 +3606,7 @@ impl LibraryScanner {
             // episode tree. Read the stored id back instead if either bites.
             if matches!(kind, TmdbKind::Series)
                 && !cache.series_tmdb.contains_key(&entity.id)
-                && let Some(name) = entity.name.clone().filter(|n| !n.is_empty())
+                && let Some(name) = lookup.name(entity)
                 && let Some(hit) = tmdb
                     .search(kind, &name, year, None)
                     .await
@@ -3579,7 +3627,7 @@ impl LibraryScanner {
         let tmdb_id = if let Some(id) = pinned {
             id
         } else {
-            let name = entity.name.clone().filter(|n| !n.is_empty())?;
+            let name = lookup.name(entity)?;
             tmdb.search(kind, name.as_str(), year, None)
                 .await
                 .into_iter()
@@ -3633,13 +3681,12 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
         stored: Option<&StoredText>,
+        lookup: &ResolverGuesses,
     ) -> Option<RemoteMetadata> {
         let (Some(series_id), Some(season), Some(number)) = (
             entity.series_id.clone(),
-            entity
-                .parent_index_number
-                .and_then(|n| i32::try_from(n).ok()),
-            entity.index_number.and_then(|n| i32::try_from(n).ok()),
+            lookup.parent_index(entity),
+            lookup.index(entity),
         ) else {
             return None;
         };
@@ -3649,38 +3696,17 @@ impl LibraryScanner {
         // would never fire — every episode would re-request its credits on
         // every nightly scan.
         //
-        // Skipping also has to carry the stored values forward. The scan upsert
-        // writes `excluded` for unlocked rows, so returning here without them
-        // would overwrite a good title with the placeholder — one scan during a
-        // TMDB outage would revert the whole library to filenames.
-        //
-        // An NFO wins either way: `apply_nfo` already ran and moved the name
-        // off the stem, which is what the placeholder check reads.
+        // Skipping carries nothing forward by hand: the scan saves an existing
+        // episode as its stored row with this pass's results merged on
+        // (`merge_onto_stored`), so the stored title, synopsis, air date,
+        // year and rating all stand when no provider ran.
         //
         // ponytail: an episode TMDB has a title but no overview for never
         // satisfies this gate, so it re-fetches its credits every scan (the
         // season response itself is cached, so that half is free). Same
         // unbounded-refetch shape as the trailers backfill above. Store a
         // "checked" marker if it ever costs real time.
-        if let Some(stored) = stored.filter(|s| s.is_complete()) {
-            if name_is_file_stem_placeholder(entity) {
-                // Recomputed from the stored title, not copied from the stored
-                // key: a key derived by an older algorithm would otherwise
-                // survive every rescan and sort next to freshly derived ones
-                // (the play queue reads this). `BaseItem.SortName` prefers a
-                // `ForcedSortName` when the item has one, so this does too.
-                entity.name.clone_from(&stored.name);
-                entity.sort_name = match entity.forced_sort_name.as_deref() {
-                    Some(forced) => Some(forced_sort_name(entity, forced)),
-                    None => stored
-                        .name
-                        .as_deref()
-                        .map(|name| derived_sort_name(entity, name)),
-                };
-            }
-            if entity.overview.is_none() {
-                entity.overview.clone_from(&stored.overview);
-            }
+        if stored.is_some_and(StoredText::is_complete) {
             return Some(RemoteMetadata::default());
         }
         let ep = self
@@ -3815,13 +3841,14 @@ impl LibraryScanner {
         entity: &mut BaseItemEntity,
         short: &str,
         cache: &mut ArtworkCache,
+        lookup: &ResolverGuesses,
     ) -> Option<RemoteMetadata> {
         let tvdb = self.tvdb.as_ref()?;
         match short {
             "Series" => {
-                let name = entity.name.as_deref().filter(|n| !n.is_empty())?;
-                let year = entity.production_year.and_then(|y| i32::try_from(y).ok());
-                let hit = pick_series_hit(tvdb.search(name, year).await, year)?;
+                let name = lookup.name(entity)?;
+                let year = lookup.year(entity);
+                let hit = pick_series_hit(tvdb.search(&name, year).await, year)?;
                 let details = tvdb.series_details(hit.tvdb_id, METADATA_COUNTRY).await?;
                 apply_tvdb_series(entity, &details);
                 let people = tvdb_people(&details.people);
@@ -3844,10 +3871,8 @@ impl LibraryScanner {
             "Episode" => {
                 let (Some(series_id), Some(season), Some(number)) = (
                     entity.series_id.clone(),
-                    entity
-                        .parent_index_number
-                        .and_then(|n| i32::try_from(n).ok()),
-                    entity.index_number.and_then(|n| i32::try_from(n).ok()),
+                    lookup.parent_index(entity),
+                    lookup.index(entity),
                 ) else {
                     return None;
                 };
@@ -4899,16 +4924,30 @@ impl LibraryScanner {
     ) -> Option<(Uuid, BaseItemEntity)> {
         let id = item_type_lookup::derive_item_id_with(&self.id_derivation, kind, path)?;
         let sort_name = create_sort_name(&name);
-        // One stat per file feeds both dates (a second `getattr` round-trip
-        // per item adds up on an NFS-backed library); `std::fs::metadata`
-        // follows symlinks, matching upstream's `LinkTarget` resolution. A
-        // path that cannot be stat'ed at all is stamped with the scan time
-        // (upstream's `dateCreated == MinValue` guard). A folder is never
-        // stat'ed for its dates at all (see below).
+        // One stat per path feeds the dates and the size (a second
+        // `getattr` round-trip per item adds up on an NFS-backed library);
+        // `std::fs::metadata` follows symlinks, matching upstream's
+        // `LinkTarget` resolution. A path that cannot be stat'ed at all is
+        // stamped with the scan time (upstream's `dateCreated == MinValue`
+        // guard) and carries no `DateModified`/`Size`, so a save keeps the
+        // stored ones.
+        let meta = std::fs::metadata(path).ok();
+        // A FILE's `Size` is its length on every save (`MetadataService.
+        // SaveInternal`, `if (!file.IsDirectory) item.Size = file.Length`); a
+        // directory has none.
+        let size = meta
+            .as_ref()
+            .filter(|m| !m.is_dir())
+            .and_then(|m| i64::try_from(m.len()).ok());
+        // Every save stamps `DateModified` with the path's mtime
+        // (`SaveInternal`: `item.DateModified = file.LastWriteTimeUtc`) — for
+        // a folder too (owner decision D3), which is what lets a folder whose
+        // directory changed be told apart from one that did not.
+        let mtime = meta.as_ref().map(|m| FileTimes::of(m).mtime);
         let times = if is_folder {
             None
         } else {
-            std::fs::metadata(path).ok().map(|m| FileTimes::of(&m))
+            meta.as_ref().map(FileTimes::of)
         };
         let entity = BaseItemEntity {
             id: guid_to_db(id),
@@ -4930,14 +4969,16 @@ impl LibraryScanner {
             // so every folder item (Series, Season, MusicAlbum, PhotoAlbum, a
             // disc-rip Movie whose path is the directory) resolves with
             // `MinValue` dates → `DateCreated = DateTime.UtcNow` at FIRST
-            // resolve and `DateModified` unset (stored NULL). The scan upsert's
-            // `coalesce("DateCreated", excluded."DateCreated")` is what keeps
-            // that first-resolve stamp stable across rescans.
+            // resolve. The scan upsert's `coalesce("DateCreated",
+            // excluded."DateCreated")` is what keeps that first-resolve stamp
+            // stable across rescans. Its `DateModified` is the directory's
+            // mtime, which `SaveInternal` stamps on every save (D3).
             date_created: Some(match &times {
                 Some(times) => creation_time_from(times).into(),
                 None => Utc::now(),
             }),
-            date_modified: times.map(|t| t.mtime.into()),
+            date_modified: mtime.map(Into::into),
+            size,
             ..BaseItemEntity::default()
         };
         Some((id, entity))
@@ -5938,8 +5979,10 @@ impl LibraryScanner {
                 continue;
             };
             entity.media_type = Some("Audio".to_owned());
-            // A placeholder the probe's ALBUM tag replaces (see
-            // `apply_audio_metadata`); kept for tagless files.
+            // The album folder's name, for the scan's legacy carve-out only
+            // (`ResolverGuesses::folder_album`): it is taken off before any
+            // provider runs and never saved — a tagless track's `Album`
+            // stays empty, as upstream's does.
             entity.album = Some(album_name.clone());
             out.push(Planned {
                 id,
@@ -6402,14 +6445,15 @@ fn apply_book(entity: &mut BaseItemEntity, book: &ferrofin_providers::BookMetada
     }
     // An OPF's `file-as` / `calibre:title_sort` is C#'s `ForcedSortName`: it is
     // the whole point of a Calibre library's "Tolkien, J.R.R." ordering, and
-    // outranks the name-derived sort key set just above.
+    // the saved sort key is derived from it (`settle_sort_name`).
     if let Some(sort) = book
         .sort_name
         .as_deref()
         .map(str::trim)
         .filter(|n| !n.is_empty())
     {
-        entity.sort_name = Some(sort.to_owned());
+        entity.forced_sort_name = Some(sort.to_owned());
+        entity.sort_name = Some(forced_sort_name(entity, sort));
     }
     if entity.original_title.is_none() {
         entity.original_title.clone_from(&book.original_title);
@@ -6725,15 +6769,30 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     // The NFO `<title>` is authoritative for the display name: Jellyfin's local
     // metadata provider overwrites the resolver's folder/file-derived name with
     // it, so a `Movie 0001 (2020)/` folder resolves to the NFO's clean
-    // `Movie 0001` (not the raw, year-bearing folder name). The derived sort name
-    // follows — an explicit NFO `<sortname>` wins, else it is recomputed from the
-    // new title (otherwise SortName keeps the stale folder-derived value).
+    // `Movie 0001` (not the raw, year-bearing folder name). The sort key is
+    // derived from the saved name last (`settle_sort_name`).
     if let Some(title) = n.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         entity.name = Some(title.to_owned());
-        entity.sort_name = n
-            .sort_name
-            .clone()
-            .or_else(|| Some(derived_sort_name(entity, title)));
+    }
+    // `<sorttitle>` is `ForcedSortName` (`BaseNfoParser.cs:297-298`). A
+    // `<sortname>` sets upstream's `SortName` cache, which the refresh
+    // discards (`MergeBaseItemData` copies only `ForcedSortName`), so it
+    // persists nothing.
+    if let Some(forced) = n
+        .forced_sort_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        entity.forced_sort_name = Some(forced.to_owned());
+    }
+    // `<episode>`/`<season>` (`EpisodeNfoParser`, `SeasonNfoParser`): the
+    // numbers the user pinned outrank the ones read off the file name.
+    if entity.index_number.is_none() {
+        entity.index_number = n.index_number.map(i64::from);
+    }
+    if entity.parent_index_number.is_none() {
+        entity.parent_index_number = n.parent_index_number.map(i64::from);
     }
     if entity.overview.is_none() {
         entity.overview.clone_from(&n.overview);
@@ -6833,6 +6892,343 @@ fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'stati
 fn apply_series_status(entity: &mut BaseItemEntity, status: &str) {
     if let Some(data) = crate::item_data::fill_series_status(entity.data.as_deref(), status) {
         entity.data = Some(data);
+    }
+}
+
+/// What the resolver read off an item's path: its name, year, episode or
+/// track numbers, a track's album (the folder name), a book's series (its
+/// parent folder) and the resolver's `DateCreated` stamp.
+///
+/// Upstream never lets a guess compete with a provider: the provider result
+/// (`temp` in `RefreshWithProviders`, `MetadataService.cs:790-795`) starts
+/// empty, and the path's name and episode numbers only fill what the item
+/// still lacks (`BaseItem.BeforeMetadataRefresh`,
+/// `LibraryManager.FillMissingEpisodeNumbersFromPath`). So the scan takes
+/// them off the planned row before any provider runs: every value left on
+/// the row afterwards is one a provider supplied, even when it equals the
+/// guess. The fetchers search by them ([`name`](Self::name) and friends)
+/// and [`fill`](Self::fill) puts them back where nothing else did.
+///
+/// For an item already stored, the name, year and episode/track numbers the
+/// fetchers search by are the STORED ones, the path's only where the row has
+/// none: upstream's lookup info is built from the item, and
+/// `FillMissingEpisodeNumbersFromPath` (`LibraryManager.cs:3366-3375`) only
+/// fills a number the item lacks. An episode edited to S02E01 in a file
+/// named S01E03 is looked up, and saved, as S02E01.
+#[derive(Debug, Clone, Default)]
+struct ResolverGuesses {
+    name: Option<String>,
+    production_year: Option<i64>,
+    index_number: Option<i64>,
+    parent_index_number: Option<i64>,
+    /// A track's album folder name. Never persisted and never filled back:
+    /// upstream never sets `Audio.Album` from the path, so a tagless track's
+    /// `Album` stays empty. Only the legacy carve-out in
+    /// [`keep_stored_audio_tags`] reads it.
+    folder_album: Option<String>,
+    series_name: Option<String>,
+    date_created: Option<chrono::DateTime<Utc>>,
+}
+
+impl ResolverGuesses {
+    /// Moves the guesses off `entity`, and drops the sort key the planner
+    /// derived from them (the saved row's is derived at the end, see
+    /// [`settle_sort_name`]). A book's series name is a guess; an episode's
+    /// or season's is its parent series, which stays. `stored`'s name, year
+    /// and numbers take the guesses' place where it has them.
+    fn take(entity: &mut BaseItemEntity, stored: Option<&BaseItemEntity>) -> Self {
+        entity.sort_name = None;
+        let name = entity.name.take();
+        let production_year = entity.production_year.take();
+        let index_number = entity.index_number.take();
+        let parent_index_number = entity.parent_index_number.take();
+        Self {
+            name: stored
+                .and_then(|s| s.name.clone())
+                .filter(|n| !n.is_empty())
+                .or(name),
+            production_year: stored.and_then(|s| s.production_year).or(production_year),
+            index_number: stored.and_then(|s| s.index_number).or(index_number),
+            parent_index_number: stored
+                .and_then(|s| s.parent_index_number)
+                .or(parent_index_number),
+            folder_album: entity.album.take(),
+            series_name: if entity.type_.ends_with(".Book") {
+                entity.series_name.take()
+            } else {
+                None
+            },
+            date_created: entity.date_created.take(),
+        }
+    }
+
+    /// Fills what `row` still lacks from the guesses.
+    fn fill(&self, row: &mut BaseItemEntity) {
+        if row.name.as_deref().is_none_or(str::is_empty) {
+            row.name.clone_from(&self.name);
+        }
+        if row.series_name.as_deref().is_none_or(str::is_empty) && self.series_name.is_some() {
+            row.series_name.clone_from(&self.series_name);
+        }
+        for (value, guess) in [
+            (&mut row.production_year, self.production_year),
+            (&mut row.index_number, self.index_number),
+            (&mut row.parent_index_number, self.parent_index_number),
+        ] {
+            if value.is_none() {
+                *value = guess;
+            }
+        }
+        // `ResolverHelper.EnsureDates`.
+        if row.date_created.is_none() {
+            row.date_created = self.date_created;
+        }
+    }
+
+    /// The name a fetcher searches by: a provider's, else the stored row's,
+    /// else the path's.
+    fn name(&self, entity: &BaseItemEntity) -> Option<String> {
+        entity
+            .name
+            .clone()
+            .or_else(|| self.name.clone())
+            .filter(|n| !n.is_empty())
+    }
+
+    /// The year a fetcher searches by.
+    fn year(&self, entity: &BaseItemEntity) -> Option<i32> {
+        entity
+            .production_year
+            .or(self.production_year)
+            .and_then(|y| i32::try_from(y).ok())
+    }
+
+    /// The episode/track number a fetcher looks up.
+    fn index(&self, entity: &BaseItemEntity) -> Option<i32> {
+        entity
+            .index_number
+            .or(self.index_number)
+            .and_then(|n| i32::try_from(n).ok())
+    }
+
+    /// The season/disc number a fetcher looks up.
+    fn parent_index(&self, entity: &BaseItemEntity) -> Option<i32> {
+        entity
+            .parent_index_number
+            .or(self.parent_index_number)
+            .and_then(|n| i32::try_from(n).ok())
+    }
+}
+
+/// The per-item facts [`saved_row`] needs besides the rows.
+#[derive(Clone, Copy)]
+struct SaveFacts {
+    /// The item is locked: no provider ran and no merge happens.
+    locked: bool,
+    /// A probe ran, so its measurements are this file's.
+    probe_ran: bool,
+}
+
+/// The row a scanned item is saved as. A new item (or one whose stored row
+/// could not be read) is the pipeline's row with the resolver's guesses
+/// filling its gaps; an existing one is [`merge_onto_stored`]. Either way
+/// the sort key is settled last, from the saved name.
+fn saved_row(
+    stored: Option<&BaseItemEntity>,
+    guesses: &ResolverGuesses,
+    scanned: &BaseItemEntity,
+    facts: SaveFacts,
+) -> BaseItemEntity {
+    let mut row = match stored {
+        Some(stored) => {
+            let mut row = merge_onto_stored(stored, scanned, facts.locked, facts.probe_ran);
+            keep_stored_audio_tags(&mut row, stored, guesses.folder_album.as_deref());
+            row
+        }
+        None => scanned.clone(),
+    };
+    guesses.fill(&mut row);
+    settle_sort_name(&mut row);
+    row
+}
+
+/// `AudioFileProber` on a stored track, in the Default mode every scan runs
+/// in. Upstream's prober writes the tags straight onto the stored item, and
+/// only the title and year replace what it holds (`AudioFileProber.cs:370-396`).
+/// Everything else the tags carry only fills a gap:
+///
+/// - `Artists`, `AlbumArtists` — "if null or empty" (`:342-365`);
+/// - `Album ??=`, `IndexNumber ??=`, `ParentIndexNumber ??=` (`:381-386`);
+/// - `Genres` — if null, empty, or all blank (`:410-426`);
+/// - an audiobook's `Overview` — if empty — and `Studios` (its publisher) —
+///   if null or empty (`:431-455`).
+///
+/// The merge replaced them with the tag values, so a stored value is put back
+/// here.
+///
+/// Legacy-data carve-out: scans before this change saved a tagless track's
+/// album folder name (`folder_album`: the folder holding it, or the one above
+/// a `CD1`-style disc folder) as its `Album`, which upstream never does. For
+/// the fill decision only, a stored `Album` equal to that name counts as
+/// empty, so a real ALBUM tag fills it; without a tag it stays as stored. No
+/// row is rewritten otherwise.
+///
+/// TODO(Phase 5, `PLAN_SCAN_CHANGE_DETECTION`): in `ReplaceAllMetadata` mode
+/// upstream REPLACES all of these with the tags, so this step must become
+/// mode-aware when the refresh modes reach the scan.
+fn keep_stored_audio_tags(
+    row: &mut BaseItemEntity,
+    stored: &BaseItemEntity,
+    folder_album: Option<&str>,
+) {
+    let kind = item_type_lookup::kind_from_type_name(&row.type_);
+    if !matches!(kind, Some(BaseItemKind::Audio | BaseItemKind::AudioBook)) {
+        return;
+    }
+    let present = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+    if stored
+        .album
+        .as_deref()
+        .is_some_and(|a| !a.is_empty() && Some(a) != folder_album)
+    {
+        row.album.clone_from(&stored.album);
+    }
+    if stored.index_number.is_some() {
+        row.index_number = stored.index_number;
+    }
+    if stored.parent_index_number.is_some() {
+        row.parent_index_number = stored.parent_index_number;
+    }
+    for (value, kept) in [
+        (&mut row.artists, &stored.artists),
+        (&mut row.album_artists, &stored.album_artists),
+    ] {
+        if present(kept.as_deref()) {
+            value.clone_from(kept);
+        }
+    }
+    if stored
+        .genres
+        .as_deref()
+        .is_some_and(|g| g.split('|').any(|v| !v.trim().is_empty()))
+    {
+        row.genres.clone_from(&stored.genres);
+    }
+    if kind == Some(BaseItemKind::AudioBook) {
+        if present(stored.overview.as_deref()) {
+            row.overview.clone_from(&stored.overview);
+        }
+        if present(stored.studios.as_deref()) {
+            row.studios.clone_from(&stored.studios);
+        }
+    }
+}
+
+/// The row an already-stored item is saved as: the stored row, with this
+/// scan's file facts and provider results merged onto it — upstream's
+/// refresh of a stored item in the Default mode every scan runs in.
+///
+/// `scanned` is the item as the pipeline built it: the planner's row without
+/// its [`ResolverGuesses`], with the probe, the NFO, the remote fetchers and
+/// the embedded readers applied. It plays upstream's provider result (`temp`
+/// in `RefreshWithProviders`, `MetadataService.cs:790-915`), so the merge is
+/// upstream's two calls: stored values fill what no provider returned, then
+/// the result replaces the stored row. A locked row skips the merge entirely
+/// (`if (item.IsLocked) return refreshResult;`) and takes only the file
+/// facts.
+fn merge_onto_stored(
+    stored: &BaseItemEntity,
+    scanned: &BaseItemEntity,
+    locked: bool,
+    probe_ran: bool,
+) -> BaseItemEntity {
+    use ferrofin_providers::metadata_merge::{MetadataResult, merge_data};
+    let mut row = stored.clone();
+    if !locked {
+        let mut temp = MetadataResult::of(scanned.clone());
+        // "Add existing metadata to provider result if it does not exist
+        // there" (`MergeData(metadata, temp, [], false, false)`).
+        merge_data(
+            &MetadataResult::of(stored.clone()),
+            &mut temp,
+            &[],
+            false,
+            false,
+        );
+        // `shouldReplace` for "Scan for new and updated files" (Default,
+        // no `ReplaceAllMetadata`). `LockedFields` arrive with Phase 3L.
+        let mut target = MetadataResult::of(row);
+        merge_data(&temp, &mut target, &[], true, true);
+        row = target.item;
+    }
+    overlay_file_facts(&mut row, scanned, probe_ran);
+    row
+}
+
+/// `BaseItem.SortName` as upstream saves it (`BaseItem.cs:540-561`,
+/// `AfterMetadataRefresh` resetting the cache): the `ForcedSortName`'s key
+/// when there is one, else the per-kind `CreateSortName` of the saved name —
+/// derived last, so an episode's or track's key embeds its final numbers.
+/// Upstream persists no other explicit sort key.
+fn settle_sort_name(row: &mut BaseItemEntity) {
+    if let Some(forced) = row.forced_sort_name.clone().filter(|f| !f.is_empty()) {
+        row.sort_name = Some(forced_sort_name(row, &forced));
+    } else if let Some(name) = row.name.clone() {
+        row.sort_name = Some(derived_sort_name(row, &name));
+    }
+}
+
+/// Lays what this scan read off the filesystem over the saved row: the
+/// planner's structure (`UpdateFromResolvedItem`, and the parent links a
+/// move changes) and the stat, plus what a probe that ran measured.
+///
+/// Planner-owned: `Path`, the parent/top-parent/owner links, the
+/// series/season links and names (a `Book`'s series name is a provider
+/// field, see [`ResolverGuesses`]), `IsFolder`, `IsInMixedFolder`,
+/// `MediaType`, `IsMovie`, `ExtraType` and the series presentation key a
+/// child inherits. `Data.VideoType` travels in the merged blob. Stat-owned
+/// (`SaveInternal`): `DateModified` (files and folders) and `Size` (files).
+/// Probe-owned: `RunTimeTicks` of a playable kind, `TotalBitrate` and the
+/// video `Width`/`Height` (a photo's come from its EXIF reader).
+fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_ran: bool) {
+    row.id.clone_from(&scanned.id);
+    row.type_.clone_from(&scanned.type_);
+    row.path.clone_from(&scanned.path);
+    row.parent_id.clone_from(&scanned.parent_id);
+    row.top_parent_id.clone_from(&scanned.top_parent_id);
+    row.owner_id.clone_from(&scanned.owner_id);
+    row.extra_type = scanned.extra_type;
+    row.is_folder = scanned.is_folder;
+    row.is_in_mixed_folder = scanned.is_in_mixed_folder;
+    row.is_movie = scanned.is_movie;
+    row.media_type.clone_from(&scanned.media_type);
+    row.series_id.clone_from(&scanned.series_id);
+    row.season_id.clone_from(&scanned.season_id);
+    row.season_name.clone_from(&scanned.season_name);
+    if !scanned.type_.ends_with(".Book") {
+        row.series_name.clone_from(&scanned.series_name);
+    }
+    if scanned.series_presentation_unique_key.is_some() {
+        row.series_presentation_unique_key
+            .clone_from(&scanned.series_presentation_unique_key);
+    }
+    if scanned.date_modified.is_some() {
+        row.date_modified = scanned.date_modified;
+    }
+    if scanned.size.is_some() {
+        row.size = scanned.size;
+    }
+    for (value, measured) in [
+        (&mut row.width, scanned.width),
+        (&mut row.height, scanned.height),
+        (&mut row.total_bitrate, scanned.total_bitrate),
+    ] {
+        if measured.is_some() {
+            *value = measured;
+        }
+    }
+    if probe_ran && scanned.run_time_ticks.is_some() {
+        row.run_time_ticks = scanned.run_time_ticks;
     }
 }
 
@@ -7222,19 +7618,11 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     {
         entity.name = Some(title.to_owned());
     }
-    // The ALBUM tag replaces the plan's folder-stem placeholder (upstream's
-    // `audio.Album ??= trackAlbum` works on a null the resolver left; here the
-    // placeholder marks "no real value yet" so tagless files keep the folder
-    // name). An NFO/edited album — no longer equal to the folder stem — wins.
-    let album_is_placeholder = match (entity.album.as_deref(), entity.path.as_deref()) {
-        (Some(album), Some(path)) => std::path::Path::new(path)
-            .parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .is_some_and(|dir| album == file_stem(&dir)),
-        (None, _) => true,
-        _ => false,
-    };
-    if album_is_placeholder
+    // `audio.Album ??= trackAlbum`. The scan takes the planner's folder name
+    // off the row first (`ResolverGuesses`), so only a tag sets it; a tagless
+    // track keeps no album. What a stored row keeps is
+    // `keep_stored_audio_tags`'s rule.
+    if entity.album.as_deref().is_none_or(str::is_empty)
         && let Some(album) = info
             .album
             .as_deref()
@@ -7270,19 +7658,10 @@ fn apply_audio_metadata(entity: &mut BaseItemEntity, info: &MediaInfo) -> Vec<(S
     if entity.premiere_date.is_none() {
         entity.premiere_date = info.premiere_date;
     }
-    // The sort key is recomputed LAST, because `Audio.CreateSortName` reads the
-    // disc/track numbers this pass just filled in
-    // (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`). Deriving it
-    // earlier — as the resolver's `base_item` does for every row — leaves a
-    // track sorting by the alphanumeric name key, which puts it in a different
-    // place than Jellyfin puts it in every album and every search-hint page.
-    // A `ForcedSortName` (an NFO `<sortname>`) still wins, as `BaseItem.SortName`
-    // does.
-    if entity.forced_sort_name.is_none()
-        && let Some(name) = entity.name.clone()
-    {
-        entity.sort_name = Some(derived_sort_name(entity, &name));
-    }
+    // No sort key here: `Audio.CreateSortName` reads the final disc/track
+    // numbers (`{ParentIndexNumber:0000 - }{IndexNumber:0000 - }Name`), which
+    // for a stored track may be its own rather than the tags', so the scan
+    // derives it last (`settle_sort_name`, upstream's `AfterMetadataRefresh`).
     info.provider_ids
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -8020,10 +8399,11 @@ mod tests {
     }
 
     /// `ResolverHelper.SetDateCreated` + the `ManagedFileSystem` directory
-    /// quirk: a FILE row carries its creation time and mtime; a FOLDER row is
-    /// stamped with the resolve time and no `DateModified` (upstream only
-    /// fills the dates for a `FileInfo`, so directories resolve with
-    /// `MinValue` → `UtcNow`).
+    /// quirk: a FILE row carries its creation time, mtime and length; a
+    /// FOLDER row is stamped with the resolve time (upstream only fills the
+    /// dates for a `FileInfo`, so directories resolve with `MinValue` →
+    /// `UtcNow`) and, per owner decision D3, its directory's mtime as
+    /// `DateModified` (`SaveInternal` stamps it on every save).
     #[tokio::test]
     async fn base_item_stamps_folders_with_now_and_files_with_file_times() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8073,7 +8453,12 @@ mod tests {
             created > chrono::DateTime::<chrono::Utc>::from(past),
             "not the directory's own timestamp"
         );
-        assert_eq!(folder.date_modified, None, "a folder has no DateModified");
+        assert_eq!(
+            folder.date_modified,
+            Some(chrono::DateTime::<chrono::Utc>::from(past)),
+            "a folder's DateModified is its directory's mtime (D3, `SaveInternal`)"
+        );
+        assert_eq!(folder.size, None, "a directory has no Size");
 
         let (_, episode) = scanner
             .base_item(
@@ -8100,6 +8485,7 @@ mod tests {
             )),
             "a file's DateModified is its mtime"
         );
+        assert_eq!(episode.size, Some(1), "a file's Size is its length");
 
         // A path that cannot be stat'ed is stamped with the scan time —
         // upstream's `MinValue → UtcNow` guard.
@@ -9723,8 +10109,11 @@ mod tests {
         assert_eq!(pre.album.as_deref(), Some("Existing"));
 
         // The TITLE tag replaces the resolver's file-stem name, and the ALBUM
-        // tag replaces the plan's folder-stem placeholder (the reported music
-        // bug: every track/album displayed release-folder noise).
+        // tag fills the album (the reported music bug: every track/album
+        // displayed release-folder noise). The planner's album-folder name on
+        // this fixture never reaches the tags: `ResolverGuesses::take` empties
+        // `album` first, exactly as the scan does, and the path only locates
+        // that folder.
         info.media_source.name = Some("Scar Tissue".into());
         let mut tagged = BaseItemEntity {
             name: Some("03. Red Hot Chili Peppers - Scar Tissue".into()),
@@ -9735,6 +10124,7 @@ mod tests {
             ),
             ..Default::default()
         };
+        let _guesses = super::ResolverGuesses::take(&mut tagged, None);
         super::apply_audio_metadata(&mut tagged, &info);
         assert_eq!(tagged.name.as_deref(), Some("Scar Tissue"));
         assert_eq!(tagged.album.as_deref(), Some("Kind of Blue"));
@@ -10115,7 +10505,12 @@ mod tests {
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
         let result = scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("applied");
         assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
@@ -10158,7 +10553,12 @@ mod tests {
         episode.index_number = Some(2);
 
         scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("applied");
         assert_eq!(episode.name.as_deref(), Some("The Kingsroad"));
@@ -10188,7 +10588,12 @@ mod tests {
         );
 
         scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("resolves through TVDB's Tmdb id");
         assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
@@ -10205,7 +10610,12 @@ mod tests {
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
         let result = scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("applied");
 
@@ -10291,7 +10701,12 @@ mod tests {
         episode.name = Some("A Title From The NFO".into());
 
         scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("applied");
         assert_eq!(episode.name.as_deref(), Some("A Title From The NFO"));
@@ -10313,8 +10728,22 @@ mod tests {
         ep2.path = Some("/tv/GoT/Season 1/GoT.S01E02.1080p.Bluray.mkv".into());
         ep2.index_number = Some(2);
 
-        scanner.fetch_tmdb_episode(&mut ep1, &mut cache, None).await;
-        scanner.fetch_tmdb_episode(&mut ep2, &mut cache, None).await;
+        scanner
+            .fetch_tmdb_episode(
+                &mut ep1,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
+            .await;
+        scanner
+            .fetch_tmdb_episode(
+                &mut ep2,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
+            .await;
         // The image pass asks for the same season.
         let poster = scanner
             .season_details_cached(&mut cache, "SERIES", 1)
@@ -10327,73 +10756,900 @@ mod tests {
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// The scan's save for one item, as the loop runs it: the resolver's
+    /// guesses come off the planned row, `pipeline` plays the providers, and
+    /// `saved_row` builds what is written.
+    fn save_as(
+        stored: Option<&BaseItemEntity>,
+        planned: &BaseItemEntity,
+        pipeline: impl FnOnce(&mut BaseItemEntity, &super::ResolverGuesses),
+        locked: bool,
+        probe_ran: bool,
+    ) -> BaseItemEntity {
+        let mut scanned = planned.clone();
+        let guesses = super::ResolverGuesses::take(&mut scanned, stored);
+        pipeline(&mut scanned, &guesses);
+        super::saved_row(
+            stored,
+            &guesses,
+            &scanned,
+            super::SaveFacts { locked, probe_ran },
+        )
+    }
+
+    fn planned_movie() -> BaseItemEntity {
+        use chrono::TimeZone as _;
+        let at = |y| chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap();
+        BaseItemEntity {
+            id: "ID".into(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            name: Some("Heat".into()),
+            sort_name: Some("heat".into()),
+            production_year: Some(1995),
+            path: Some("/m/Heat (1995)/Heat (1995).mkv".into()),
+            parent_id: Some("NEW-PARENT".into()),
+            date_created: Some(at(2026)),
+            date_modified: Some(at(2025)),
+            size: Some(42),
+            data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    fn planned_episode(number: i64) -> BaseItemEntity {
+        BaseItemEntity {
+            id: "EP".into(),
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+            name: Some(format!("Show S01E{number:02}")),
+            path: Some(format!("/tv/Show/Season 01/Show S01E{number:02}.mkv")),
+            series_id: Some("SERIES".into()),
+            parent_index_number: Some(1),
+            index_number: Some(number),
+            ..BaseItemEntity::default()
+        }
+    }
+
+    /// `saved_row` field by field: resolver guesses never replace a stored
+    /// value but fill a missing one, provider values replace, file facts
+    /// always overlay, and a locked row takes only the file facts.
+    #[test]
+    fn saved_row_layers_file_facts_and_providers_over_the_stored_row() {
+        use chrono::TimeZone as _;
+        let at = |y| chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap();
+        let planned = planned_movie();
+        let stored = BaseItemEntity {
+            name: Some("Heat (Director's Cut)".into()),
+            sort_name: Some("heat (director's cut)".into()),
+            production_year: Some(1996),
+            overview: Some("Stored overview".into()),
+            tagline: Some("Stored tagline".into()),
+            parent_id: Some("OLD-PARENT".into()),
+            date_created: Some(at(2020)),
+            date_modified: Some(at(2021)),
+            date_last_refreshed: Some(at(2022)),
+            size: Some(7),
+            run_time_ticks: Some(100),
+            data: Some(r#"{"RemoteTrailers":[{"Url":"u"}],"VideoType":"Iso"}"#.into()),
+            ..planned.clone()
+        };
+        // A provider replaced the tagline; nothing else ran.
+        let provider = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            e.tagline = Some("Provider tagline".into());
+        };
+
+        let saved = save_as(Some(&stored), &planned, provider, false, false);
+        assert_eq!(
+            saved.name.as_deref(),
+            Some("Heat (Director's Cut)"),
+            "a resolver guess never wins"
+        );
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some("heat (directors cut)"),
+            "derived from the kept name"
+        );
+        assert_eq!(saved.production_year, Some(1996));
+        assert_eq!(saved.overview.as_deref(), Some("Stored overview"));
+        assert_eq!(
+            saved.tagline.as_deref(),
+            Some("Provider tagline"),
+            "a provider wins"
+        );
+        assert_eq!(
+            saved.parent_id.as_deref(),
+            Some("NEW-PARENT"),
+            "structure is the planner's"
+        );
+        assert_eq!(saved.date_created, Some(at(2020)), "first import stands");
+        assert_eq!(saved.date_modified, Some(at(2025)), "the stat's mtime");
+        assert_eq!(saved.size, Some(42), "the stat's length");
+        assert_eq!(saved.date_last_refreshed, Some(at(2022)));
+        assert_eq!(saved.run_time_ticks, Some(100), "no probe ran");
+        let data = crate::item_data::parse_data(saved.data.as_deref());
+        assert_eq!(data["VideoType"], "VideoFile", "the resolver's VideoType");
+        assert!(data.contains_key("RemoteTrailers"), "a stored key survives");
+
+        // A probe that ran measures the runtime.
+        let probed = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            e.run_time_ticks = Some(200);
+        };
+        let saved = save_as(Some(&stored), &planned, probed, false, true);
+        assert_eq!(saved.run_time_ticks, Some(200));
+
+        // A locked row runs no merge: the provider's tagline never lands, and
+        // its Data is the stored blob; the file facts still do.
+        let saved = save_as(Some(&stored), &planned, provider, true, false);
+        assert_eq!(saved.tagline.as_deref(), Some("Stored tagline"));
+        assert_eq!(saved.data, stored.data);
+        assert_eq!(saved.size, Some(42));
+        assert_eq!(saved.parent_id.as_deref(), Some("NEW-PARENT"));
+
+        // A new item is the pipeline's row with the guesses filling it.
+        let saved = save_as(None, &planned, provider, false, false);
+        assert_eq!(saved.name.as_deref(), Some("Heat"));
+        assert_eq!(saved.sort_name.as_deref(), Some("heat"));
+        assert_eq!(saved.production_year, Some(1995));
+        assert_eq!(saved.date_created, Some(at(2026)));
+    }
+
+    /// Review regression (a): a provider value that happens to equal the
+    /// path's guess is still the provider's. An NFO `<title>Heat</title>`
+    /// replaces a stale stored name from an old wrong match, although the
+    /// file is also called "Heat".
+    #[test]
+    fn a_provider_value_equal_to_the_guess_still_replaces_the_stored_one() {
+        let stored = BaseItemEntity {
+            name: Some("Heat Wave".into()),
+            sort_name: Some("heat wave".into()),
+            ..planned_movie()
+        };
+        let nfo = ferrofin_providers::xbmc::item::NfoBaseItem {
+            name: Some("Heat".into()),
+            ..ferrofin_providers::xbmc::item::NfoBaseItem::default()
+        };
+        let saved = save_as(
+            Some(&stored),
+            &planned_movie(),
+            |e, _| super::apply_nfo(e, &nfo),
+            false,
+            false,
+        );
+        assert_eq!(saved.name.as_deref(), Some("Heat"));
+        assert_eq!(saved.sort_name.as_deref(), Some("heat"));
+    }
+
+    /// Review regression (b): a corrected NFO `<episode>` that matches the
+    /// `S01E03` in the file name replaces the stored number a bad NFO left,
+    /// and the play-queue sort key follows it.
+    #[test]
+    fn a_corrected_nfo_episode_number_equal_to_the_path_replaces_the_stored_one() {
+        let planned = planned_episode(3);
+        let stored = BaseItemEntity {
+            name: Some("The Wrong One".into()),
+            index_number: Some(5),
+            ..planned.clone()
+        };
+        let nfo = ferrofin_providers::xbmc::item::NfoBaseItem {
+            name: Some("The Right One".into()),
+            index_number: Some(3),
+            parent_index_number: Some(1),
+            ..ferrofin_providers::xbmc::item::NfoBaseItem::default()
+        };
+        let saved = save_as(
+            Some(&stored),
+            &planned,
+            |e, _| super::apply_nfo(e, &nfo),
+            false,
+            false,
+        );
+        assert_eq!(saved.index_number, Some(3));
+        assert_eq!(saved.name.as_deref(), Some("The Right One"));
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some("001 - 0003 - The Right One")
+        );
+    }
+
+    /// A guess still fills what the stored row lacks when no provider
+    /// supplied it — and never replaces what it holds.
+    #[test]
+    fn a_guess_fills_only_an_empty_stored_field() {
+        let planned = planned_episode(3);
+        let stored = BaseItemEntity {
+            name: None,
+            index_number: None,
+            parent_index_number: Some(2),
+            ..planned.clone()
+        };
+        let saved = save_as(Some(&stored), &planned, |_, _| {}, false, false);
+        assert_eq!(
+            saved.name.as_deref(),
+            Some("Show S01E03"),
+            "an empty name takes the path's"
+        );
+        assert_eq!(
+            saved.index_number,
+            Some(3),
+            "an empty number takes the path's"
+        );
+        assert_eq!(saved.parent_index_number, Some(2), "a stored number stands");
+        assert_eq!(saved.sort_name.as_deref(), Some("002 - 0003 - Show S01E03"));
+    }
+
+    /// Review finding: `BaseItem.SortName` always prefers `ForcedSortName`. A
+    /// stored row's forced key survives a scan whose pipeline carries none,
+    /// even when the name did not change.
+    #[test]
+    fn a_stored_forced_sort_name_wins_over_the_derived_key() {
+        let planned = planned_movie();
+        let stored = BaseItemEntity {
+            forced_sort_name: Some("Heat 1995".into()),
+            sort_name: Some("heat 0000001995".into()),
+            ..planned.clone()
+        };
+        let saved = save_as(Some(&stored), &planned, |_, _| {}, false, false);
+        assert_eq!(saved.name.as_deref(), Some("Heat"));
+        assert_eq!(saved.forced_sort_name.as_deref(), Some("Heat 1995"));
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some(super::forced_sort_name(&saved, "Heat 1995").as_str())
+        );
+        assert_ne!(saved.sort_name.as_deref(), Some("heat"));
+    }
+
+    /// The planned rows and provider inputs of the new-item equivalence
+    /// cases, as the planner and readers produce them.
+    mod equivalence_fixtures {
+        use chrono::TimeZone as _;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::media_info::MediaInfo;
+
+        pub fn at(y: i32) -> chrono::DateTime<chrono::Utc> {
+            chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap()
+        }
+
+        pub fn episode() -> BaseItemEntity {
+            BaseItemEntity {
+                id: "EP".into(),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                name: Some("Show S01E01".into()),
+                sort_name: Some("001 - 0001 - Show S01E01".into()),
+                path: Some("/tv/Show/Season 01/Show S01E01.mkv".into()),
+                parent_id: Some("SEASON".into()),
+                top_parent_id: Some("CF".into()),
+                media_type: Some("Video".into()),
+                parent_index_number: Some(1),
+                index_number: Some(1),
+                series_id: Some("SERIES".into()),
+                series_name: Some("Show".into()),
+                season_id: Some("SEASON".into()),
+                season_name: Some("Season 1".into()),
+                date_created: Some(at(2020)),
+                date_modified: Some(at(2021)),
+                size: Some(10),
+                data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
+                ..BaseItemEntity::default()
+            }
+        }
+
+        pub fn episode_nfo() -> ferrofin_providers::xbmc::item::NfoBaseItem {
+            ferrofin_providers::xbmc::item::NfoBaseItem {
+                name: Some("Pilot".into()),
+                overview: Some("The first one.".into()),
+                ..ferrofin_providers::xbmc::item::NfoBaseItem::default()
+            }
+        }
+
+        pub fn season() -> BaseItemEntity {
+            BaseItemEntity {
+                id: "SEASON".into(),
+                type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                name: Some("Season 1".into()),
+                sort_name: Some("0001".into()),
+                path: Some("/tv/Show/Season 01".into()),
+                parent_id: Some("SERIES".into()),
+                top_parent_id: Some("CF".into()),
+                is_folder: true,
+                index_number: Some(1),
+                series_id: Some("SERIES".into()),
+                series_name: Some("Show".into()),
+                date_created: Some(at(2020)),
+                date_modified: Some(at(2021)),
+                ..BaseItemEntity::default()
+            }
+        }
+
+        pub fn track() -> BaseItemEntity {
+            BaseItemEntity {
+                id: "TRACK".into(),
+                type_: "MediaBrowser.Controller.Entities.Audio.Audio".into(),
+                name: Some("01 - Song".into()),
+                sort_name: Some(super::super::create_sort_name("01 - Song")),
+                path: Some("/music/Artist/Album/01 - Song.mp3".into()),
+                parent_id: Some("ALBUM".into()),
+                top_parent_id: Some("CF".into()),
+                media_type: Some("Audio".into()),
+                album: Some("Album".into()),
+                date_created: Some(at(2020)),
+                date_modified: Some(at(2021)),
+                size: Some(10),
+                ..BaseItemEntity::default()
+            }
+        }
+
+        pub fn track_tags() -> MediaInfo {
+            let mut info = MediaInfo {
+                album: Some("Album Tag".into()),
+                artists: vec!["Artist".into()],
+                album_artists: vec!["Artist".into()],
+                genres: vec!["Rock".into()],
+                index_number: Some(1),
+                parent_index_number: Some(1),
+                production_year: Some(2001),
+                ..MediaInfo::default()
+            };
+            info.media_source.name = Some("Song".into());
+            info.media_source.run_time_ticks = Some(1_800_000_000);
+            info
+        }
+
+        pub fn book() -> BaseItemEntity {
+            BaseItemEntity {
+                id: "BOOK".into(),
+                type_: "MediaBrowser.Controller.Entities.Book".into(),
+                name: Some("The Hobbit".into()),
+                sort_name: Some(super::super::create_sort_name("The Hobbit")),
+                path: Some("/books/Tolkien/The Hobbit.epub".into()),
+                parent_id: Some("CF".into()),
+                top_parent_id: Some("CF".into()),
+                media_type: Some("Book".into()),
+                series_name: Some("Tolkien".into()),
+                date_created: Some(at(2020)),
+                date_modified: Some(at(2021)),
+                size: Some(10),
+                ..BaseItemEntity::default()
+            }
+        }
+
+        pub fn book_metadata() -> ferrofin_providers::BookMetadata {
+            ferrofin_providers::BookMetadata {
+                name: Some("The Hobbit".into()),
+                sort_name: Some("Hobbit, The".into()),
+                index_number: Some(2),
+                production_year: Some(1937),
+                series_name: Some("Middle-earth".into()),
+                overview: Some("There and back again.".into()),
+                ..ferrofin_providers::BookMetadata::default()
+            }
+        }
+    }
+    /// A brand-new item through the new pipeline: guesses off, the readers
+    /// applied, `saved_row` with no stored row.
+    fn save_new(
+        planned: &BaseItemEntity,
+        pipeline: impl FnOnce(&mut BaseItemEntity),
+        probe_ran: bool,
+    ) -> BaseItemEntity {
+        save_as(None, planned, |e, _| pipeline(e), false, probe_ran)
+    }
+
+    // New-item equivalence: a brand-new row is identical to what the scan
+    // wrote before the stored-row merge (the expected rows were produced by
+    // running the same fixtures through the pre-change appliers at
+    // bfa15170), except for the deliberate sort-key changes pinned below.
+    #[test]
+    fn a_new_episode_with_an_nfo_title_saves_as_before() {
+        use equivalence_fixtures as f;
+        let saved = save_new(
+            &f::episode(),
+            |e| super::apply_nfo(e, &f::episode_nfo()),
+            false,
+        );
+        let before = BaseItemEntity {
+            name: Some("Pilot".into()),
+            overview: Some("The first one.".into()),
+            sort_name: Some("001 - 0001 - Pilot".into()),
+            ..f::episode()
+        };
+        assert_eq!(saved, before);
+    }
+
+    #[test]
+    fn a_new_season_saves_as_before() {
+        use equivalence_fixtures as f;
+        assert_eq!(save_new(&f::season(), |_| {}, false), f::season());
+    }
+
+    #[test]
+    fn a_new_probed_track_saves_as_before() {
+        use equivalence_fixtures as f;
+        let saved = save_new(
+            &f::track(),
+            |e| {
+                super::LibraryScanner::apply_probe(e, Some(&f::track_tags()), true);
+            },
+            true,
+        );
+        let before = BaseItemEntity {
+            album: Some("Album Tag".into()),
+            album_artists: Some("Artist".into()),
+            artists: Some("Artist".into()),
+            genres: Some("Rock".into()),
+            index_number: Some(1),
+            parent_index_number: Some(1),
+            name: Some("Song".into()),
+            production_year: Some(2001),
+            run_time_ticks: Some(1_800_000_000),
+            sort_name: Some("0001 - 0001 - Song".into()),
+            ..f::track()
+        };
+        assert_eq!(saved, before);
+    }
+
+    /// The two deliberate changes for a new track without tags (owner
+    /// decision: match Jellyfin):
+    /// - its sort key was the planner's generic `create_sort_name(stem)`
+    ///   ("0000000001  song"); it is now `Audio.CreateSortName` of the stem,
+    ///   the per-kind key upstream saves and every probed track already got;
+    /// - its `Album` was the album folder's name ("Album"); it is now empty,
+    ///   as upstream never sets `Audio.Album` from the path. The album the
+    ///   track belongs to is still its parent row (the DTO's `AlbumId`).
+    #[test]
+    fn a_new_unprobed_track_saves_as_before_but_for_its_album_and_sort_key() {
+        use equivalence_fixtures as f;
+        let saved = save_new(&f::track(), |_| {}, false);
+        assert_eq!(f::track().sort_name.as_deref(), Some("0000000001  song"));
+        assert_eq!(f::track().album.as_deref(), Some("Album"));
+        let before = BaseItemEntity {
+            sort_name: Some(super::audio_sort_name(None, None, "01 - Song")),
+            album: None,
+            ..f::track()
+        };
+        assert_eq!(saved, before);
+    }
+
+    /// A book's OPF `file-as` is its `ForcedSortName` now (upstream saves no
+    /// other explicit sort key), so the row carries it and derives its key
+    /// from it; everything else is as before.
+    #[test]
+    fn a_new_book_saves_as_before_but_for_its_forced_sort_name() {
+        use equivalence_fixtures as f;
+        let saved = save_new(
+            &f::book(),
+            |e| super::apply_book(e, &f::book_metadata()),
+            false,
+        );
+        let mut before = BaseItemEntity {
+            index_number: Some(2),
+            overview: Some("There and back again.".into()),
+            production_year: Some(1937),
+            series_name: Some("Middle-earth".into()),
+            // Before: `sort_name: Some("Hobbit, The")`, no forced key.
+            forced_sort_name: Some("Hobbit, The".into()),
+            ..f::book()
+        };
+        before.sort_name = Some(super::forced_sort_name(&before, "Hobbit, The"));
+        assert_eq!(saved, before);
+    }
+
+    // ── Round-2 review ────────────────────────────────────────────────
+
+    /// The fetchers look an item up by its STORED numbers, the path's only
+    /// where it has none (`FillMissingEpisodeNumbersFromPath`): an episode
+    /// edited to S02E01 in a file named S01E03 fetches, and saves, S02E01's
+    /// metadata — never S01E03's under S02.
+    #[tokio::test]
+    async fn an_edited_episode_is_looked_up_by_its_stored_numbers() {
+        let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, _) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let planned = planned_episode(3);
+        let stored = BaseItemEntity {
+            name: Some("Old title".into()),
+            parent_index_number: Some(2),
+            index_number: Some(1),
+            ..planned.clone()
+        };
+        let mut episode = planned.clone();
+        let guesses = super::ResolverGuesses::take(&mut episode, Some(&stored));
+        assert_eq!(guesses.parent_index(&episode), Some(2));
+        assert_eq!(guesses.index(&episode), Some(1));
+        scanner
+            .fetch_tmdb_episode(&mut episode, &mut cache, None, &guesses)
+            .await
+            .expect("episode 1 of the season response");
+        let saved = super::saved_row(
+            Some(&stored),
+            &guesses,
+            &episode,
+            super::SaveFacts {
+                locked: false,
+                probe_ran: false,
+            },
+        );
+        // The season response's episode 1 (the path's episode 3 is not in it).
+        assert_eq!(saved.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(saved.overview.as_deref(), Some("Ned is summoned south."));
+        assert_eq!(
+            (saved.parent_index_number, saved.index_number),
+            (Some(2), Some(1))
+        );
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some("002 - 0001 - Winter Is Coming")
+        );
+    }
+
+    /// A new item has no stored numbers: the path's are the lookup.
+    #[test]
+    fn a_new_item_is_looked_up_by_its_path() {
+        let mut episode = planned_episode(3);
+        let guesses = super::ResolverGuesses::take(&mut episode, None);
+        assert_eq!(guesses.index(&episode), Some(3));
+        assert_eq!(guesses.name(&episode).as_deref(), Some("Show S01E03"));
+        episode.index_number = Some(4);
+        assert_eq!(
+            guesses.index(&episode),
+            Some(4),
+            "a provider's number leads"
+        );
+    }
+
+    fn tags() -> ferrofin_model::media_info::MediaInfo {
+        let mut info = equivalence_fixtures::track_tags();
+        info.album = Some("Tag Album".into());
+        info.index_number = Some(3);
+        info.parent_index_number = Some(2);
+        info.production_year = Some(2010);
+        info.media_source.name = Some("Tag Title".into());
+        info
+    }
+
+    /// `AudioFileProber` on a stored track (Default): the title and year tags
+    /// replace; the album, track and disc tags only fill what the track lacks.
+    #[test]
+    fn a_stored_tracks_album_and_numbers_are_only_filled_by_its_tags() {
+        let planned = equivalence_fixtures::track();
+        let stored = BaseItemEntity {
+            name: Some("Old title".into()),
+            album: Some("Stored Album".into()),
+            index_number: Some(7),
+            parent_index_number: Some(1),
+            production_year: Some(2000),
+            ..planned.clone()
+        };
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        let saved = save_as(Some(&stored), &planned, probe, false, true);
+        assert_eq!(
+            saved.name.as_deref(),
+            Some("Tag Title"),
+            "the title replaces"
+        );
+        assert_eq!(saved.production_year, Some(2010), "the year replaces");
+        assert_eq!(saved.album.as_deref(), Some("Stored Album"), "Album ??=");
+        assert_eq!(saved.index_number, Some(7), "IndexNumber ??=");
+        assert_eq!(saved.parent_index_number, Some(1), "ParentIndexNumber ??=");
+        assert_eq!(saved.sort_name.as_deref(), Some("0001 - 0007 - Tag Title"));
+
+        // What the stored track lacks, the tags fill.
+        let bare = BaseItemEntity {
+            album: None,
+            index_number: None,
+            parent_index_number: None,
+            ..stored
+        };
+        let saved = save_as(Some(&bare), &planned, probe, false, true);
+        assert_eq!(saved.album.as_deref(), Some("Tag Album"));
+        assert_eq!(
+            (saved.parent_index_number, saved.index_number),
+            (Some(2), Some(3))
+        );
+    }
+
+    /// A multi-disc track (`Album/CD1/01 - Song.mp3`) as the planner plans
+    /// it: its folder album is the album folder above the disc folder.
+    fn planned_disc_track() -> BaseItemEntity {
+        BaseItemEntity {
+            path: Some("/music/Artist/Album/CD1/01 - Song.mp3".into()),
+            ..equivalence_fixtures::track()
+        }
+    }
+
+    /// Legacy data: a scan before this change saved a tagless track's album
+    /// folder name as its `Album`. A later scan that reads an ALBUM tag
+    /// replaces it — flat and multi-disc — because that name counts as empty
+    /// for `Album ??=`; without a tag it stays as stored.
+    #[test]
+    fn a_legacy_folder_name_album_is_replaced_by_a_later_album_tag() {
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        for planned in [equivalence_fixtures::track(), planned_disc_track()] {
+            let legacy = BaseItemEntity {
+                album: Some("Album".into()),
+                ..planned.clone()
+            };
+            let tagged = save_as(Some(&legacy), &planned, probe, false, true);
+            assert_eq!(
+                tagged.album.as_deref(),
+                Some("Tag Album"),
+                "{:?}",
+                planned.path
+            );
+            let untagged = save_as(Some(&legacy), &planned, |_, _| {}, false, false);
+            assert_eq!(untagged.album.as_deref(), Some("Album"), "left as stored");
+        }
+    }
+
+    /// A new tagless track saves no `Album`; a later tag fills it.
+    #[test]
+    fn a_new_tagless_track_saves_no_album() {
+        let planned = equivalence_fixtures::track();
+        let first = save_as(None, &planned, |_, _| {}, false, false);
+        assert_eq!(first.album, None);
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        let second = save_as(Some(&first), &planned, probe, false, true);
+        assert_eq!(second.album.as_deref(), Some("Tag Album"));
+    }
+
+    /// A user's album that differs from the folder name is never replaced
+    /// by a tag (`Album ??=`).
+    #[test]
+    fn a_user_album_that_differs_from_the_folder_is_never_replaced() {
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        for planned in [equivalence_fixtures::track(), planned_disc_track()] {
+            let edited = BaseItemEntity {
+                album: Some("My Mixtape".into()),
+                ..planned.clone()
+            };
+            let saved = save_as(Some(&edited), &planned, probe, false, true);
+            assert_eq!(saved.album.as_deref(), Some("My Mixtape"));
+        }
+    }
+
+    /// The rest of the prober's fill-only rule on a stored track: edited
+    /// artists, album artists and genres survive a rescan whose tags differ;
+    /// empty ones take the tags.
+    #[test]
+    fn a_stored_tracks_artists_and_genres_are_only_filled_by_its_tags() {
+        let planned = equivalence_fixtures::track();
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        let edited = BaseItemEntity {
+            artists: Some("Edited Artist".into()),
+            album_artists: Some("Edited Album Artist".into()),
+            genres: Some("Jazz".into()),
+            ..planned.clone()
+        };
+        let saved = save_as(Some(&edited), &planned, probe, false, true);
+        assert_eq!(saved.artists.as_deref(), Some("Edited Artist"));
+        assert_eq!(saved.album_artists.as_deref(), Some("Edited Album Artist"));
+        assert_eq!(saved.genres.as_deref(), Some("Jazz"));
+
+        let empty = BaseItemEntity {
+            artists: None,
+            album_artists: Some(String::new()),
+            genres: Some(" | ".into()),
+            ..planned.clone()
+        };
+        let saved = save_as(Some(&empty), &planned, probe, false, true);
+        assert_eq!(saved.artists.as_deref(), Some("Artist"));
+        assert_eq!(saved.album_artists.as_deref(), Some("Artist"));
+        assert_eq!(
+            saved.genres.as_deref(),
+            Some("Rock"),
+            "an all-blank list is empty"
+        );
+    }
+
+    /// An audiobook's stored overview and studios are only filled, never
+    /// replaced (`AudioFileProber.cs:431-455`); a plain track's are merged
+    /// like any provider's.
+    #[test]
+    fn a_stored_audiobooks_overview_and_studios_are_only_filled() {
+        let planned = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.AudioBook".into(),
+            ..equivalence_fixtures::track()
+        };
+        let stored = BaseItemEntity {
+            overview: Some("Edited blurb".into()),
+            studios: Some("Edited House".into()),
+            ..planned.clone()
+        };
+        let provider = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            e.overview = Some("Tag comment".into());
+            e.studios = Some("Tag Publisher".into());
+        };
+        let saved = save_as(Some(&stored), &planned, provider, false, false);
+        assert_eq!(saved.overview.as_deref(), Some("Edited blurb"));
+        assert_eq!(saved.studios.as_deref(), Some("Edited House"));
+        let bare = BaseItemEntity {
+            overview: None,
+            studios: None,
+            ..stored
+        };
+        let saved = save_as(Some(&bare), &planned, provider, false, false);
+        assert_eq!(saved.overview.as_deref(), Some("Tag comment"));
+        assert_eq!(saved.studios.as_deref(), Some("Tag Publisher"));
+
+        // A plain track is not an audiobook: its overview merges normally.
+        let track = equivalence_fixtures::track();
+        let stored = BaseItemEntity {
+            overview: Some("Edited blurb".into()),
+            ..track.clone()
+        };
+        let saved = save_as(Some(&stored), &track, provider, false, false);
+        assert_eq!(saved.overview.as_deref(), Some("Tag comment"));
+    }
+
+    /// A new track takes every tag, and its sort key embeds the tag numbers.
+    #[test]
+    fn a_new_track_takes_its_tags() {
+        let probe = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            super::LibraryScanner::apply_probe(e, Some(&tags()), true);
+        };
+        let saved = save_as(None, &equivalence_fixtures::track(), probe, false, true);
+        assert_eq!(saved.album.as_deref(), Some("Tag Album"));
+        assert_eq!(
+            (saved.parent_index_number, saved.index_number),
+            (Some(2), Some(3))
+        );
+        assert_eq!(saved.sort_name.as_deref(), Some("0002 - 0003 - Tag Title"));
+    }
+
+    /// NFO `<sorttitle>` is `ForcedSortName` (`BaseNfoParser.cs:297-298`), and
+    /// `<sortname>` persists nothing: the saved key is the forced one's, else
+    /// the name's.
+    #[test]
+    fn nfo_sort_tags_map_like_upstream() {
+        use equivalence_fixtures as f;
+        let nfo = ferrofin_providers::xbmc::item::NfoBaseItem {
+            name: Some("Pilot".into()),
+            sort_name: Some("zzz explicit".into()),
+            forced_sort_name: Some("Pilot 01".into()),
+            ..ferrofin_providers::xbmc::item::NfoBaseItem::default()
+        };
+        let saved = save_new(&f::episode(), |e| super::apply_nfo(e, &nfo), false);
+        assert_eq!(saved.forced_sort_name.as_deref(), Some("Pilot 01"));
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some(super::forced_sort_name(&saved, "Pilot 01").as_str())
+        );
+        let only_sortname = ferrofin_providers::xbmc::item::NfoBaseItem {
+            forced_sort_name: None,
+            ..nfo
+        };
+        let saved = save_new(
+            &f::episode(),
+            |e| super::apply_nfo(e, &only_sortname),
+            false,
+        );
+        assert_eq!(saved.forced_sort_name, None);
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some("001 - 0001 - Pilot"),
+            "<sortname> is dropped"
+        );
+    }
+
+    /// A book's OPF `file-as` lands as its `ForcedSortName` on a stored row
+    /// too, and the saved key follows it.
+    #[test]
+    fn a_books_file_as_is_its_forced_sort_name() {
+        use equivalence_fixtures as f;
+        let stored = BaseItemEntity {
+            sort_name: Some("hobbit".into()),
+            ..f::book()
+        };
+        let saved = save_as(
+            Some(&stored),
+            &f::book(),
+            |e, _| super::apply_book(e, &f::book_metadata()),
+            false,
+            false,
+        );
+        assert_eq!(saved.forced_sort_name.as_deref(), Some("Hobbit, The"));
+        assert_eq!(
+            saved.sort_name.as_deref(),
+            Some(super::forced_sort_name(&saved, "Hobbit, The").as_str())
+        );
+    }
+
+    /// The stored row an earlier scan left for the fixture episode.
+    fn titled_episode_row(planned: &BaseItemEntity, sort_name: &str) -> BaseItemEntity {
+        use chrono::TimeZone as _;
+        BaseItemEntity {
+            name: Some("Winter Is Coming".into()),
+            sort_name: Some(sort_name.into()),
+            overview: Some("Ned is summoned south.".into()),
+            premiere_date: Some(chrono::Utc.with_ymd_and_hms(2011, 4, 17, 0, 0, 0).unwrap()),
+            production_year: Some(2011),
+            community_rating: Some(8.1),
+            ..planned.clone()
+        }
+    }
+
+    /// Runs the TMDB episode fetcher on the fixture episode the way the scan
+    /// does (guesses off, passed as lookup info) and saves it over `row`.
+    async fn rescan_episode(
+        scanner: &LibraryScanner,
+        cache: &mut super::ArtworkCache,
+        mut episode: BaseItemEntity,
+        row: &BaseItemEntity,
+    ) -> BaseItemEntity {
+        let guesses = super::ResolverGuesses::take(&mut episode, Some(row));
+        let stored = super::StoredText::from_entity(row);
+        scanner
+            .fetch_tmdb_episode(&mut episode, cache, Some(&stored), &guesses)
+            .await
+            .expect("nothing to do");
+        super::saved_row(
+            Some(row),
+            &guesses,
+            &episode,
+            super::SaveFacts {
+                locked: false,
+                probe_ran: false,
+            },
+        )
+    }
+
     // Re-scan gate. It has to read the STORED row: the planned entity is
     // rebuilt from the filesystem every scan, so its name is always the file
     // stem and gating on it would never fire — every episode in the library
     // would re-request its credits on every nightly scan.
     //
-    // Skipping must also carry the stored title forward, because the scan
-    // upsert writes the entity's values: returning early without them would
-    // overwrite a good title with the placeholder, so one scan during a TMDB
-    // outage would revert the whole library to filenames.
+    // Skipping must not revert what the stored row holds: the save merges
+    // this pass onto the stored row (`merge_onto_stored`), so one scan during
+    // a TMDB outage — or a gate that skipped the fetch — never reverts a
+    // title to the filename or drops the air date, year or rating.
     #[tokio::test]
     async fn a_previously_titled_episode_is_neither_re_requested_nor_reverted() {
         let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
-        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
-
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         // What an earlier scan achieved. `episode` is the freshly-planned row,
         // still carrying the file stem and no overview.
-        let stored = super::StoredText::from_entity(&BaseItemEntity {
-            name: Some("Winter Is Coming".into()),
-            sort_name: Some("001 - 0001 - Winter Is Coming".into()),
-            overview: Some("Ned is summoned south.".into()),
-            path: episode.path.clone(),
-            ..Default::default()
-        });
+        let row = titled_episode_row(&episode, "001 - 0001 - Winter Is Coming");
 
-        scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
-            .await
-            .expect("nothing to do");
-
+        let saved = rescan_episode(&scanner, &mut cache, episode, &row).await;
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
-        assert_eq!(episode.overview.as_deref(), Some("Ned is summoned south."));
+        assert_eq!(saved.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(saved.overview.as_deref(), Some("Ned is summoned south."));
         assert_eq!(
-            episode.sort_name.as_deref(),
+            saved.sort_name.as_deref(),
             Some("001 - 0001 - Winter Is Coming")
         );
+        // The fields the old hand-carried gate dropped.
+        assert_eq!(saved.premiere_date, row.premiere_date);
+        assert_eq!(saved.production_year, Some(2011));
+        assert_eq!(saved.community_rating, Some(8.1));
     }
 
-    // A key an older algorithm produced must not survive the rescan: the row
-    // carries the stored TITLE forward and derives the key from it again, so a
-    // library never ends up half-sorted by two different rules.
+    // A key an older algorithm produced must not survive the rescan: the save
+    // keeps the stored TITLE and derives the key from it again, so a library
+    // never ends up half-sorted by two different rules.
     #[tokio::test]
     async fn a_carried_forward_title_re_derives_its_sort_key() {
         let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
-        let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
-
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         // A stale key: what the pre-convergence scanner wrote for this title.
-        let stored = super::StoredText::from_entity(&BaseItemEntity {
-            name: Some("Winter Is Coming".into()),
-            sort_name: Some("winter is coming".into()),
-            overview: Some("Ned is summoned south.".into()),
-            path: episode.path.clone(),
-            ..Default::default()
-        });
+        let row = titled_episode_row(&episode, "winter is coming");
 
-        scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
-            .await
-            .expect("nothing to do");
-
-        assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
+        let saved = rescan_episode(&scanner, &mut cache, episode, &row).await;
+        assert_eq!(saved.name.as_deref(), Some("Winter Is Coming"));
         assert_eq!(
-            episode.sort_name.as_deref(),
+            saved.sort_name.as_deref(),
             Some("001 - 0001 - Winter Is Coming"),
-            "the key is re-derived from the carried-forward title, not copied"
+            "the key is re-derived from the kept title, not copied"
         );
     }
 
@@ -10404,23 +11660,12 @@ mod tests {
         let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let row = titled_episode_row(&episode, "thrones 0000000001");
         episode.forced_sort_name = Some("Thrones 01".into());
 
-        let stored = super::StoredText::from_entity(&BaseItemEntity {
-            name: Some("Winter Is Coming".into()),
-            sort_name: Some("thrones 0000000001".into()),
-            overview: Some("Ned is summoned south.".into()),
-            path: episode.path.clone(),
-            ..Default::default()
-        });
-
-        scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, Some(&stored))
-            .await
-            .expect("nothing to do");
-
+        let saved = rescan_episode(&scanner, &mut cache, episode, &row).await;
         assert_eq!(
-            episode.sort_name.as_deref(),
+            saved.sort_name.as_deref(),
             Some("thrones 0000000001"),
             "ModifySortChunks(ForcedSortName).ToLowerInvariant()"
         );
@@ -10453,7 +11698,12 @@ mod tests {
         );
         assert!(
             scanner
-                .fetch_tmdb_episode(&mut ep1, &mut cache, None)
+                .fetch_tmdb_episode(
+                    &mut ep1,
+                    &mut cache,
+                    None,
+                    &super::ResolverGuesses::default()
+                )
                 .await
                 .is_none()
         );
@@ -10488,7 +11738,15 @@ mod tests {
             ..Default::default()
         };
         let result = scanner
-            .fetch_tmdb_metadata(&mut series, "Series", false, &mut cache, None, &[])
+            .fetch_tmdb_metadata(
+                &mut series,
+                "Series",
+                false,
+                &mut cache,
+                None,
+                &[],
+                &super::ResolverGuesses::default(),
+            )
             .await;
 
         let result = result.expect("the series needed no fetch");
@@ -10509,7 +11767,12 @@ mod tests {
 
         // And the episodes below it now resolve.
         scanner
-            .fetch_tmdb_episode(&mut episode, &mut cache, None)
+            .fetch_tmdb_episode(
+                &mut episode,
+                &mut cache,
+                None,
+                &super::ResolverGuesses::default(),
+            )
             .await
             .expect("episode resolves through the published id");
         assert_eq!(episode.name.as_deref(), Some("Winter Is Coming"));
@@ -10527,7 +11790,12 @@ mod tests {
 
         assert!(
             scanner
-                .fetch_tmdb_episode(&mut episode, &mut cache, None)
+                .fetch_tmdb_episode(
+                    &mut episode,
+                    &mut cache,
+                    None,
+                    &super::ResolverGuesses::default()
+                )
                 .await
                 .is_none()
         );
@@ -10615,6 +11883,7 @@ mod tests {
                 super::FetcherPolicy::default(),
                 None,
                 &[],
+                &super::ResolverGuesses::default(),
             )
             .await;
 
@@ -10851,7 +12120,12 @@ mod tests {
         // A miss, not an empty hit: the caller must be able to fall through.
         assert!(
             scanner
-                .fetch_tvdb_metadata(&mut nameless, "Series", &mut cache)
+                .fetch_tvdb_metadata(
+                    &mut nameless,
+                    "Series",
+                    &mut cache,
+                    &super::ResolverGuesses::default()
+                )
                 .await
                 .is_none()
         );
@@ -10867,7 +12141,12 @@ mod tests {
         };
         assert!(
             scanner
-                .fetch_tvdb_metadata(&mut orphan_ep, "Episode", &mut cache)
+                .fetch_tvdb_metadata(
+                    &mut orphan_ep,
+                    "Episode",
+                    &mut cache,
+                    &super::ResolverGuesses::default()
+                )
                 .await
                 .is_none()
         );
@@ -10901,6 +12180,7 @@ mod tests {
                 super::FetcherPolicy::default(),
                 None,
                 &[],
+                &super::ResolverGuesses::default(),
             )
             .await;
 
@@ -11421,7 +12701,9 @@ mod tests {
                 .with_attachments(attachments.clone());
         scanner.scan_all().await.unwrap();
 
-        // The probed duration + size land on the item row.
+        // The probed duration lands on the item row. `Size` is the file's
+        // stat'ed length (the empty fixture's 0), not the probe's 51753:
+        // `SaveInternal` stamps `Size = file.Length` after every provider ran.
         let (ticks, size, movie_id): (Option<i64>, Option<i64>, String) = sqlx::query_as(
             r#"SELECT "RunTimeTicks","Size","Id" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
         )
@@ -11429,7 +12711,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ticks, Some(30_000_000));
-        assert_eq!(size, Some(51753));
+        assert_eq!(size, Some(0));
 
         // Both probed streams are persisted (a video + an audio row).
         let streams: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos""#)
@@ -13959,6 +15241,46 @@ mod tests {
         assert!(items.retrieve_item(resolved).await.unwrap().is_some());
     }
 
+    /// Each audio track the real planner plans for a music library over
+    /// `media`, with the folder album the scan takes off it.
+    async fn planned_folder_albums(
+        media: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Vec<(String, Option<String>)> {
+        let db2 = Database::connect_in_memory().await.unwrap();
+        db2.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db2));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(root.join(".plan-views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Music",
+            Some(CollectionTypeOptions::music),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let folders = scanner.scoped_folders(None).await.unwrap();
+        scanner
+            .plan(&folders)
+            .into_iter()
+            .filter(|p| p.entity.type_.ends_with("Audio.Audio"))
+            .map(|p| {
+                let mut entity = p.entity;
+                let path = entity.path.clone().unwrap_or_default();
+                let guesses = super::ResolverGuesses::take(&mut entity, None);
+                (path, guesses.folder_album)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn scan_builds_music_album_with_tracks() {
         use ferrofin_traits::persistence::ItemRepository as _;
@@ -14056,7 +15378,29 @@ mod tests {
             tracks.iter().all(|t| t.0 == album_row.0),
             "tracks parent to the album"
         );
-        assert!(tracks.iter().all(|t| t.1.as_deref() == Some("The Wall")));
+        // Tagless tracks carry no `Album` (upstream never sets it from the
+        // path); the album they belong to is their parent row, which is what
+        // the DTO's `AlbumId` reads.
+        assert!(tracks.iter().all(|t| t.1.is_none()), "{tracks:?}");
+
+        // The real planner names a disc-folder track's folder album after the
+        // ALBUM folder ("The Wall"), not its disc folder ("CD2") — what the
+        // scan's legacy carve-out (`keep_stored_audio_tags`) compares a stored
+        // album against.
+        let mut folder_albums = planned_folder_albums(&media, tmp.path()).await;
+        folder_albums.sort();
+        assert_eq!(folder_albums.len(), 3);
+        assert!(
+            folder_albums
+                .iter()
+                .all(|(_, album)| album.as_deref() == Some("The Wall")),
+            "{folder_albums:?}"
+        );
+        assert!(
+            folder_albums
+                .iter()
+                .any(|(path, _)| path.ends_with("CD2/03 Mother.flac"))
+        );
     }
 
     /// `MusicArtistResolver`'s `artist.nfo` shortcut fires before every other

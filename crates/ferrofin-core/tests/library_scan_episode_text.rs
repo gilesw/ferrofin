@@ -44,7 +44,8 @@ const SEASON_JSON: &str = r#"{
     "overview": "The first season.",
     "episodes": [
         {"id": 63056, "episode_number": 1, "name": "Winter Is Coming",
-         "overview": "Ned is summoned south.", "air_date": "2011-04-17"},
+         "overview": "Ned is summoned south.", "air_date": "2011-04-17",
+         "vote_average": 8.5},
         {"id": 63057, "episode_number": 2, "name": "The Kingsroad",
          "overview": "The party rides north.", "air_date": "2011-04-24"}
     ]
@@ -154,9 +155,15 @@ async fn a_rescan_hands_the_stored_episode_text_to_the_gate() {
         .expect("episode row");
     assert_eq!(stored.name.as_deref(), Some("Winter Is Coming"));
     assert_eq!(stored.overview.as_deref(), Some("Ned is summoned south."));
+    let first = stored;
+    assert!(first.premiere_date.is_some());
+    assert_eq!(first.production_year, Some(2011));
+    assert_eq!(first.community_rating, Some(8.5));
 
     // Rescan: the stored title and synopsis reach the gate, so no episode is
-    // fetched again, and the carried-forward text is saved back unchanged.
+    // fetched again, and the save — the stored row with this pass merged on —
+    // keeps everything TMDB supplied: the text, and (the regression the old
+    // hand-carried gate had) the air date, year and rating.
     let rescan = scanner.scan_all().await.expect("rescan");
     assert_eq!(
         rescan,
@@ -177,4 +184,7 @@ async fn a_rescan_hands_the_stored_episode_text_to_the_gate() {
         .expect("episode row");
     assert_eq!(stored.name.as_deref(), Some("Winter Is Coming"));
     assert_eq!(stored.overview.as_deref(), Some("Ned is summoned south."));
+    assert_eq!(stored.premiere_date, first.premiere_date);
+    assert_eq!(stored.production_year, Some(2011));
+    assert_eq!(stored.community_rating, Some(8.5));
 }

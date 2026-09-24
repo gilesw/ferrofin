@@ -1253,6 +1253,7 @@ impl FerrofinItemPersistenceService {
             .bind(&item.type_)
             .bind(&item.unrated_type)
             .bind(item.width)
+            .bind(datetime_to_db(chrono::Utc::now()))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
@@ -2117,6 +2118,11 @@ pub(crate) async fn alternate_version_child_type(
 
 /// The full-column upsert statement for a `BaseItems` row. Column order matches
 /// the bind order in [`FerrofinItemPersistenceService::upsert_item`].
+///
+/// `?73` is the save time: an insert stores the row's own `DateLastSaved`
+/// (`NULL` for a new item — `CreateItems` never stamps it), and every update
+/// stamps it (`LibraryManager.UpdateItemsAsync`: `item.DateLastSaved =
+/// DateTime.UtcNow`).
 const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "Id", "Album", "AlbumArtists", "Artists", "Audio", "ChannelId", "CleanName",
     "CommunityRating", "CriticRating", "CustomRating", "Data", "DateCreated",
@@ -2144,7 +2150,7 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
     "CommunityRating" = excluded."CommunityRating", "CriticRating" = excluded."CriticRating",
     "CustomRating" = excluded."CustomRating", "Data" = excluded."Data",
     "DateCreated" = excluded."DateCreated", "DateLastMediaAdded" = excluded."DateLastMediaAdded",
-    "DateLastRefreshed" = excluded."DateLastRefreshed", "DateLastSaved" = excluded."DateLastSaved",
+    "DateLastRefreshed" = excluded."DateLastRefreshed", "DateLastSaved" = ?73,
     "DateModified" = excluded."DateModified", "EndDate" = excluded."EndDate",
     "EpisodeTitle" = excluded."EpisodeTitle", "ExternalId" = excluded."ExternalId",
     "ExternalSeriesId" = excluded."ExternalSeriesId", "ExternalServiceId" = excluded."ExternalServiceId",
@@ -2182,10 +2188,13 @@ const UPSERT_SQL: &str = r#"INSERT INTO "BaseItems" (
 "#;
 
 /// The user-editable metadata columns (everything the metadata editor's
-/// `POST /Items/{id}` writes, plus the `Name`-derived `CleanName`/`SortName`):
-/// the scan's upsert keeps the stored value for each of these when the row is
-/// locked, so a locked item's edits survive every rescan.
+/// `POST /Items/{id}` writes, plus the `Name`-derived `CleanName`/`SortName`)
+/// and the `Data` blob that holds the rest of a row's provider metadata
+/// (`RemoteTrailers`, a series' `Status`, …): the scan's upsert keeps the
+/// stored value for each of these when the row is locked, so a locked item's
+/// edits survive every rescan.
 const LOCKED_PRESERVED_COLUMNS: &[&str] = &[
+    "Data",
     "Name",
     "CleanName",
     "SortName",
@@ -2214,6 +2223,14 @@ const LOCKED_PRESERVED_COLUMNS: &[&str] = &[
     "AlbumArtists",
 ];
 
+/// The columns a scan save may set but never clear — see [`scan_upsert_sql`].
+const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
+    "DateLastRefreshed",
+    "DateLastMediaAdded",
+    "DateModified",
+    "Size",
+];
+
 /// The library scan's upsert: identical to [`UPSERT_SQL`] except for the
 /// columns the scanner does not own on an existing row —
 ///
@@ -2223,6 +2240,10 @@ const LOCKED_PRESERVED_COLUMNS: &[&str] = &[
 ///   it when the stored value is `NULL`),
 /// - `IsLocked` can be set by the scan (an NFO `<lockdata>`) but never
 ///   cleared (`max`) — otherwise every scan would silently unlock edits,
+/// - `DateLastRefreshed`, `DateLastMediaAdded`, `DateModified` and `Size` are
+///   never cleared (`coalesce(excluded, stored)`): the scan saves them from
+///   the stored row or its stat, and a row it could not read, or a path it
+///   could not stat, must not lose them,
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state).
@@ -2242,6 +2263,12 @@ fn scan_upsert_sql() -> &'static str {
                 r#""IsLocked" = excluded."IsLocked","#,
                 r#""IsLocked" = max("IsLocked", excluded."IsLocked"),"#,
             );
+        for col in SCAN_NEVER_CLEARED_COLUMNS {
+            sql = sql.replace(
+                &format!(r#""{col}" = excluded."{col}""#),
+                &format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#),
+            );
+        }
         for col in LOCKED_PRESERVED_COLUMNS {
             sql = sql.replace(
                 &format!(r#""{col}" = excluded."{col}""#),
@@ -3348,6 +3375,9 @@ mod tests {
     // row (a plain save_items erased every merge-versions link on each scan),
     // while the full save — the merge/split write path — must still set AND
     // clear both.
+    // One test for the whole scan statement: its guards are derived from one
+    // text substitution, so they are asserted together.
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     #[tokio::test]
     async fn scan_upsert_preserves_unowned_columns() {
         // Guard the text-substitution derivation of the scan SQL: if the base
@@ -3357,6 +3387,18 @@ mod tests {
         assert!(sql.contains(r#"coalesce("DateCreated", excluded."DateCreated")"#));
         assert!(!sql.contains(r#""PrimaryVersionId" = excluded."PrimaryVersionId""#));
         assert!(sql.contains(r#""IsLocked" = max("IsLocked", excluded."IsLocked")"#));
+        for col in super::SCAN_NEVER_CLEARED_COLUMNS {
+            assert!(
+                sql.contains(&format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#)),
+                "never-cleared guard missing for column {col}"
+            );
+        }
+        for stmt in [sql, super::UPSERT_SQL] {
+            assert!(
+                stmt.contains(r#""DateLastSaved" = ?73"#),
+                "an update stamps DateLastSaved"
+            );
+        }
         for col in super::LOCKED_PRESERVED_COLUMNS {
             assert!(
                 sql.contains(&format!(
@@ -3425,6 +3467,110 @@ mod tests {
                 .await
                 .expect("row");
         assert_eq!(pvid, None, "full save still clears the merge link");
+
+        // ── The dates and `Data` (scan plan, Phase 3) ────────────────────
+        type Dates = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        );
+        let read = async |id: Uuid| -> Dates {
+            sqlx::query_as(
+                r#"SELECT "DateLastSaved", "DateLastRefreshed", "DateLastMediaAdded",
+                          "DateModified", "Size", "Data"
+                   FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .expect("row")
+        };
+        // A brand-new row keeps a NULL `DateLastSaved` (`CreateItems` never
+        // stamps it) — whichever save path inserts it.
+        let fresh = Uuid::new_v4();
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(fresh),
+            ..item.clone()
+        };
+        svc.save_scanned_items(std::slice::from_ref(&row))
+            .await
+            .expect("scan insert");
+        assert_eq!(
+            read(fresh).await.0,
+            None,
+            "an insert leaves DateLastSaved NULL"
+        );
+
+        // A provider pass stamps the refresh date; the folder pass the media
+        // date; the save its stat. Every update stamps `DateLastSaved`.
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let trailers = r#"{"RemoteTrailers":[{"Url":"https://youtu.be/x"}]}"#;
+        row.date_last_refreshed = Some(at("2026-02-01T00:00:00Z"));
+        row.date_last_media_added = Some(at("2026-03-01T00:00:00Z"));
+        row.date_modified = Some(at("2026-04-01T00:00:00Z"));
+        row.size = Some(1234);
+        row.data = Some(trailers.into());
+        let before = ferrofin_db::store::datetime_to_db(chrono::Utc::now());
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("full update");
+        let saved = read(fresh).await;
+        let stamped = saved.0.clone().expect("an update stamps DateLastSaved");
+        assert!(stamped >= before, "{stamped} is the save time");
+
+        // A scan save of a row it could not read carries none of them: the
+        // scan must still never clear them, and it re-stamps the save time.
+        let scanned = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_last_refreshed: None,
+            date_last_media_added: None,
+            date_last_saved: None,
+            date_modified: None,
+            size: None,
+            data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
+            ..row.clone()
+        };
+        svc.save_scanned_items(std::slice::from_ref(&scanned))
+            .await
+            .expect("scan update");
+        let after = read(fresh).await;
+        assert!(
+            after.0.clone().expect("stamped") >= stamped,
+            "re-stamped on the scan save"
+        );
+        assert_eq!(after.1, saved.1, "DateLastRefreshed survives the scan");
+        assert_eq!(after.2, saved.2, "DateLastMediaAdded survives the scan");
+        assert_eq!(after.3, saved.3, "DateModified survives an un-stat'ed save");
+        assert_eq!(after.4, Some(1234), "Size survives an un-stat'ed save");
+        assert_eq!(
+            after.5.as_deref(),
+            Some(r#"{"VideoType":"VideoFile"}"#),
+            "an unlocked row takes the scan's (merged) Data"
+        );
+
+        // A locked row keeps its whole `Data` blob — trailers, series status…
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("restore trailers");
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(fresh))
+            .execute(db.writer())
+            .await
+            .expect("lock");
+        svc.save_scanned_items(std::slice::from_ref(&scanned))
+            .await
+            .expect("locked scan update");
+        assert_eq!(
+            read(fresh).await.5.as_deref(),
+            Some(trailers),
+            "a locked row's Data survives the scan"
+        );
     }
 
     // Merge/split write their link through set_primary_version_id, which must

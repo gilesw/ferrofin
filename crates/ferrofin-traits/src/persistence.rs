@@ -492,6 +492,10 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError>;
 
     /// Persists (inserts or updates) the given item rows.
+    ///
+    /// An update stamps `DateLastSaved` with the save time
+    /// (`LibraryManager.UpdateItemsAsync`); an insert keeps the row's own value
+    /// (`NULL` for a new item — `CreateItems` never stamps it).
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError>;
 
     /// Persists item rows rebuilt from disk by the library scan, preserving the
@@ -502,6 +506,12 @@ pub trait ItemPersistenceService: Send + Sync {
     ///   would erase every merged alternate version on each scan.
     /// - `DateCreated` — the item's first-import timestamp; re-stamping it with
     ///   the scan time breaks "date added" ordering.
+    /// - `DateLastRefreshed`, `DateLastMediaAdded`, `DateModified`, `Size` —
+    ///   set but never cleared, so a row the scan could not read or a path it
+    ///   could not stat keeps them.
+    /// - on a locked row, the user-editable metadata columns and `Data`.
+    ///
+    /// Like [`save_items`](Self::save_items), an update stamps `DateLastSaved`.
     ///
     /// The default delegates to [`save_items`](Self::save_items) (for stub/fake
     /// services); the real service uses a scan-specific upsert.

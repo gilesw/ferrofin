@@ -23,6 +23,7 @@ pub mod local_xml;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
+pub mod metadata_merge;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;

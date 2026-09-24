@@ -1,0 +1,978 @@
+//! `MergeData` cases. The upstream ones are transliterated from
+//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceTests.cs` and
+//! `tests/Jellyfin.Model.Tests/Entities/ProviderIdsExtensionsTests.cs`
+//! (upstream master `208c278b75`); their expected values are the oracle.
+//!
+//! Upstream's reflection helper `TestMergeBaseItemData` answers "did the
+//! target end up equal to the source value?"; [`merged_equals_new`] is its
+//! transliteration.
+
+use chrono::{TimeZone, Utc};
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::entities::MetadataField;
+use rstest::rstest;
+
+use super::{MetadataResult, is_valid_provider_id, merge_data, merge_provider_ids};
+
+/// The stored `Type` name for `kind`.
+fn type_name(kind: BaseItemKind) -> String {
+    kind.stored_type_name().expect("a stored kind").to_owned()
+}
+
+/// A string key of a `Data` column value.
+fn data_string(data: Option<&str>, key: &str) -> Option<String> {
+    super::parse_data(data)
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The URLs of a `Data` column value's `RemoteTrailers`, in order.
+fn trailer_urls_of(data: Option<&str>) -> Vec<String> {
+    super::parse_data(data)
+        .get("RemoteTrailers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("Url")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn item(kind: BaseItemKind) -> BaseItemEntity {
+    BaseItemEntity {
+        type_: type_name(kind),
+        ..BaseItemEntity::default()
+    }
+}
+
+/// One field of the row, read and written as upstream's reflection helper
+/// reads and writes a property.
+#[derive(Clone, Copy, Debug)]
+enum Field {
+    Name,
+    OriginalTitle,
+    OfficialRating,
+    CustomRating,
+    Tagline,
+    Overview,
+    ForcedSortName,
+    /// `DisplayOrder`, which Ferrofin keeps in the `Data` blob.
+    DisplayOrder,
+    Genres,
+    Studios,
+    Tags,
+    ProductionLocations,
+    AlbumArtists,
+}
+
+impl Field {
+    fn get(self, item: &BaseItemEntity) -> Option<String> {
+        match self {
+            Self::Name => item.name.clone(),
+            Self::OriginalTitle => item.original_title.clone(),
+            Self::OfficialRating => item.official_rating.clone(),
+            Self::CustomRating => item.custom_rating.clone(),
+            Self::Tagline => item.tagline.clone(),
+            Self::Overview => item.overview.clone(),
+            Self::ForcedSortName => item.forced_sort_name.clone(),
+            Self::DisplayOrder => data_string(item.data.as_deref(), "DisplayOrder"),
+            Self::Genres => item.genres.clone(),
+            Self::Studios => item.studios.clone(),
+            Self::Tags => item.tags.clone(),
+            Self::ProductionLocations => item.production_locations.clone(),
+            Self::AlbumArtists => item.album_artists.clone(),
+        }
+    }
+
+    fn set(self, item: &mut BaseItemEntity, value: Option<&str>) {
+        let value = value.map(str::to_owned);
+        match self {
+            Self::Name => item.name = value,
+            Self::OriginalTitle => item.original_title = value,
+            Self::OfficialRating => item.official_rating = value,
+            Self::CustomRating => item.custom_rating = value,
+            Self::Tagline => item.tagline = value,
+            Self::Overview => item.overview = value,
+            Self::ForcedSortName => item.forced_sort_name = value,
+            Self::DisplayOrder => {
+                item.data = value.map(|v| serde_json::json!({ "DisplayOrder": v }).to_string());
+            }
+            Self::Genres => item.genres = value,
+            Self::Studios => item.studios = value,
+            Self::Tags => item.tags = value,
+            Self::ProductionLocations => item.production_locations = value,
+            Self::AlbumArtists => item.album_artists = value,
+        }
+    }
+}
+
+/// `TestMergeBaseItemData`: merges a `kind` item carrying `new` into one
+/// carrying `old` and answers whether the target now holds `new`.
+fn merged_equals_new(
+    kind: BaseItemKind,
+    field: Field,
+    old: Option<&str>,
+    new: Option<&str>,
+    lock: Option<MetadataField>,
+    replace: bool,
+) -> bool {
+    let mut source = item(kind);
+    field.set(&mut source, new);
+    let mut target = item(kind);
+    field.set(&mut target, old);
+    let source = MetadataResult::of(source);
+    let mut target = MetadataResult::of(target);
+    let locked: Vec<MetadataField> = lock.into_iter().collect();
+    merge_data(&source, &mut target, &locked, replace, false);
+    field.get(&target.item).as_deref() == new
+}
+
+/// `MergeBaseItemData_StringField_ReplacesAppropriately` (on a `Series`, so
+/// `DisplayOrder` is reachable).
+#[rstest]
+#[case::name(Field::Name, Some(MetadataField::Name), false)]
+#[case::original_title(Field::OriginalTitle, None, true)]
+#[case::official_rating(Field::OfficialRating, Some(MetadataField::OfficialRating), true)]
+#[case::custom_rating(Field::CustomRating, None, true)]
+#[case::tagline(Field::Tagline, None, true)]
+#[case::overview(Field::Overview, Some(MetadataField::Overview), true)]
+#[case::display_order(Field::DisplayOrder, None, false)]
+#[case::forced_sort_name(Field::ForcedSortName, None, false)]
+fn string_field_replaces_appropriately(
+    #[case] field: Field,
+    #[case] lock: Option<MetadataField>,
+    #[case] replaces_with_empty: bool,
+) {
+    let k = BaseItemKind::Series;
+    assert!(!merged_equals_new(
+        k,
+        field,
+        Some("Old"),
+        Some("New"),
+        None,
+        false
+    ));
+    if let Some(lock) = lock {
+        assert!(!merged_equals_new(
+            k,
+            field,
+            Some("Old"),
+            Some("New"),
+            Some(lock),
+            true
+        ));
+        assert!(!merged_equals_new(
+            k,
+            field,
+            None,
+            Some("New"),
+            Some(lock),
+            false
+        ));
+        assert!(!merged_equals_new(
+            k,
+            field,
+            Some(""),
+            Some("New"),
+            Some(lock),
+            false
+        ));
+    }
+    assert!(merged_equals_new(
+        k,
+        field,
+        Some("Old"),
+        Some("New"),
+        None,
+        true
+    ));
+    assert!(merged_equals_new(k, field, None, Some("New"), None, false));
+    assert!(merged_equals_new(
+        k,
+        field,
+        Some(""),
+        Some("New"),
+        None,
+        false
+    ));
+    assert_eq!(
+        merged_equals_new(k, field, Some("Old"), Some(""), None, true),
+        replaces_with_empty
+    );
+}
+
+/// `MergeBaseItemData_StringArrayField_ReplacesAppropriately` (on an
+/// `Audio`, so `AlbumArtists` is reachable). "Note that arrays are replaced,
+/// not merged" — except that a non-replacing merge into a non-empty target
+/// unions, which is why the first assertion is `false`.
+#[rstest]
+#[case::genres(Field::Genres, Some(MetadataField::Genres))]
+#[case::studios(Field::Studios, Some(MetadataField::Studios))]
+#[case::tags(Field::Tags, Some(MetadataField::Tags))]
+#[case::production_locations(Field::ProductionLocations, Some(MetadataField::ProductionLocations))]
+#[case::album_artists(Field::AlbumArtists, None)]
+fn string_array_field_replaces_appropriately(
+    #[case] field: Field,
+    #[case] lock: Option<MetadataField>,
+) {
+    let k = BaseItemKind::Audio;
+    assert!(!merged_equals_new(
+        k,
+        field,
+        Some("Old"),
+        Some("New"),
+        None,
+        false
+    ));
+    if let Some(lock) = lock {
+        assert!(!merged_equals_new(
+            k,
+            field,
+            Some("Old"),
+            Some("New"),
+            Some(lock),
+            true
+        ));
+        assert!(!merged_equals_new(
+            k,
+            field,
+            None,
+            Some("New"),
+            Some(lock),
+            false
+        ));
+    }
+    assert!(merged_equals_new(
+        k,
+        field,
+        Some("Old"),
+        Some("New"),
+        None,
+        true
+    ));
+    assert!(merged_equals_new(k, field, None, Some("New"), None, false));
+    assert!(merged_equals_new(k, field, Some("Old"), None, None, true));
+}
+
+/// The union half of the array rule: a fill merge into a non-empty target
+/// keeps the target's values first and adds the source's, deduplicated
+/// ordinal-ignore-case.
+#[rstest]
+#[case::studios(Field::Studios)]
+#[case::tags(Field::Tags)]
+#[case::production_locations(Field::ProductionLocations)]
+#[case::album_artists(Field::AlbumArtists)]
+fn string_array_fill_unions(#[case] field: Field) {
+    let mut source = item(BaseItemKind::Audio);
+    field.set(&mut source, Some("B|a"));
+    let mut target = item(BaseItemKind::Audio);
+    field.set(&mut target, Some("A"));
+    let mut target = MetadataResult::of(target);
+    merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
+    assert_eq!(field.get(&target.item).as_deref(), Some("A|B"));
+}
+
+/// Genres are not a union field upstream: a fill merge keeps the target.
+#[test]
+fn genres_fill_does_not_union() {
+    assert!(!merged_equals_new(
+        BaseItemKind::Movie,
+        Field::Genres,
+        Some("Drama"),
+        Some("Comedy"),
+        None,
+        false
+    ));
+    let mut target = item(BaseItemKind::Movie);
+    target.genres = Some("Drama".into());
+    let mut source = item(BaseItemKind::Movie);
+    source.genres = Some("Comedy".into());
+    let mut target = MetadataResult::of(target);
+    merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
+    assert_eq!(target.item.genres.as_deref(), Some("Drama"));
+}
+
+/// A scalar field, set on both sides of a merge.
+#[derive(Clone, Copy, Debug)]
+enum Scalar {
+    IndexNumber,
+    ParentIndexNumber,
+    ProductionYear,
+    CommunityRating,
+    CriticRating,
+    EndDate,
+    PremiereDate,
+    /// `Video3DFormat`, kept in `Data`.
+    Video3DFormat,
+}
+
+impl Scalar {
+    /// Sets the field to its "old" (1) or "new" (2) test value, or clears it.
+    fn set(self, item: &mut BaseItemEntity, value: Option<i64>) {
+        let date = |v: i64| {
+            Utc.with_ymd_and_hms(2000 + i32::try_from(v).unwrap(), 1, 1, 0, 0, 0)
+                .unwrap()
+        };
+        match self {
+            Self::IndexNumber => item.index_number = value,
+            Self::ParentIndexNumber => item.parent_index_number = value,
+            Self::ProductionYear => item.production_year = value,
+            #[allow(clippy::cast_precision_loss)]
+            Self::CommunityRating => item.community_rating = value.map(|v| v as f64),
+            #[allow(clippy::cast_precision_loss)]
+            Self::CriticRating => item.critic_rating = value.map(|v| v as f64),
+            Self::EndDate => item.end_date = value.map(date),
+            Self::PremiereDate => item.premiere_date = value.map(date),
+            Self::Video3DFormat => {
+                item.data = value.map(|v| {
+                    let format = if v == 1 {
+                        "HalfSideBySide"
+                    } else {
+                        "FullSideBySide"
+                    };
+                    serde_json::json!({ "Video3DFormat": format }).to_string()
+                });
+            }
+        }
+    }
+
+    fn equal(self, a: &BaseItemEntity, b: &BaseItemEntity) -> bool {
+        match self {
+            Self::IndexNumber => a.index_number == b.index_number,
+            Self::ParentIndexNumber => a.parent_index_number == b.parent_index_number,
+            Self::ProductionYear => a.production_year == b.production_year,
+            Self::CommunityRating => a.community_rating == b.community_rating,
+            Self::CriticRating => a.critic_rating == b.critic_rating,
+            Self::EndDate => a.end_date == b.end_date,
+            Self::PremiereDate => a.premiere_date == b.premiere_date,
+            Self::Video3DFormat => {
+                let read = |e: &BaseItemEntity| data_string(e.data.as_deref(), "Video3DFormat");
+                read(a) == read(b)
+            }
+        }
+    }
+}
+
+fn scalar_merged_equals_new(
+    field: Scalar,
+    old: Option<i64>,
+    new: Option<i64>,
+    replace: bool,
+) -> bool {
+    let mut source = item(BaseItemKind::Movie);
+    field.set(&mut source, new);
+    let mut target = item(BaseItemKind::Movie);
+    field.set(&mut target, old);
+    let source = MetadataResult::of(source);
+    let mut target = MetadataResult::of(target);
+    merge_data(&source, &mut target, &[], replace, false);
+    field.equal(&target.item, &source.item)
+}
+
+/// `MergeBaseItemData_SimpleField_ReplacesAppropriately` (on a `Movie`, so
+/// `Video3DFormat` is reachable).
+#[rstest]
+#[case::index_number(Scalar::IndexNumber)]
+#[case::parent_index_number(Scalar::ParentIndexNumber)]
+#[case::production_year(Scalar::ProductionYear)]
+#[case::community_rating(Scalar::CommunityRating)]
+#[case::critic_rating(Scalar::CriticRating)]
+#[case::end_date(Scalar::EndDate)]
+#[case::premiere_date(Scalar::PremiereDate)]
+#[case::video_3d_format(Scalar::Video3DFormat)]
+fn simple_field_replaces_appropriately(#[case] field: Scalar) {
+    assert!(!scalar_merged_equals_new(field, Some(1), Some(2), false));
+    assert!(scalar_merged_equals_new(field, Some(1), Some(2), true));
+    assert!(scalar_merged_equals_new(field, None, Some(2), false));
+    // "Video3DFormat - null values do NOT replace existing data".
+    let null_replaces = !matches!(field, Scalar::Video3DFormat);
+    assert_eq!(
+        scalar_merged_equals_new(field, Some(1), None, true),
+        null_replaces
+    );
+}
+
+fn trailers(urls: &[&str]) -> String {
+    let entries: Vec<serde_json::Value> = urls
+        .iter()
+        .map(|u| serde_json::json!({ "Name": format!("Name {u}"), "Url": u }))
+        .collect();
+    serde_json::json!({ "RemoteTrailers": entries }).to_string()
+}
+
+fn trailer_urls(item: &BaseItemEntity) -> Vec<String> {
+    trailer_urls_of(item.data.as_deref())
+}
+
+fn merge_trailers(old: &[&str], new: &[&str], replace: bool) -> Vec<String> {
+    let mut source = item(BaseItemKind::Movie);
+    source.data = Some(trailers(new));
+    let mut target = item(BaseItemKind::Movie);
+    target.data = Some(trailers(old));
+    let mut target = MetadataResult::of(target);
+    merge_data(
+        &MetadataResult::of(source),
+        &mut target,
+        &[],
+        replace,
+        false,
+    );
+    trailer_urls(&target.item)
+}
+
+/// `MergeBaseItemData_MergeTrailers_ReplacesAppropriately`, plus the union
+/// it implies (`DistinctBy(t => t.Url)`).
+#[test]
+fn merge_trailers_replaces_appropriately() {
+    assert_ne!(merge_trailers(&["URL 1"], &["URL 2"], false), ["URL 2"]);
+    assert_eq!(
+        merge_trailers(&["URL 1"], &["URL 2"], false),
+        ["URL 1", "URL 2"]
+    );
+    assert_eq!(merge_trailers(&["URL 1"], &["URL 2"], true), ["URL 2"]);
+    assert_eq!(merge_trailers(&[], &["URL 2"], false), ["URL 2"]);
+    assert!(merge_trailers(&["URL 1"], &[], true).is_empty());
+    assert_eq!(merge_trailers(&["URL 1"], &["URL 1"], false), ["URL 1"]);
+}
+
+fn ids(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+/// `MergeBaseItemData_ProviderIds_MergesAppropriately`.
+#[test]
+fn provider_ids_merge_appropriately() {
+    let old = ids(&[("provider 1", "id 1")]);
+    // Overwrite.
+    let overwrite = ids(&[("provider 1", "id 2")]);
+    assert_ne!(merge_provider_ids(&overwrite, &old, false), overwrite);
+    assert_eq!(merge_provider_ids(&overwrite, &old, true), overwrite);
+    // Merge without overwriting.
+    let merged = merge_provider_ids(
+        &ids(&[("provider 1", "id 2"), ("provider 2", "id 3")]),
+        &old,
+        false,
+    );
+    assert_eq!(
+        merged,
+        ids(&[("provider 1", "id 1"), ("provider 2", "id 3")])
+    );
+    // An empty source changes nothing.
+    assert_eq!(merge_provider_ids(&[], &old, true), old);
+}
+
+/// The id-validity half of the ProviderIds rule: a malformed source id never
+/// lands, even when replacing; a malformed stored id is replaced by a valid
+/// one even when filling, and dropped when nothing replaces it.
+#[test]
+fn provider_ids_never_keep_an_invalid_id() {
+    let stored = ids(&[("Tmdb", "nm0000123"), ("Imdb", "tt0113375")]);
+    assert_eq!(
+        merge_provider_ids(&ids(&[("Tmdb", "11")]), &stored, false),
+        ids(&[("Tmdb", "11"), ("Imdb", "tt0113375")])
+    );
+    assert_eq!(
+        merge_provider_ids(&ids(&[("Imdb", "https://imdb.com/tt1")]), &stored, true),
+        ids(&[("Imdb", "tt0113375")])
+    );
+    // Keys compare case-insensitively.
+    assert_eq!(
+        merge_provider_ids(&ids(&[("tmdb", "12")]), &ids(&[("Tmdb", "11")]), true),
+        ids(&[("Tmdb", "12")])
+    );
+}
+
+/// `ProviderIdsExtensionsTests.IsValidProviderId_ChecksKnownFormats`
+/// (`null` is the empty string here).
+#[rstest]
+#[case("Imdb", "tt0113375", true)]
+#[case("Imdb", "nm0000123", true)]
+#[case("Imdb", "0113375", true)]
+#[case("Imdb", "https://www.imdb.com/title/tt0113375", false)]
+#[case("Tmdb", "11", true)]
+#[case("Tmdb", "nm0000123", false)]
+#[case("Tmdb", "0", false)]
+#[case("Tmdb", "-11", false)]
+#[case("TmdbCollection", "nm0000123", false)]
+#[case("AudioDbArtist", "111239", true)]
+#[case("AudioDbArtist", "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", false)]
+#[case("MusicBrainzArtist", "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", true)]
+#[case("MusicBrainzArtist", "111239", false)]
+#[case("MusicBrainzAlbum", "not-an-mbid", false)]
+#[case("Tvdb", "anything-goes", true)]
+#[case("SomePlugin", "anything-goes", true)]
+#[case("Tmdb", "", false)]
+#[case("", "11", false)]
+fn is_valid_provider_id_checks_known_formats(
+    #[case] name: &str,
+    #[case] value: &str,
+    #[case] expected: bool,
+) {
+    assert_eq!(is_valid_provider_id(name, value), expected);
+}
+
+fn person(name: &str) -> PeopleEntity {
+    PeopleEntity {
+        id: String::new(),
+        name: name.to_owned(),
+        person_type: Some("Actor".into()),
+        role: None,
+        primary_image_url: None,
+        provider_id: None,
+    }
+}
+
+fn old_people() -> Vec<PeopleEntity> {
+    vec![PeopleEntity {
+        provider_id: Some(1234),
+        ..person("Name 1")
+    }]
+}
+
+/// `TestMergeBaseItemDataPerson`: whether the target's people end up equal to
+/// the source's. (Owned arguments keep the upstream call shapes readable.)
+#[allow(clippy::needless_pass_by_value)]
+fn merge_people_case(
+    old: Option<Vec<PeopleEntity>>,
+    new: Option<Vec<PeopleEntity>>,
+    lock: Option<MetadataField>,
+    replace: bool,
+) -> (bool, Option<Vec<PeopleEntity>>) {
+    let source = MetadataResult {
+        people: new.clone(),
+        ..MetadataResult::of(item(BaseItemKind::Movie))
+    };
+    let mut target = MetadataResult {
+        people: old,
+        ..MetadataResult::of(item(BaseItemKind::Movie))
+    };
+    let locked: Vec<MetadataField> = lock.into_iter().collect();
+    merge_data(&source, &mut target, &locked, replace, false);
+    (target.people == new, target.people)
+}
+
+/// `MergeBaseItemData_MergePeople_MergesAppropriately`, over Ferrofin's one
+/// person id (upstream's `"Provider 1"` key is the TMDB id here).
+#[test]
+fn merge_people_merges_appropriately() {
+    let overwrite = vec![person("Name 2")];
+    let (equal, result) =
+        merge_people_case(Some(old_people()), Some(overwrite.clone()), None, false);
+    assert!(!equal);
+    // People not already in target are not merged into it from source.
+    let result = result.expect("people");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "Name 1");
+
+    assert!(merge_people_case(Some(old_people()), Some(overwrite.clone()), None, true).0);
+    assert!(merge_people_case(Some(Vec::new()), Some(overwrite.clone()), None, false).0);
+    assert!(merge_people_case(None, Some(overwrite.clone()), None, false).0);
+    assert!(
+        !merge_people_case(
+            Some(old_people()),
+            Some(overwrite),
+            Some(MetadataField::Cast),
+            true
+        )
+        .0
+    );
+
+    // Ids merge but don't overwrite the target's.
+    let merge_new = vec![PeopleEntity {
+        provider_id: Some(5678),
+        role: Some("Role".into()),
+        ..person("Name 1")
+    }];
+    let (_, result) = merge_people_case(Some(old_people()), Some(merge_new), None, false);
+    let result = result.expect("people");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].provider_id, Some(1234));
+    assert_eq!(
+        result[0].role.as_deref(),
+        Some("Role"),
+        "a missing role fills"
+    );
+    let (_, result) = merge_people_case(
+        Some(vec![person("Name 1")]),
+        Some(vec![PeopleEntity {
+            provider_id: Some(5678),
+            ..person("Name 1")
+        }]),
+        None,
+        false,
+    );
+    assert_eq!(result.expect("people")[0].provider_id, Some(5678));
+
+    // A picture fills when missing but never overwrites.
+    let picture = |url: &str| {
+        vec![PeopleEntity {
+            primary_image_url: Some(url.into()),
+            ..person("Name 1")
+        }]
+    };
+    let (_, result) = merge_people_case(Some(old_people()), Some(picture("URL 1")), None, false);
+    assert_eq!(
+        result.expect("people")[0].primary_image_url.as_deref(),
+        Some("URL 1")
+    );
+    let (_, result) =
+        merge_people_case(Some(picture("URL 1")), Some(picture("URL 2")), None, false);
+    assert_eq!(
+        result.expect("people")[0].primary_image_url.as_deref(),
+        Some("URL 1")
+    );
+
+    // An empty source can be forced to overwrite a target with data.
+    assert!(merge_people_case(Some(old_people()), Some(Vec::new()), None, true).0);
+}
+
+/// Names match ignoring case and diacritics; an invalid (non-positive) TMDB
+/// person id is dropped on both sides.
+#[test]
+fn merge_people_matches_names_loosely_and_drops_invalid_ids() {
+    let (_, result) = merge_people_case(
+        Some(vec![PeopleEntity {
+            provider_id: Some(0),
+            ..person("Zoë Kravitz")
+        }]),
+        Some(vec![PeopleEntity {
+            provider_id: Some(37_917),
+            ..person("zoe kravitz")
+        }]),
+        None,
+        false,
+    );
+    assert_eq!(result.expect("people")[0].provider_id, Some(37_917));
+}
+
+/// `MergeBaseItemData_MergeMetadataSettings_MergesWhenSet` (upstream's
+/// `LockedFields` half waits for Phase 3L's column).
+#[rstest]
+#[case(false, false)]
+#[case(true, false)]
+#[case(true, true)]
+fn merge_metadata_settings_merges_when_set(
+    #[case] merge_metadata_settings: bool,
+    #[case] default_date: bool,
+) {
+    let new_date = Utc.with_ymd_and_hms(2026, 9, 24, 0, 0, 0).unwrap();
+    let old_date = chrono::DateTime::<Utc>::UNIX_EPOCH;
+    let source = BaseItemEntity {
+        is_locked: true,
+        preferred_metadata_country_code: Some("new".into()),
+        preferred_metadata_language: Some("new".into()),
+        date_created: (!default_date).then_some(new_date),
+        ..item(BaseItemKind::Movie)
+    };
+    let target = BaseItemEntity {
+        is_locked: false,
+        preferred_metadata_country_code: Some("old".into()),
+        preferred_metadata_language: Some("old".into()),
+        date_created: Some(old_date),
+        ..item(BaseItemKind::Movie)
+    };
+    let mut target = MetadataResult::of(target);
+    merge_data(
+        &MetadataResult::of(source),
+        &mut target,
+        &[],
+        true,
+        merge_metadata_settings,
+    );
+    let t = &target.item;
+    if merge_metadata_settings {
+        assert!(t.is_locked);
+        assert_eq!(t.preferred_metadata_country_code.as_deref(), Some("new"));
+        assert_eq!(t.preferred_metadata_language.as_deref(), Some("new"));
+        assert_eq!(
+            t.date_created,
+            Some(if default_date { old_date } else { new_date })
+        );
+    } else {
+        assert!(!t.is_locked);
+        assert_eq!(t.preferred_metadata_country_code.as_deref(), Some("old"));
+        assert_eq!(t.preferred_metadata_language.as_deref(), Some("old"));
+        assert_eq!(t.date_created, Some(old_date));
+    }
+}
+
+/// `if (target is not Audio && target is not Video && target is not Book)`:
+/// a provider runtime never replaces a probed one, but does land on a
+/// series.
+#[rstest]
+#[case::movie(BaseItemKind::Movie, false)]
+#[case::episode(BaseItemKind::Episode, false)]
+#[case::audio(BaseItemKind::Audio, false)]
+#[case::audio_book(BaseItemKind::AudioBook, false)]
+#[case::book(BaseItemKind::Book, false)]
+#[case::series(BaseItemKind::Series, true)]
+fn runtime_comes_from_providers_only_for_non_media_kinds(
+    #[case] kind: BaseItemKind,
+    #[case] takes_provider_runtime: bool,
+) {
+    let source = BaseItemEntity {
+        run_time_ticks: Some(2),
+        ..item(kind)
+    };
+    let mut target = MetadataResult::of(BaseItemEntity {
+        run_time_ticks: Some(1),
+        ..item(kind)
+    });
+    merge_data(
+        &MetadataResult::of(source.clone()),
+        &mut target,
+        &[],
+        true,
+        true,
+    );
+    assert_eq!(
+        target.item.run_time_ticks,
+        Some(if takes_provider_runtime { 2 } else { 1 })
+    );
+    let mut locked = MetadataResult::of(BaseItemEntity {
+        run_time_ticks: Some(1),
+        ..item(kind)
+    });
+    merge_data(
+        &MetadataResult::of(source),
+        &mut locked,
+        &[MetadataField::Runtime],
+        true,
+        true,
+    );
+    assert_eq!(
+        locked.item.run_time_ticks,
+        Some(1),
+        "a locked runtime never moves"
+    );
+}
+
+/// A row carrying a value for every field upstream's lock can protect.
+fn fully_populated(tag: &str, kind: BaseItemKind) -> MetadataResult {
+    MetadataResult {
+        item: BaseItemEntity {
+            name: Some(format!("{tag} name")),
+            genres: Some(format!("{tag} genre")),
+            official_rating: Some(format!("{tag} rating")),
+            overview: Some(format!("{tag} overview")),
+            run_time_ticks: Some(if tag == "old" { 1 } else { 2 }),
+            studios: Some(format!("{tag} studio")),
+            tags: Some(format!("{tag} tag")),
+            production_locations: Some(format!("{tag} location")),
+            tagline: Some(format!("{tag} tagline")),
+            ..item(kind)
+        },
+        people: Some(vec![person(&format!("{tag} person"))]),
+        provider_ids: Vec::new(),
+    }
+}
+
+/// Every lockable field, merged in every `replace_data` mode, with and
+/// without its lock: a locked field keeps the target's value; an unlocked one
+/// follows the mode. `Tagline` is never lock-checked upstream.
+#[rstest]
+fn locked_fields_hold_in_every_mode(
+    #[values(
+        MetadataField::Name,
+        MetadataField::Genres,
+        MetadataField::OfficialRating,
+        MetadataField::Overview,
+        MetadataField::Cast,
+        MetadataField::Runtime,
+        MetadataField::Studios,
+        MetadataField::Tags,
+        MetadataField::ProductionLocations
+    )]
+    field: MetadataField,
+    #[values(false, true)] replace: bool,
+    #[values(false, true)] locked: bool,
+) {
+    // A `Series` owns no runtime of its own, so `Runtime` is observable.
+    let kind = BaseItemKind::Series;
+    let source = fully_populated("new", kind);
+    let old = fully_populated("old", kind);
+    let mut target = old.clone();
+    let locks: Vec<MetadataField> = if locked { vec![field] } else { Vec::new() };
+    merge_data(&source, &mut target, &locks, replace, false);
+    let pick = |r: &MetadataResult| -> String {
+        let i = &r.item;
+        match field {
+            MetadataField::Name => i.name.clone().unwrap_or_default(),
+            MetadataField::Genres => i.genres.clone().unwrap_or_default(),
+            MetadataField::OfficialRating => i.official_rating.clone().unwrap_or_default(),
+            MetadataField::Overview => i.overview.clone().unwrap_or_default(),
+            MetadataField::Cast => format!("{:?}", r.people),
+            MetadataField::Runtime => format!("{:?}", i.run_time_ticks),
+            MetadataField::Studios => i.studios.clone().unwrap_or_default(),
+            MetadataField::Tags => i.tags.clone().unwrap_or_default(),
+            MetadataField::ProductionLocations => {
+                i.production_locations.clone().unwrap_or_default()
+            }
+        }
+    };
+    let expected = if locked || !replace {
+        match (locked, field) {
+            // A fill merge into a non-empty target unions the union fields.
+            (
+                false,
+                MetadataField::Studios | MetadataField::Tags | MetadataField::ProductionLocations,
+            ) => format!("{}|{}", pick(&old), pick(&source)),
+            // …and enriches (but never adds to) the target's people.
+            _ => pick(&old),
+        }
+    } else {
+        pick(&source)
+    };
+    assert_eq!(
+        pick(&target),
+        expected,
+        "{field:?} replace={replace} locked={locked}"
+    );
+    // A lock on one field never protects another.
+    assert_eq!(
+        target.item.tagline.as_deref(),
+        Some(if replace {
+            "new tagline"
+        } else {
+            "old tagline"
+        })
+    );
+}
+
+/// `Data` merges key by key: the upstream-owned keys follow their rules,
+/// resolver keys (`VideoType`) come from the source when it has them, and a
+/// key only the target holds is kept — in every mode.
+#[test]
+fn data_merges_key_wise() {
+    let source = BaseItemEntity {
+        data: Some(r#"{"VideoType":"Iso","Status":"Ended"}"#.into()),
+        ..item(BaseItemKind::Series)
+    };
+    let target = BaseItemEntity {
+        data: Some(
+            r#"{"VideoType":"VideoFile","Status":"Continuing","AirTime":"20:00","LinkedChildren":[]}"#.into(),
+        ),
+        ..item(BaseItemKind::Series)
+    };
+    let merged = |replace: bool| {
+        let mut t = MetadataResult::of(target.clone());
+        merge_data(
+            &MetadataResult::of(source.clone()),
+            &mut t,
+            &[],
+            replace,
+            false,
+        );
+        super::parse_data(t.item.data.as_deref())
+    };
+    let filled = merged(false);
+    assert_eq!(filled["VideoType"], "VideoFile", "fill keeps the target's");
+    assert_eq!(filled["Status"], "Continuing");
+    assert_eq!(filled["AirTime"], "20:00");
+    assert!(filled.contains_key("LinkedChildren"));
+    let replaced = merged(true);
+    assert_eq!(replaced["VideoType"], "Iso");
+    assert_eq!(replaced["Status"], "Ended");
+    assert!(
+        !replaced.contains_key("AirTime"),
+        "replace clears an upstream property the source did not return"
+    );
+    assert!(
+        replaced.contains_key("LinkedChildren"),
+        "an unrelated key is never dropped"
+    );
+}
+
+/// A merge that changes nothing leaves the blob byte-identical (no
+/// reserialization, so key order and spacing survive).
+#[test]
+fn an_unchanged_blob_is_not_reserialized() {
+    let blob = r#"{ "Status": "Ended",  "AirTime": "20:00" }"#;
+    let target = BaseItemEntity {
+        data: Some(blob.into()),
+        ..item(BaseItemKind::Series)
+    };
+    let mut t = MetadataResult::of(target.clone());
+    merge_data(&MetadataResult::of(target), &mut t, &[], true, false);
+    assert_eq!(t.item.data.as_deref(), Some(blob));
+}
+
+/// Upstream's Default scan in two calls (`RefreshWithProviders` `:897-915`):
+/// stored values fill the provider result, then the result replaces the row.
+/// Provider values win; fields no provider returned keep the stored values;
+/// the union fields keep both.
+#[test]
+fn default_mode_is_fill_then_replace() {
+    let stored = MetadataResult::of(BaseItemEntity {
+        name: Some("Stored".into()),
+        overview: Some("Stored overview".into()),
+        premiere_date: Some(Utc.with_ymd_and_hms(2011, 4, 17, 0, 0, 0).unwrap()),
+        community_rating: Some(8.1),
+        studios: Some("HBO".into()),
+        data: Some(r#"{"RemoteTrailers":[{"Url":"a"}]}"#.into()),
+        ..item(BaseItemKind::Episode)
+    });
+    let mut provider = MetadataResult::of(BaseItemEntity {
+        overview: Some("Provider overview".into()),
+        studios: Some("Sky".into()),
+        data: Some(r#"{"RemoteTrailers":[{"Url":"b"}]}"#.into()),
+        ..item(BaseItemKind::Episode)
+    });
+    merge_data(&stored, &mut provider, &[], false, false);
+    let mut row = stored.clone();
+    merge_data(&provider, &mut row, &[], true, true);
+    let r = &row.item;
+    assert_eq!(r.name.as_deref(), Some("Stored"));
+    assert_eq!(r.overview.as_deref(), Some("Provider overview"));
+    assert_eq!(r.premiere_date, stored.item.premiere_date);
+    assert_eq!(r.community_rating, Some(8.1));
+    assert_eq!(r.studios.as_deref(), Some("Sky|HBO"));
+    assert_eq!(trailer_urls(r), ["b", "a"]);
+}
+
+/// Per-kind overrides: `Artists` unions on audio, an episode takes a
+/// provider's explicit season only on the settings-carrying merge, and a
+/// book takes its series name.
+#[test]
+fn kind_specific_rules() {
+    let mut target = MetadataResult::of(BaseItemEntity {
+        artists: Some("A".into()),
+        album: Some("Old".into()),
+        ..item(BaseItemKind::Audio)
+    });
+    let source = MetadataResult::of(BaseItemEntity {
+        artists: Some("B".into()),
+        album: Some("New".into()),
+        ..item(BaseItemKind::Audio)
+    });
+    merge_data(&source, &mut target, &[], false, false);
+    assert_eq!(target.item.artists.as_deref(), Some("A|B"));
+    assert_eq!(target.item.album.as_deref(), Some("Old"));
+
+    let episode = |season| {
+        MetadataResult::of(BaseItemEntity {
+            parent_index_number: season,
+            ..item(BaseItemKind::Episode)
+        })
+    };
+    let mut target = episode(Some(1));
+    merge_data(&episode(Some(2)), &mut target, &[], false, false);
+    assert_eq!(target.item.parent_index_number, Some(1));
+    merge_data(&episode(Some(2)), &mut target, &[], false, true);
+    assert_eq!(target.item.parent_index_number, Some(2));
+
+    let mut book = MetadataResult::of(BaseItemEntity {
+        series_name: Some("Folder".into()),
+        ..item(BaseItemKind::Book)
+    });
+    let source = MetadataResult::of(BaseItemEntity {
+        series_name: Some("Discworld".into()),
+        ..item(BaseItemKind::Book)
+    });
+    merge_data(&source, &mut book, &[], true, false);
+    assert_eq!(book.item.series_name.as_deref(), Some("Discworld"));
+}
