@@ -145,14 +145,13 @@ struct StoredText {
 }
 
 impl StoredText {
-    /// Takes the row by value: the caller owns it and drops it immediately, so
-    /// cloning three `String`s per episode is pure waste at library scale.
-    /// `titled` is computed first, while `path` is still in hand.
-    fn from_row(row: ferrofin_db::entities::base_items::ItemTextRow) -> Self {
+    /// Lifts the gate's values out of the stored row the scan pre-read for
+    /// this item. `titled` is computed here, while the row's `path` is in hand.
+    fn from_entity(row: &BaseItemEntity) -> Self {
         Self {
             titled: !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
-            name: row.name,
-            overview: row.overview,
+            name: row.name.clone(),
+            overview: row.overview.clone(),
         }
     }
 
@@ -746,6 +745,106 @@ struct Planned {
 /// `FERROFIN_SCAN_PROGRESS_EVERY` bootstrap knob.
 const DEFAULT_SCAN_PROGRESS_EVERY: usize = 100;
 
+/// What one scan pass did to the library, per planned item plus the prune.
+///
+/// Returned by [`LibraryScanner::scan`] and its siblings in place of the old
+/// planned-item count, which the scan logged as `created` although it counted
+/// every item the scan visited, new or not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    /// Planned items that had no stored row before this scan. An id the plan
+    /// holds twice (overlapping library locations) counts once.
+    ///
+    /// A scanner built without an item repository cannot read stored rows, so
+    /// it asks the item store whether each planned item exists instead.
+    pub created: usize,
+    /// Planned items that already had a stored row and that the scan saved.
+    /// Items whose stored rows could not be read count here too: they are
+    /// saved, but whether they existed is unknown.
+    pub updated: usize,
+    /// Planned items that already had a stored row and that the scan left
+    /// untouched.
+    pub unchanged: usize,
+    /// Stored items the scan deleted because their files are gone.
+    pub removed: usize,
+}
+
+impl std::ops::AddAssign for ScanOutcome {
+    /// Sums two passes, e.g. a scan and the rerun a coalesced request queued.
+    fn add_assign(&mut self, other: Self) {
+        self.created += other.created;
+        self.updated += other.updated;
+        self.unchanged += other.unchanged;
+        self.removed += other.removed;
+    }
+}
+
+/// The stored rows of the planned items, read one
+/// [`BATCH_BIND_CHUNK`](ferrofin_db::BATCH_BIND_CHUNK)-sized window of the plan
+/// at a time, as the scan loop reaches it.
+///
+/// The loop needs each item's stored row (whether it exists now; its dates,
+/// `Data` and lock state later), but holding every row of a 60k-item library
+/// at once is the memory spike this scan is meant to avoid. Following the plan
+/// order keeps at most one window of whole rows alive: the old window is
+/// dropped before the next one is read.
+#[derive(Default)]
+struct StoredRows {
+    /// The plan index one past the current window (0 before the first read).
+    end: usize,
+    /// The current window's rows by id; `None` only while a window is being
+    /// read.
+    rows: Option<HashMap<Uuid, BaseItemEntity>>,
+    /// Ids in the current window known (or assumed) to exist although their
+    /// rows were not read: every existing id for a scanner without an item
+    /// repository, and the rows that failed to read one by one.
+    exist_unread: std::collections::HashSet<Uuid>,
+}
+
+impl StoredRows {
+    /// Whether the loop has reached the end of the current window and must
+    /// read the next one before visiting plan index `index`.
+    fn needs_read(&self, index: usize) -> bool {
+        index >= self.end
+    }
+
+    /// What the scan knows about `id`'s stored row. Only valid for ids in the
+    /// current window.
+    fn get(&self, id: Uuid) -> Stored<'_> {
+        match &self.rows {
+            None => Stored::Unread,
+            Some(_) if self.exist_unread.contains(&id) => Stored::Unread,
+            Some(rows) => rows.get(&id).map_or(Stored::New, Stored::Existing),
+        }
+    }
+}
+
+/// One planned item's stored row, as the scan read it at its window.
+#[derive(Clone, Copy)]
+enum Stored<'a> {
+    /// No row when its window was read: this scan creates the item (unless the
+    /// plan already saved the same id earlier in this scan).
+    New,
+    /// The row as read at its window — after every earlier window's saves, so
+    /// it is the row as it stood before this scan touched this item.
+    Existing(&'a BaseItemEntity),
+    /// No row to hand: the item's row failed to read, so whether it exists is
+    /// unknown, or the scanner has no item repository and the item exists.
+    /// Treated as existing (not announced as added), as the per-item existence
+    /// check this replaced treated its own failure.
+    Unread,
+}
+
+impl<'a> Stored<'a> {
+    /// The stored row, when there is one and it was read.
+    fn row(self) -> Option<&'a BaseItemEntity> {
+        match self {
+            Self::Existing(row) => Some(row),
+            Self::New | Self::Unread => None,
+        }
+    }
+}
+
 /// Per-library done/total counters driving the `RefreshProgress` pushes.
 struct LibraryProgress {
     /// Planned items per collection folder.
@@ -1177,19 +1276,20 @@ impl LibraryScanner {
         self
     }
 
-    /// Scans every configured library; returns the number of items created.
+    /// Scans every configured library; returns what the scan did.
     ///
     /// # Errors
     /// See [`scan`](Self::scan).
-    pub async fn scan_all(&self) -> Result<usize, ServiceError> {
+    pub async fn scan_all(&self) -> Result<ScanOutcome, ServiceError> {
         self.scan(None).await
     }
 
     /// Scans the configured libraries — restricted to the one whose
     /// CollectionFolder id is `only` (all of them when `None`) — and returns
-    /// the number of items created. An `only` matching no library falls back
-    /// to a full scan rather than silently scanning nothing (the id may come
-    /// from a nested folder or a library removed mid-flight).
+    /// what the scan created, updated, left unchanged and removed. An `only`
+    /// matching no library falls back to a full scan rather than silently
+    /// scanning nothing (the id may come from a nested folder or a library
+    /// removed mid-flight).
     ///
     /// Idempotent: item ids are deterministic
     /// ([`derive_item_id`](item_type_lookup::derive_item_id)), so re-scanning
@@ -1198,7 +1298,7 @@ impl LibraryScanner {
     /// # Errors
     /// Propagates the item-store failure if listing libraries, saving an item,
     /// or writing its ancestor closure fails.
-    pub async fn scan(&self, only: Option<Uuid>) -> Result<usize, ServiceError> {
+    pub async fn scan(&self, only: Option<Uuid>) -> Result<ScanOutcome, ServiceError> {
         // `LibraryManager.PerformLibraryValidation` opens with
         // `ValidateTopLibraryFolders`, whose tail deletes the library rows whose
         // directory no longer exists. Do the same here so a library removed
@@ -1230,7 +1330,7 @@ impl LibraryScanner {
     ///
     /// # Errors
     /// Propagates the item-store failure exactly as [`scan`](Self::scan) does.
-    pub async fn scan_paths(&self, changed: &[String]) -> Result<usize, ServiceError> {
+    pub async fn scan_paths(&self, changed: &[String]) -> Result<ScanOutcome, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let affected: Vec<VirtualFolderInfo> = folders
             .into_iter()
@@ -1245,7 +1345,7 @@ impl LibraryScanner {
                 paths = changed.len(),
                 "changed paths match no library; nothing to scan"
             );
-            return Ok(0);
+            return Ok(ScanOutcome::default());
         }
         let planned = self.plan(&affected);
         let scoped: Vec<Planned> = planned
@@ -1279,7 +1379,7 @@ impl LibraryScanner {
         folders: &[VirtualFolderInfo],
         planned: Vec<Planned>,
         prune_scope: Option<&[String]>,
-    ) -> Result<usize, ServiceError> {
+    ) -> Result<ScanOutcome, ServiceError> {
         tracing::info!(
             items = planned.len(),
             folders = folders.len(),
@@ -1293,7 +1393,17 @@ impl LibraryScanner {
         let mut items_added: Vec<&Planned> = Vec::new();
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
-        let (mut art_cache, locked_items, stored_text) = self.scan_prereads(&planned).await;
+        let (mut art_cache, locked_items) = self.scan_prereads(&planned).await;
+        // Each planned item's stored row, read a window at a time just ahead
+        // of the loop (see `StoredRows`) — never the whole library at once.
+        let mut stored_rows = StoredRows::default();
+        // Ids this scan created, so a repeat of one in the plan is an update.
+        // Only new items land here, so an unchanged-library rescan holds none.
+        let mut created_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut outcome = ScanOutcome::default();
+        // The episode providers' re-scan gate reads the stored row's text.
+        let episode_type =
+            item_type_lookup::stored_type_name(ferrofin_model::data::BaseItemKind::Episode);
         // Per-library fetcher policies, keyed by the collection-folder id
         // every Planned item carries as its first ancestor. This is what
         // makes the dashboard's per-library "Metadata downloaders" and
@@ -1312,8 +1422,17 @@ impl LibraryScanner {
         for (scanned, item) in planned.iter().enumerate() {
             tracing::debug!(item = %item.id, "scanning item");
             self.log_scan_progress(scanned, planned.len());
-            if self.events.is_some() && !self.persistence.item_exists(item.id).await.unwrap_or(true)
-            {
+            if stored_rows.needs_read(scanned) {
+                // Boxed: the read is awaited inside the loop, and inlining its
+                // future would grow the scan future (`large_futures`).
+                Box::pin(self.read_stored_window(&planned, &mut stored_rows)).await;
+            }
+            // The row as it stood before this scan: an item is new iff it has
+            // none. A planned id repeated (overlapping library locations) is
+            // new only the first time: its window was read before that save.
+            let stored_row = stored_rows.get(item.id);
+            let is_new = matches!(stored_row, Stored::New) && created_ids.insert(item.id);
+            if is_new && self.events.is_some() {
                 items_added.push(item);
             }
             // A locked item's metadata, cast, and artwork are user-owned: run
@@ -1323,9 +1442,15 @@ impl LibraryScanner {
             // columns; file-derived facts (the probe) still update.
             let locked = locked_items.contains(&item.id);
             let policy = policy_for(item, &fetcher_policies);
-            // What a previous scan already achieved for this row, from the same
-            // read-once-per-scan batch the lock set uses.
-            let stored = stored_text.get(&item.id);
+            // What a previous scan already achieved for this episode, lifted
+            // out of its stored row.
+            let stored_text = stored_row
+                .row()
+                .filter(|row| {
+                    episode_type.is_some_and(|ep| item.entity.type_ == ep && row.type_ == ep)
+                })
+                .map(StoredText::from_entity);
+            let stored = stored_text.as_ref();
             // Probe first so the item row is saved already carrying its duration and
             // size (the streams themselves are saved after, since they FK the row).
             let mut entity = item.entity.clone();
@@ -1436,6 +1561,11 @@ impl LibraryScanner {
             self.persistence
                 .save_scanned_items(std::slice::from_ref(&entity))
                 .await?;
+            if is_new {
+                outcome.created += 1;
+            } else {
+                outcome.updated += 1;
+            }
             if let Some(key) = moved_series_key {
                 // `SeriesMetadataService.UpdateSeriesChildrenInfoAsync`: the
                 // children a previous scan stored under the old key are
@@ -1486,7 +1616,75 @@ impl LibraryScanner {
         // images) run once per scan, and inlining their state kept the scan
         // future at clippy's `large_futures` ceiling.
         Box::pin(self.post_scan_passes(folders, &art_cache)).await;
-        Ok(planned.len())
+        outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
+        Ok(outcome)
+    }
+
+    /// Replaces `window` with the stored rows of the next
+    /// [`BATCH_BIND_CHUNK`](ferrofin_db::BATCH_BIND_CHUNK) planned items.
+    ///
+    /// The previous window is dropped before the read, so at most one window
+    /// of whole rows is alive at a time. When the batch read fails, the window
+    /// is re-read one row at a time, so only the rows that cannot be read are
+    /// left unread (see [`Stored::Unread`]).
+    ///
+    /// Without an item repository no row can be read, so the item store is
+    /// asked per item whether it exists — the check this read replaced, kept
+    /// for that wiring so its counts and `ItemsAdded` stay exact.
+    async fn read_stored_window(&self, planned: &[Planned], window: &mut StoredRows) {
+        let start = window.end;
+        let end = (start + ferrofin_db::BATCH_BIND_CHUNK).min(planned.len());
+        window.end = end;
+        window.rows = None;
+        window.exist_unread.clear();
+        let ids: Vec<Uuid> = planned[start..end].iter().map(|p| p.id).collect();
+        let Some(repo) = &self.item_repository else {
+            for id in ids {
+                if self.persistence.item_exists(id).await.unwrap_or(true) {
+                    window.exist_unread.insert(id);
+                }
+            }
+            window.rows = Some(HashMap::new());
+            return;
+        };
+        match repo.retrieve_items(&ids).await {
+            Ok(rows) => {
+                window.rows = Some(
+                    rows.into_iter()
+                        .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+                        .collect(),
+                );
+            }
+            Err(err) => {
+                // One row the decoder rejects fails the whole batch, and it
+                // stays that way scan after scan (the upsert preserves most
+                // stored columns). Re-read the window row by row so only the
+                // undecodable rows lose their stored state.
+                let mut rows = HashMap::new();
+                let mut failed = 0_usize;
+                for id in ids {
+                    match repo.retrieve_item(id).await {
+                        Ok(Some(row)) => {
+                            rows.insert(id, row);
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            // Unknown, not absent: still scanned and saved,
+                            // but not announced as added.
+                            failed += 1;
+                            window.exist_unread.insert(id);
+                        }
+                    }
+                }
+                window.rows = Some(rows);
+                tracing::warn!(
+                    %err,
+                    failed,
+                    "failed to read a window of stored items; re-read it per item, \
+                     treating the unreadable ones as existing"
+                );
+            }
+        }
     }
 
     /// Writes an item's cast/crew, if there is anything authoritative to write.
@@ -1617,11 +1815,7 @@ impl LibraryScanner {
     async fn scan_prereads(
         &self,
         planned: &[Planned],
-    ) -> (
-        Box<ArtworkCache>,
-        std::collections::HashSet<Uuid>,
-        std::collections::HashMap<Uuid, StoredText>,
-    ) {
+    ) -> (Box<ArtworkCache>, std::collections::HashSet<Uuid>) {
         // Carries matched series' TMDB ids + their episode-still URLs across
         // the scan so seasons/episodes resolve against the same series lookup,
         // pre-seeded with the external ids previous scans recorded.
@@ -1635,9 +1829,7 @@ impl LibraryScanner {
         // One read of the locked-item set for the whole scan, replacing the
         // per-item row hydration the loop used to pay (see `locked_items`).
         let locked_items = self.locked_items(planned).await;
-        // Same one-read-per-scan shape, for the episode providers' gate.
-        let stored_text = self.stored_episode_text(planned).await;
-        (art_cache, locked_items, stored_text)
+        (art_cache, locked_items)
     }
 
     /// Seeds the scan's provider-id cache with the ids previous scans recorded,
@@ -4393,72 +4585,6 @@ impl LibraryScanner {
         }
     }
 
-    /// The stored text of every episode, read once per scan.
-    ///
-    /// The same shape and the same reason as
-    /// [`locked_items`](Self::locked_items): the episode providers' re-scan
-    /// gate needs what a previous scan achieved, and asking per item would
-    /// reinstate the `SELECT *`-per-item cost that read was introduced to
-    /// remove. Episodes only — they are the sole consumer.
-    async fn stored_episode_text(
-        &self,
-        planned: &[Planned],
-    ) -> std::collections::HashMap<Uuid, StoredText> {
-        let Some(repo) = &self.item_repository else {
-            return std::collections::HashMap::new();
-        };
-        // Only the episodes this scan planned. Reading every episode row
-        // instead costs ~113 ms and ~30 MB on a 60k-episode library — paid in
-        // full by `scan_paths`, which the library monitor runs for one changed
-        // file, and paid by libraries with no episodes in them at all.
-        let episode_type =
-            item_type_lookup::stored_type_name(ferrofin_model::data::BaseItemKind::Episode);
-        let ids: Vec<Uuid> = planned
-            .iter()
-            .filter(|p| Some(p.entity.type_.as_str()) == episode_type)
-            .map(|p| p.id)
-            .collect();
-        if ids.is_empty() {
-            return std::collections::HashMap::new();
-        }
-        match repo
-            .item_text_rows(ferrofin_model::data::BaseItemKind::Episode, &ids)
-            .await
-        {
-            Ok(rows) => {
-                let mut dropped = 0_usize;
-                let map: std::collections::HashMap<Uuid, StoredText> = rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        // Parse before the move: `from_row` takes the row by
-                        // value, so the borrow of `row.id` must end first.
-                        let parsed = Uuid::parse_str(&row.id);
-                        if let Ok(id) = parsed {
-                            Some((id, StoredText::from_row(row)))
-                        } else {
-                            dropped += 1;
-                            None
-                        }
-                    })
-                    .collect();
-                if dropped > 0 {
-                    // Silently dropping rows here would look like "no previous
-                    // scan" and re-fetch forever, so say it happened.
-                    tracing::debug!(dropped, "stored episode rows with unparseable ids");
-                }
-                map
-            }
-            Err(err) => {
-                // A closed gate re-fetches; it does NOT protect the stored
-                // title, because the scan upsert writes `excluded."Name"` for
-                // an unlocked row. A fetch that then misses would put the
-                // file-stem placeholder back.
-                tracing::warn!(%err, "failed to read stored episode text; re-fetching all");
-                std::collections::HashMap::new()
-            }
-        }
-    }
-
     /// Appends rows for art files already sitting in the item's metadata art
     /// dir (`{meta}/library/{id}` — user uploads and previously downloaded
     /// artwork) whose image type discovery did not produce, so an uploaded
@@ -7014,7 +7140,7 @@ fn name_is_file_stem_placeholder(entity: &BaseItemEntity) -> bool {
 }
 
 /// [`name_is_file_stem_placeholder`] over the two fields it reads, so the
-/// narrow `ItemTextRow` projection can use the identical rule.
+/// episode gate's `StoredText` can use the identical rule.
 fn name_is_placeholder(name: Option<&str>, path: Option<&str>) -> bool {
     match (name, path) {
         (None | Some(""), _) => true,
@@ -10218,12 +10344,12 @@ mod tests {
 
         // What an earlier scan achieved. `episode` is the freshly-planned row,
         // still carrying the file stem and no overview.
-        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
-            id: String::new(),
+        let stored = super::StoredText::from_entity(&BaseItemEntity {
             name: Some("Winter Is Coming".into()),
             sort_name: Some("001 - 0001 - Winter Is Coming".into()),
             overview: Some("Ned is summoned south.".into()),
             path: episode.path.clone(),
+            ..Default::default()
         });
 
         scanner
@@ -10250,12 +10376,12 @@ mod tests {
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
 
         // A stale key: what the pre-convergence scanner wrote for this title.
-        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
-            id: String::new(),
+        let stored = super::StoredText::from_entity(&BaseItemEntity {
             name: Some("Winter Is Coming".into()),
             sort_name: Some("winter is coming".into()),
             overview: Some("Ned is summoned south.".into()),
             path: episode.path.clone(),
+            ..Default::default()
         });
 
         scanner
@@ -10280,12 +10406,12 @@ mod tests {
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
         episode.forced_sort_name = Some("Thrones 01".into());
 
-        let stored = super::StoredText::from_row(ferrofin_db::entities::base_items::ItemTextRow {
-            id: String::new(),
+        let stored = super::StoredText::from_entity(&BaseItemEntity {
             name: Some("Winter Is Coming".into()),
             sort_name: Some("thrones 0000000001".into()),
             overview: Some("Ned is summoned south.".into()),
             path: episode.path.clone(),
+            ..Default::default()
         });
 
         scanner
@@ -12407,6 +12533,76 @@ mod tests {
         );
     }
 
+    // The stored-row pre-read runs one `BATCH_BIND_CHUNK` window of the plan at
+    // a time. A library larger than one window must still classify every item
+    // correctly on both sides of the boundary: new files in the second window
+    // are created, existing ones there are updated, and the prune still sees
+    // the whole plan.
+    #[tokio::test]
+    async fn scan_outcome_is_exact_across_stored_row_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).unwrap();
+        let total = ferrofin_db::BATCH_BIND_CHUNK + 20;
+        for i in 0..total {
+            std::fs::write(media.join(format!("Movie {i:04} (2000).mkv")), b"").unwrap();
+        }
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_items(items)
+                .with_progress_every(0);
+
+        assert_eq!(
+            scanner.scan_all().await.unwrap(),
+            super::ScanOutcome {
+                created: total,
+                ..Default::default()
+            }
+        );
+
+        // One file gone and one new file, both sorting into the last window.
+        std::fs::remove_file(media.join(format!("Movie {:04} (2000).mkv", total - 1))).unwrap();
+        std::fs::write(media.join("Movie 9999 (2000).mkv"), b"").unwrap();
+        assert_eq!(
+            scanner.scan_all().await.unwrap(),
+            super::ScanOutcome {
+                created: 1,
+                updated: total - 1,
+                unchanged: 0,
+                removed: 1,
+            }
+        );
+        assert_eq!(
+            count_type_like(&db, "%Movies.Movie").await,
+            i64::try_from(total).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn scan_creates_movie_rows_with_parent_and_ancestors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12438,11 +12634,22 @@ mod tests {
         .await
         .unwrap();
 
+        // The item repository is what lets the scan read stored rows (without
+        // it the scan falls back to a per-item existence check).
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
         let scanner =
-            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence);
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_items(items);
         assert_eq!(
             scanner.scan_all().await.unwrap(),
-            2,
+            super::ScanOutcome {
+                created: 2,
+                ..Default::default()
+            },
             "two movies (flat + nested), poster ignored"
         );
 
@@ -12475,13 +12682,32 @@ mod tests {
                 .unwrap();
         assert_eq!(ancestor_rows, 2);
 
-        // Deterministic ids → re-scan upserts, does not duplicate.
-        assert_eq!(scanner.scan_all().await.unwrap(), 2);
+        // Deterministic ids → re-scan upserts, does not duplicate: nothing is
+        // created, and (until per-item change detection) every row is re-saved.
+        assert_eq!(
+            scanner.scan_all().await.unwrap(),
+            super::ScanOutcome {
+                updated: 2,
+                ..Default::default()
+            }
+        );
         assert_eq!(
             count_type_like(&db, "%Movies.Movie").await,
             2,
             "re-scan did not duplicate"
         );
+
+        // A deleted file is pruned and counted as removed, not as updated.
+        std::fs::remove_file(media.join("Dune (2021)/Dune (2021).mkv")).unwrap();
+        assert_eq!(
+            scanner.scan_all().await.unwrap(),
+            super::ScanOutcome {
+                updated: 1,
+                removed: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(count_type_like(&db, "%Movies.Movie").await, 1);
     }
 
     // Deleting media from disk must remove it from the library on the next
@@ -12686,8 +12912,11 @@ mod tests {
 
         let scanner =
             LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence);
-        let created = scanner.scan(Some(tv_cf)).await.unwrap();
-        assert!(created > 0, "the TV library itself must still be scanned");
+        let outcome = scanner.scan(Some(tv_cf)).await.unwrap();
+        assert!(
+            outcome.created > 0,
+            "the TV library itself must still be scanned"
+        );
         assert_eq!(
             count_type_like(&db, "%Movies.Movie").await,
             0,
@@ -12757,21 +12986,35 @@ mod tests {
         // A new file: only it is planned and created.
         let new_path = movies.join("Solaris (1972).mkv");
         std::fs::write(&new_path, b"").unwrap();
-        let created = scanner
+        let outcome = scanner
             .scan_paths(&[new_path.to_string_lossy().into_owned()])
             .await
             .unwrap();
-        assert_eq!(created, 1, "only the new file is planned");
+        assert_eq!(
+            outcome,
+            super::ScanOutcome {
+                created: 1,
+                ..Default::default()
+            },
+            "only the new file is planned"
+        );
         assert_eq!(count_type_like(&db, "%Movies.Movie").await, 3);
 
         // A deleted file: exactly its row is pruned.
         let gone = movies.join("Alien (1979).mkv");
         std::fs::remove_file(&gone).unwrap();
-        let created = scanner
+        let outcome = scanner
             .scan_paths(&[gone.to_string_lossy().into_owned()])
             .await
             .unwrap();
-        assert_eq!(created, 0, "a deletion plans nothing");
+        assert_eq!(
+            outcome,
+            super::ScanOutcome {
+                removed: 1,
+                ..Default::default()
+            },
+            "a deletion plans nothing and prunes exactly its row"
+        );
         assert_eq!(count_type_like(&db, "%Movies.Movie").await, 2);
 
         // A path outside every library is ignored.
@@ -12780,7 +13023,7 @@ mod tests {
                 .scan_paths(&["/nowhere/else.mkv".to_owned()])
                 .await
                 .unwrap(),
-            0
+            super::ScanOutcome::default()
         );
         assert_eq!(count_type_like(&db, "%Movies.Movie").await, 2);
     }
@@ -12814,21 +13057,32 @@ mod tests {
         )
         .await
         .unwrap();
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
         let scanner =
-            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence);
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_items(items);
         scanner.scan_all().await.unwrap();
         assert_eq!(count_type_like(&db, "%TV.Episode").await, 1);
 
         std::fs::create_dir_all(tv.join("Firefly/Season 02")).unwrap();
         let ep2 = tv.join("Firefly/Season 02/Firefly S02E01.mkv");
         std::fs::write(&ep2, b"").unwrap();
-        let created = scanner
+        let outcome = scanner
             .scan_paths(&[ep2.to_string_lossy().into_owned()])
             .await
             .unwrap();
         assert_eq!(
-            created, 3,
-            "the new episode plus its series/season ancestors"
+            outcome,
+            super::ScanOutcome {
+                created: 2,
+                updated: 1,
+                ..Default::default()
+            },
+            "the new episode and season are created; the existing series ancestor is re-saved"
         );
         assert_eq!(count_type_like(&db, "%TV.Episode").await, 2);
         assert_eq!(count_type_like(&db, "%TV.Season").await, 2);

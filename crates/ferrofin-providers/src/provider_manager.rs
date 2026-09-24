@@ -5298,6 +5298,12 @@ mod tests {
             let _ = self.seen.send(id);
             Ok(self.rows.get(&id).cloned())
         }
+        async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(ids
+                .iter()
+                .filter_map(|id| self.rows.get(id).cloned())
+                .collect())
+        }
         async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
             Ok(self
                 .rows
@@ -5305,13 +5311,6 @@ mod tests {
                 .filter(|(_, row)| row.is_locked)
                 .map(|(id, _)| *id)
                 .collect())
-        }
-        async fn item_text_rows(
-            &self,
-            _kind: ferrofin_model::data::BaseItemKind,
-            _ids: &[Uuid],
-        ) -> Result<Vec<ferrofin_db::entities::base_items::ItemTextRow>, ServiceError> {
-            unimplemented!()
         }
         async fn get_ancestor_chain(
             &self,

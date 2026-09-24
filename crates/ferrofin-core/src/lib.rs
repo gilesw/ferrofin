@@ -263,7 +263,7 @@ pub use library_manager::FerrofinLibraryManager;
 pub use library_monitor::{
     FerrofinLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
 };
-pub use library_scan::LibraryScanner;
+pub use library_scan::{LibraryScanner, ScanOutcome};
 pub use linked_children_service::FerrofinLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::FerrofinLyricManager;

@@ -988,7 +988,7 @@ impl FerrofinLibraryManager {
         Some(async move {
             let started = std::time::Instant::now();
             tracing::info!("library scan started");
-            let mut total_created = 0usize;
+            let mut total = crate::library_scan::ScanOutcome::default();
             let mut scope = scope;
             loop {
                 let result = match scope {
@@ -997,9 +997,15 @@ impl FerrofinLibraryManager {
                     ScanScope::Paths(ref paths) => scanner.scan_paths(paths).await,
                 };
                 match result {
-                    Ok(created) => {
-                        total_created += created;
-                        tracing::info!(created, "library scan pass complete");
+                    Ok(pass) => {
+                        total += pass;
+                        tracing::info!(
+                            created = pass.created,
+                            updated = pass.updated,
+                            unchanged = pass.unchanged,
+                            removed = pass.removed,
+                            "library scan pass complete"
+                        );
                     }
                     // Logged exactly once, here, at the scan task's top level.
                     Err(err) => tracing::error!(%err, "library scan failed"),
@@ -1013,7 +1019,10 @@ impl FerrofinLibraryManager {
             }
             in_flight.store(false, Ordering::Release);
             tracing::info!(
-                created = total_created,
+                created = total.created,
+                updated = total.updated,
+                unchanged = total.unchanged,
+                removed = total.removed,
                 elapsed_ms = started.elapsed().as_millis(),
                 "library scan complete"
             );
