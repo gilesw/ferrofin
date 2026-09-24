@@ -148,6 +148,9 @@ impl RateLimiter {
             1
         };
         let context = request_context(&self.provider, request.url());
+        // One line per outbound provider call (retries excluded): what counts a
+        // scan's remote traffic. Debug, because it scales with library size.
+        tracing::debug!(provider = %self.provider, %context, "metadata provider request");
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
         for attempt in 1..=attempts {
