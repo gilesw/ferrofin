@@ -156,12 +156,15 @@ async fn an_unreadable_row_leaves_only_itself_unread() {
         rescan,
         ScanOutcome {
             created: 1,
-            updated: 2,
+            updated: 1,
+            unchanged: 1,
             ..ScanOutcome::default()
         },
-        "the new file is still created; the healthy and the unreadable rows are updates"
+        "the new file is still created; the unreadable row is saved as an update \
+         (nothing can be compared with it), and the healthy row, re-read on its \
+         own, is found unchanged"
     );
-    assert_eq!(movie_rows(&db).await, 3, "every item is saved");
+    assert_eq!(movie_rows(&db).await, 3, "no row is lost");
     let announced: Vec<uuid::Uuid> = added(&changes)
         .iter()
         .map(|id| uuid::Uuid::parse_str(id).expect("announced id"))
@@ -206,9 +209,10 @@ async fn without_an_item_repository_a_rescan_announces_nothing() {
     assert_eq!(added(&changes).len(), 2, "a rescan announces no additions");
 }
 
-// Overlapping library locations plan the same kind+path id twice. Both copies
-// sit in one window read before either was saved, so both read as new; only
-// the first may count as created and be announced.
+// Overlapping library locations plan the same kind+path id twice, each copy
+// with its own parent. Only the last copy is refreshed — the one whose row
+// always won — so the file is created and announced once, and a rescan is
+// quiet instead of saving each copy over the other every time.
 #[tokio::test]
 async fn a_repeated_planned_id_is_created_and_announced_once() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -228,10 +232,32 @@ async fn a_repeated_planned_id_is_created_and_announced_once() {
         first,
         ScanOutcome {
             created: 1,
-            updated: 1,
+            unchanged: 1,
             ..ScanOutcome::default()
         },
-        "the plan holds the file twice; the repeat is an update"
+        "the plan holds the file twice; the superseded copy writes nothing"
     );
     assert_eq!(added(&changes).len(), 1, "announced once");
+    let parent = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            r#"SELECT "ParentId" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("parent")
+    };
+    let first_parent = parent().await;
+
+    for scan in ["second", "third"] {
+        assert_eq!(
+            scanner.scan_all().await.expect("rescan"),
+            ScanOutcome {
+                unchanged: 2,
+                ..ScanOutcome::default()
+            },
+            "{scan} scan is quiet"
+        );
+        assert_eq!(parent().await, first_parent, "the ParentId is stable");
+    }
+    assert_eq!(added(&changes).len(), 1);
 }

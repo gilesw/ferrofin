@@ -56,12 +56,26 @@ const SEASON_JSON: &str = r#"{
 /// through.
 const CREDITS_JSON: &str = r#"{"cast": [{"id": 1, "name": "Sean Bean", "character": "Ned"}]}"#;
 
+/// `/tv/{id}` for a series that has everything the backfill gates want
+/// (an overview and a trailer), so no heuristic asks for it again.
+const ENRICHED_SERIES_DETAILS_JSON: &str = r#"{"overview": "A series.", "genres": [],
+    "videos": {"results": [{"site": "YouTube", "type": "Trailer", "key": "k", "name": "T"}]}}"#;
+
 /// A TMDB stand-in counting the per-episode credits requests.
 fn spawn_tmdb() -> (String, Arc<AtomicUsize>) {
+    let (base, credits, _) = spawn_tmdb_with(SERIES_DETAILS_JSON);
+    (base, credits)
+}
+
+/// [`spawn_tmdb`] with the given series details, also counting the series
+/// searches.
+fn spawn_tmdb_with(series_details: &'static str) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let credits = Arc::new(AtomicUsize::new(0));
+    let searches = Arc::new(AtomicUsize::new(0));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let counter = Arc::clone(&credits);
+    let search_counter = Arc::clone(&searches);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { break };
@@ -75,9 +89,10 @@ fn spawn_tmdb() -> (String, Arc<AtomicUsize>) {
             } else if req.contains("/season/") {
                 ("200 OK", SEASON_JSON)
             } else if req.contains("/search/tv") {
+                search_counter.fetch_add(1, Ordering::SeqCst);
                 ("200 OK", SERIES_SEARCH_JSON)
             } else if req.contains("/tv/") {
-                ("200 OK", SERIES_DETAILS_JSON)
+                ("200 OK", series_details)
             } else {
                 ("404 Not Found", "{}")
             };
@@ -88,7 +103,7 @@ fn spawn_tmdb() -> (String, Arc<AtomicUsize>) {
             );
         }
     });
-    (format!("http://{addr}"), credits)
+    (format!("http://{addr}"), credits, searches)
 }
 
 #[tokio::test]
@@ -164,11 +179,17 @@ async fn a_rescan_hands_the_stored_episode_text_to_the_gate() {
     // fetched again, and the save — the stored row with this pass merged on —
     // keeps everything TMDB supplied: the text, and (the regression the old
     // hand-carried gate had) the air date, year and rating.
+    //
+    // Since change detection, the unchanged season and episodes run no
+    // provider at all. The series has no remote trailers, so the kept
+    // `wants_trailers` backfill (owner decision D2) asks TMDB again — but
+    // TMDB answers exactly what is stored, so nothing is written for it
+    // either.
     let rescan = scanner.scan_all().await.expect("rescan");
     assert_eq!(
         rescan,
         ScanOutcome {
-            updated: 4,
+            unchanged: 4,
             ..ScanOutcome::default()
         }
     );
@@ -187,4 +208,89 @@ async fn a_rescan_hands_the_stored_episode_text_to_the_gate() {
     assert_eq!(stored.premiere_date, first.premiere_date);
     assert_eq!(stored.production_year, Some(2011));
     assert_eq!(stored.community_rating, Some(8.5));
+}
+
+/// A changed episode under an unchanged series: the episode runs every
+/// provider, the series none. The episode still resolves, through the TMDB id
+/// the series' earlier scan recorded — nothing matched the series this scan.
+#[tokio::test]
+async fn a_changed_episode_under_an_unchanged_series_resolves_through_the_recorded_id() {
+    let (base, credits, searches) = spawn_tmdb_with(ENRICHED_SERIES_DETAILS_JSON);
+    let tmp = tempfile::tempdir().expect("tmp");
+    let tv = tmp.path().join("tv");
+    let season = tv.join("GoT").join("Season 1");
+    std::fs::create_dir_all(&season).expect("mkdir");
+    for ep in ["GoT S01E01.mkv", "GoT S01E02.mkv"] {
+        std::fs::write(season.join(ep), b"").expect("write");
+    }
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "TV",
+        Some(CollectionTypeOptions::tvshows),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: tv.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_items(Arc::clone(&items));
+
+    assert_eq!(scanner.scan_all().await.expect("first").created, 4);
+    assert_eq!(credits.load(Ordering::SeqCst), 2);
+    let searches_before = searches.load(Ordering::SeqCst);
+    assert_eq!(
+        scanner.scan_all().await.expect("rescan"),
+        ScanOutcome {
+            unchanged: 4,
+            ..ScanOutcome::default()
+        },
+        "an enriched series and its unchanged episodes are left alone"
+    );
+
+    let file = season.join("GoT S01E01.mkv");
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+        .expect("touch");
+    assert_eq!(
+        scanner.scan_all().await.expect("rescan"),
+        ScanOutcome {
+            updated: 1,
+            unchanged: 3,
+            ..ScanOutcome::default()
+        }
+    );
+    assert_eq!(
+        credits.load(Ordering::SeqCst),
+        3,
+        "the changed episode asked TMDB for its credits again"
+    );
+    assert_eq!(
+        searches.load(Ordering::SeqCst),
+        searches_before,
+        "without searching for the unchanged series"
+    );
+    let id = derive_item_id(BaseItemKind::Episode, &file.to_string_lossy()).expect("id");
+    let row = items.retrieve_item(id).await.expect("read").expect("row");
+    assert_eq!(row.name.as_deref(), Some("Winter Is Coming"));
 }

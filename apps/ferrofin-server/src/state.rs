@@ -978,6 +978,9 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
     )
     .with_id_derivation(id_derivation)
+    // Adopted image rows' `%MetadataPath%` tokens, for the scan's local image
+    // validation (the same expansion every image reader applies).
+    .with_virtual_paths(virtual_paths.clone())
     // Materialize a `Year` item per distinct ProductionYear at the end of
     // every scan (needs the item repository wired via `with_music` below).
     .with_years(year_store.clone())

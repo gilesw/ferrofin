@@ -24,7 +24,20 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::{ItemPersistenceService, StoredImageMetadata};
+use ferrofin_traits::persistence::{ItemPersistenceService, StoredImageMetadata, StoredItemLinks};
+use std::collections::HashMap;
+
+/// One `BaseItemImageInfos` row as the scan's change detection reads it:
+/// `ItemId`, `ImageType`, `Path`, `Width`, `Height`, `Blurhash`, `DateModified`.
+type ScanImageRow = (
+    String,
+    i32,
+    String,
+    i64,
+    i64,
+    Option<Vec<u8>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
 use ferrofin_model::data::BaseItemKind;
 
@@ -1133,132 +1146,239 @@ impl FerrofinItemPersistenceService {
     /// Upserts a single item row (`INSERT … ON CONFLICT("Id") DO UPDATE`) using
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
-    /// columns in the same order.
+    /// columns in the same order: [`written_columns`]'s, then the save time.
     async fn upsert_item(&self, item: &BaseItemEntity, sql: &str) -> Result<(), ServiceError> {
-        // C# `SaveItem` always stamps `CleanName = GetCleanValue(item.Name)` at
-        // write time (no caller pre-computes it); deriving here keeps every
-        // saved item matchable by the search filter, which queries `CleanName`.
-        let clean_name = item
-            .name
-            .as_deref()
-            .filter(|n| !n.is_empty())
-            .map(crate::text_util::get_clean_value);
-        let presentation_unique_key = derive_presentation_key(item);
-        // Same reasoning for `SortName`, and it is why this belongs here rather
-        // than at each call site. In C# `SortName` is not a field a caller can
-        // forget: `BaseItem.SortName` is a lazy property that resolves to
-        // `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)` or
-        // `CreateSortName()` on first read, so `SaveItems` can never persist a
-        // null. Modelled as a plain `Option` on the entity, every construction
-        // site *could* forget — and several did, leaving 7,191 of 9,865 rows
-        // with `SortName IS NULL`. That is not merely an unsorted list:
-        // `nameStartsWith` filters `lower(SortName)` (faithfully to C#
-        // `ApplyNameFilters`), so a NULL row matches nothing and the A-Z picker
-        // returned `TotalRecordCount: 0` for types that had hundreds of rows.
-        //
-        // A caller-supplied value always wins — that is what carries the
-        // per-kind `CreateSortName` overrides (episode/season) the scanner
-        // computes, which drive the client's play queue.
-        //
-        // Both fallbacks go through the kind-aware helpers in `kinds`, not
-        // `create_sort_name` / `forced_sort_key` directly, because `GetSortName`
-        // has a per-kind branch: `Person` overrides `EnableAlphaNumericSorting
-        // => false` and keeps its name — or its forced sort name — verbatim.
-        // Deriving the generic key for a `Person` here lower-cased rows the
-        // people repository had written correctly.
-        let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
-        let sort_name = item.sort_name.clone().or_else(|| {
-            let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
-            match forced {
-                Some(f) => Some(match sort_kind {
-                    Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
-                    None => ferrofin_util::sort_name::forced_sort_key(f),
-                }),
-                None => item.name.as_deref().map(|n| match sort_kind {
-                    Some(kind) => crate::kinds::sort_name_for(kind, n),
-                    None => ferrofin_util::sort_name::create_sort_name(n),
-                }),
-            }
-        });
-        sqlx::query(sql)
-            .bind(&item.id)
-            .bind(&item.album)
-            .bind(&item.album_artists)
-            .bind(&item.artists)
-            .bind(item.audio)
-            .bind(&item.channel_id)
-            .bind(clean_name)
-            .bind(item.community_rating)
-            .bind(item.critic_rating)
-            .bind(&item.custom_rating)
-            .bind(&item.data)
-            .bind(opt_datetime_to_db(item.date_created))
-            .bind(opt_datetime_to_db(item.date_last_media_added))
-            .bind(opt_datetime_to_db(item.date_last_refreshed))
-            .bind(opt_datetime_to_db(item.date_last_saved))
-            .bind(opt_datetime_to_db(item.date_modified))
-            .bind(opt_datetime_to_db(item.end_date))
-            .bind(&item.episode_title)
-            .bind(&item.external_id)
-            .bind(&item.external_series_id)
-            .bind(&item.external_service_id)
-            .bind(item.extra_type)
-            .bind(&item.forced_sort_name)
-            .bind(&item.genres)
-            .bind(item.height)
-            .bind(item.index_number)
-            .bind(item.inherited_parental_rating_sub_value)
-            .bind(item.inherited_parental_rating_value)
-            .bind(item.is_folder)
-            .bind(item.is_in_mixed_folder)
-            .bind(item.is_locked)
-            .bind(item.is_movie)
-            .bind(item.is_repeat)
-            .bind(item.is_series)
-            .bind(item.is_virtual_item)
-            .bind(item.lufs)
-            .bind(&item.media_type)
-            .bind(&item.name)
-            .bind(item.normalization_gain)
-            .bind(&item.official_rating)
-            .bind(&item.original_language)
-            .bind(&item.original_title)
-            .bind(&item.overview)
-            .bind(&item.owner_id)
-            .bind(&item.parent_id)
-            .bind(item.parent_index_number)
-            .bind(&item.path)
-            .bind(&item.preferred_metadata_country_code)
-            .bind(&item.preferred_metadata_language)
-            .bind(opt_datetime_to_db(item.premiere_date))
-            .bind(&presentation_unique_key)
-            .bind(&item.primary_version_id)
-            .bind(&item.production_locations)
-            .bind(item.production_year)
-            .bind(item.run_time_ticks)
-            .bind(&item.season_id)
-            .bind(&item.season_name)
-            .bind(&item.series_id)
-            .bind(&item.series_name)
-            .bind(&item.series_presentation_unique_key)
-            .bind(&item.show_id)
-            .bind(item.size)
-            .bind(&sort_name)
-            .bind(opt_datetime_to_db(item.start_date))
-            .bind(&item.studios)
-            .bind(&item.tagline)
-            .bind(&item.tags)
-            .bind(&item.top_parent_id)
-            .bind(item.total_bitrate)
-            .bind(&item.type_)
-            .bind(&item.unrated_type)
-            .bind(item.width)
+        let mut query = sqlx::query(sql);
+        for (_, value) in written_columns(item) {
+            query = match value {
+                Column::Text(v) => query.bind(v),
+                Column::Int(v) => query.bind(v),
+                Column::Real(v) => query.bind(v),
+                Column::Bool(v) => query.bind(v),
+            };
+        }
+        query
             .bind(datetime_to_db(chrono::Utc::now()))
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
         Ok(())
     }
+}
+
+/// One `BaseItems` column value as [`FerrofinItemPersistenceService`] binds
+/// it: dates already in [`datetime_to_db`]'s text form, so two values compare
+/// equal exactly when the stored text would.
+#[derive(Debug, Clone, PartialEq)]
+enum Column {
+    Text(Option<String>),
+    Int(Option<i64>),
+    Real(Option<f64>),
+    Bool(bool),
+}
+
+/// The column values the upsert binds for `item`, in [`UPSERT_SQL`]'s
+/// column (= bind) order (an update writes the save time into
+/// `DateLastSaved` instead of this value). The write-time derivations are
+/// applied here, so this is exactly what reaches the table.
+fn written_columns(item: &BaseItemEntity) -> Vec<(&'static str, Column)> {
+    // C# `SaveItem` always stamps `CleanName = GetCleanValue(item.Name)` at
+    // write time (no caller pre-computes it); deriving here keeps every
+    // saved item matchable by the search filter, which queries `CleanName`.
+    let clean_name = item
+        .name
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .map(crate::text_util::get_clean_value);
+    let presentation_unique_key = derive_presentation_key(item);
+    // Same reasoning for `SortName`, and it is why this belongs here rather
+    // than at each call site. In C# `SortName` is not a field a caller can
+    // forget: `BaseItem.SortName` is a lazy property that resolves to
+    // `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)` or
+    // `CreateSortName()` on first read, so `SaveItems` can never persist a
+    // null. Modelled as a plain `Option` on the entity, every construction
+    // site *could* forget — and several did, leaving 7,191 of 9,865 rows
+    // with `SortName IS NULL`. That is not merely an unsorted list:
+    // `nameStartsWith` filters `lower(SortName)` (faithfully to C#
+    // `ApplyNameFilters`), so a NULL row matches nothing and the A-Z picker
+    // returned `TotalRecordCount: 0` for types that had hundreds of rows.
+    //
+    // A caller-supplied value always wins — that is what carries the
+    // per-kind `CreateSortName` overrides (episode/season) the scanner
+    // computes, which drive the client's play queue.
+    //
+    // Both fallbacks go through the kind-aware helpers in `kinds`, not
+    // `create_sort_name` / `forced_sort_key` directly, because `GetSortName`
+    // has a per-kind branch: `Person` overrides `EnableAlphaNumericSorting
+    // => false` and keeps its name — or its forced sort name — verbatim.
+    // Deriving the generic key for a `Person` here lower-cased rows the
+    // people repository had written correctly.
+    let sort_kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+    let sort_name = item.sort_name.clone().or_else(|| {
+        let forced = item.forced_sort_name.as_deref().filter(|f| !f.is_empty());
+        match forced {
+            Some(f) => Some(match sort_kind {
+                Some(kind) => crate::kinds::forced_sort_name_for(kind, f),
+                None => ferrofin_util::sort_name::forced_sort_key(f),
+            }),
+            None => item.name.as_deref().map(|n| match sort_kind {
+                Some(kind) => crate::kinds::sort_name_for(kind, n),
+                None => ferrofin_util::sort_name::create_sort_name(n),
+            }),
+        }
+    });
+    columns_of(item, clean_name, presentation_unique_key, sort_name)
+}
+
+/// `item`'s columns with the three derived ones given, in [`UPSERT_SQL`]'s
+/// order.
+fn columns_of(
+    item: &BaseItemEntity,
+    clean_name: Option<String>,
+    presentation_unique_key: Option<String>,
+    sort_name: Option<String>,
+) -> Vec<(&'static str, Column)> {
+    use Column::{Bool, Int, Real, Text};
+    let text = |v: &Option<String>| Text(v.clone());
+    let date = |v: Option<chrono::DateTime<chrono::Utc>>| Text(opt_datetime_to_db(v));
+    vec![
+        ("Id", Text(Some(item.id.clone()))),
+        ("Album", text(&item.album)),
+        ("AlbumArtists", text(&item.album_artists)),
+        ("Artists", text(&item.artists)),
+        ("Audio", Int(item.audio.map(i64::from))),
+        ("ChannelId", text(&item.channel_id)),
+        ("CleanName", Text(clean_name)),
+        ("CommunityRating", Real(item.community_rating)),
+        ("CriticRating", Real(item.critic_rating)),
+        ("CustomRating", text(&item.custom_rating)),
+        ("Data", text(&item.data)),
+        ("DateCreated", date(item.date_created)),
+        ("DateLastMediaAdded", date(item.date_last_media_added)),
+        ("DateLastRefreshed", date(item.date_last_refreshed)),
+        // The value an INSERT stores; an update binds the save time instead
+        // (`?73`).
+        ("DateLastSaved", date(item.date_last_saved)),
+        ("DateModified", date(item.date_modified)),
+        ("EndDate", date(item.end_date)),
+        ("EpisodeTitle", text(&item.episode_title)),
+        ("ExternalId", text(&item.external_id)),
+        ("ExternalSeriesId", text(&item.external_series_id)),
+        ("ExternalServiceId", text(&item.external_service_id)),
+        ("ExtraType", Int(item.extra_type.map(i64::from))),
+        ("ForcedSortName", text(&item.forced_sort_name)),
+        ("Genres", text(&item.genres)),
+        ("Height", Int(item.height)),
+        ("IndexNumber", Int(item.index_number)),
+        (
+            "InheritedParentalRatingSubValue",
+            Int(item.inherited_parental_rating_sub_value),
+        ),
+        (
+            "InheritedParentalRatingValue",
+            Int(item.inherited_parental_rating_value),
+        ),
+        ("IsFolder", Bool(item.is_folder)),
+        ("IsInMixedFolder", Bool(item.is_in_mixed_folder)),
+        ("IsLocked", Bool(item.is_locked)),
+        ("IsMovie", Bool(item.is_movie)),
+        ("IsRepeat", Bool(item.is_repeat)),
+        ("IsSeries", Bool(item.is_series)),
+        ("IsVirtualItem", Bool(item.is_virtual_item)),
+        ("LUFS", Real(item.lufs)),
+        ("MediaType", text(&item.media_type)),
+        ("Name", text(&item.name)),
+        ("NormalizationGain", Real(item.normalization_gain)),
+        ("OfficialRating", text(&item.official_rating)),
+        ("OriginalLanguage", text(&item.original_language)),
+        ("OriginalTitle", text(&item.original_title)),
+        ("Overview", text(&item.overview)),
+        ("OwnerId", text(&item.owner_id)),
+        ("ParentId", text(&item.parent_id)),
+        ("ParentIndexNumber", Int(item.parent_index_number)),
+        ("Path", text(&item.path)),
+        (
+            "PreferredMetadataCountryCode",
+            text(&item.preferred_metadata_country_code),
+        ),
+        (
+            "PreferredMetadataLanguage",
+            text(&item.preferred_metadata_language),
+        ),
+        ("PremiereDate", date(item.premiere_date)),
+        ("PresentationUniqueKey", Text(presentation_unique_key)),
+        ("PrimaryVersionId", text(&item.primary_version_id)),
+        ("ProductionLocations", text(&item.production_locations)),
+        ("ProductionYear", Int(item.production_year)),
+        ("RunTimeTicks", Int(item.run_time_ticks)),
+        ("SeasonId", text(&item.season_id)),
+        ("SeasonName", text(&item.season_name)),
+        ("SeriesId", text(&item.series_id)),
+        ("SeriesName", text(&item.series_name)),
+        (
+            "SeriesPresentationUniqueKey",
+            text(&item.series_presentation_unique_key),
+        ),
+        ("ShowId", text(&item.show_id)),
+        ("Size", Int(item.size)),
+        ("SortName", Text(sort_name)),
+        ("StartDate", date(item.start_date)),
+        ("Studios", text(&item.studios)),
+        ("Tagline", text(&item.tagline)),
+        ("Tags", text(&item.tags)),
+        ("TopParentId", text(&item.top_parent_id)),
+        ("TotalBitrate", Int(item.total_bitrate)),
+        ("Type", Text(Some(item.type_.clone()))),
+        ("UnratedType", text(&item.unrated_type)),
+        ("Width", Int(item.width)),
+    ]
+}
+
+/// Whether the library scan's save of `saved` over the row it read back as
+/// `stored` would change any column other than `DateLastSaved` — the
+/// "something changed" test of the scan's save rule for the row itself.
+///
+/// It evaluates [`scan_upsert_sql`]'s `SET` clause in Rust over the values
+/// the upsert would bind ([`written_columns`], with the write-time
+/// derivations) against the stored ones (as stored, no derivation):
+/// `PrimaryVersionId` is never written, `DateCreated` only fills a gap,
+/// `IsLocked` only rises, the never-cleared columns keep the stored value
+/// over a `NULL`, and a locked row keeps its user-owned columns.
+pub(crate) fn scan_save_changes_row(saved: &BaseItemEntity, stored: &BaseItemEntity) -> bool {
+    let incoming = written_columns(saved);
+    let current = columns_of(
+        stored,
+        stored.clean_name.clone(),
+        stored.presentation_unique_key.clone(),
+        stored.sort_name.clone(),
+    );
+    let is_null = |v: &Column| {
+        matches!(
+            v,
+            Column::Text(None) | Column::Int(None) | Column::Real(None)
+        )
+    };
+    incoming
+        .iter()
+        .zip(&current)
+        .any(|((name, new), (_, old))| {
+            let result = match *name {
+                // The save stamps it; that is not a change of the item.
+                "DateLastSaved" | "PrimaryVersionId" => old,
+                "DateCreated" if !is_null(old) => old,
+                "IsLocked" => {
+                    if stored.is_locked {
+                        old
+                    } else {
+                        new
+                    }
+                }
+                col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
+                col if stored.is_locked && LOCKED_PRESERVED_COLUMNS.contains(&col) => old,
+                _ => new,
+            };
+            result != old
+        })
 }
 
 #[async_trait]
@@ -1991,6 +2111,81 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             );
         }
         Ok(out)
+    }
+
+    async fn scan_stored_links(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Option<HashMap<Uuid, StoredItemLinks>>, ServiceError> {
+        use ferrofin_model::entities::MediaStreamType;
+        let mut out: HashMap<Uuid, StoredItemLinks> = HashMap::with_capacity(item_ids.len());
+        let key = |id: &str| Uuid::parse_str(id).ok();
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let images = format!(
+                r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
+                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
+                   ORDER BY "ItemId", "ImageType", "Id""#
+            );
+            let mut query = sqlx::query_as::<_, ScanImageRow>(&images);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                let Some(id) = key(&row.0) else { continue };
+                out.entry(id).or_default().images.push(ItemImageInfo {
+                    path: row.2,
+                    image_type: crate::item_repository::image_type_from_disc(row.1),
+                    date_modified: row.6.unwrap_or_else(|| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                            .unwrap_or_else(chrono::Utc::now)
+                    }),
+                    width: i32::try_from(row.3).unwrap_or(0),
+                    height: i32::try_from(row.4).unwrap_or(0),
+                    blur_hash: row
+                        .5
+                        .filter(|b| !b.is_empty())
+                        .and_then(|b| String::from_utf8(b).ok()),
+                });
+            }
+            let ancestors = format!(
+                r#"SELECT "ItemId", "ParentItemId" FROM "AncestorIds"
+                   WHERE "ItemId" IN ({placeholders})"#
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(&ancestors);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (item, parent) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let (Some(id), Some(parent)) = (key(&item), key(&parent)) {
+                    out.entry(id).or_default().ancestors.push(parent);
+                }
+            }
+            let externals = format!(
+                r#"SELECT "ItemId", "StreamType", "Path" FROM "MediaStreamInfos"
+                   WHERE "ItemId" IN ({placeholders}) AND "IsExternal" = 1
+                     AND "Path" IS NOT NULL"#
+            );
+            let mut query = sqlx::query_as::<_, (String, i32, String)>(&externals);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (item, stream_type, path) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                let Some(id) = key(&item) else { continue };
+                let links = out.entry(id).or_default();
+                match crate::db_error::media_stream_type_from_disc(stream_type) {
+                    MediaStreamType::Subtitle => links.external_subtitles.push(path),
+                    MediaStreamType::Audio => links.external_audio.push(path),
+                    _ => {}
+                }
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn set_item_image(
@@ -3375,6 +3570,943 @@ mod tests {
     // row (a plain save_items erased every merge-versions link on each scan),
     // while the full save — the merge/split write path — must still set AND
     // clear both.
+    /// `column` of `item` set to NULL (`null`) or to a different value.
+    /// Booleans and `Type` have no NULL; that mode leaves them equal.
+    #[allow(clippy::too_many_lines)]
+    fn vary(
+        item: &mut ferrofin_db::entities::base_items::BaseItemEntity,
+        column: &str,
+        null: bool,
+        other: &str,
+    ) {
+        match column {
+            "Album" => {
+                item.album = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.album.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "AlbumArtists" => {
+                item.album_artists = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.album_artists.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Artists" => {
+                item.artists = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.artists.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Audio" => {
+                item.audio = if null {
+                    None
+                } else {
+                    Some(item.audio.unwrap_or(0) + 1)
+                };
+            }
+            "ChannelId" => {
+                item.channel_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.channel_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "CleanName" => {
+                item.clean_name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.clean_name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "CommunityRating" => {
+                item.community_rating = if null {
+                    None
+                } else {
+                    Some(item.community_rating.unwrap_or(0.0) + 0.5)
+                };
+            }
+            "CriticRating" => {
+                item.critic_rating = if null {
+                    None
+                } else {
+                    Some(item.critic_rating.unwrap_or(0.0) + 0.5)
+                };
+            }
+            "CustomRating" => {
+                item.custom_rating = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.custom_rating.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Data" => {
+                item.data = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.data.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "DateCreated" => {
+                item.date_created = if null {
+                    None
+                } else {
+                    item.date_created.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "DateLastMediaAdded" => {
+                item.date_last_media_added = if null {
+                    None
+                } else {
+                    item.date_last_media_added
+                        .map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "DateLastRefreshed" => {
+                item.date_last_refreshed = if null {
+                    None
+                } else {
+                    item.date_last_refreshed
+                        .map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "DateLastSaved" => {
+                item.date_last_saved = if null {
+                    None
+                } else {
+                    item.date_last_saved.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "DateModified" => {
+                item.date_modified = if null {
+                    None
+                } else {
+                    item.date_modified.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "EndDate" => {
+                item.end_date = if null {
+                    None
+                } else {
+                    item.end_date.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "EpisodeTitle" => {
+                item.episode_title = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.episode_title.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ExternalId" => {
+                item.external_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.external_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ExternalSeriesId" => {
+                item.external_series_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.external_series_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ExternalServiceId" => {
+                item.external_service_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.external_service_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ExtraType" => {
+                item.extra_type = if null {
+                    None
+                } else {
+                    Some(item.extra_type.unwrap_or(0) + 1)
+                };
+            }
+            "ForcedSortName" => {
+                item.forced_sort_name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.forced_sort_name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Genres" => {
+                item.genres = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.genres.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Height" => {
+                item.height = if null {
+                    None
+                } else {
+                    Some(item.height.unwrap_or(0) + 1)
+                };
+            }
+            "IndexNumber" => {
+                item.index_number = if null {
+                    None
+                } else {
+                    Some(item.index_number.unwrap_or(0) + 1)
+                };
+            }
+            "InheritedParentalRatingSubValue" => {
+                item.inherited_parental_rating_sub_value = if null {
+                    None
+                } else {
+                    Some(item.inherited_parental_rating_sub_value.unwrap_or(0) + 1)
+                };
+            }
+            "InheritedParentalRatingValue" => {
+                item.inherited_parental_rating_value = if null {
+                    None
+                } else {
+                    Some(item.inherited_parental_rating_value.unwrap_or(0) + 1)
+                };
+            }
+            "IsFolder" => {
+                if !null {
+                    item.is_folder = !item.is_folder;
+                }
+            }
+            "IsInMixedFolder" => {
+                if !null {
+                    item.is_in_mixed_folder = !item.is_in_mixed_folder;
+                }
+            }
+            "IsLocked" => {
+                if !null {
+                    item.is_locked = !item.is_locked;
+                }
+            }
+            "IsMovie" => {
+                if !null {
+                    item.is_movie = !item.is_movie;
+                }
+            }
+            "IsRepeat" => {
+                if !null {
+                    item.is_repeat = !item.is_repeat;
+                }
+            }
+            "IsSeries" => {
+                if !null {
+                    item.is_series = !item.is_series;
+                }
+            }
+            "IsVirtualItem" => {
+                if !null {
+                    item.is_virtual_item = !item.is_virtual_item;
+                }
+            }
+            "LUFS" => {
+                item.lufs = if null {
+                    None
+                } else {
+                    Some(item.lufs.unwrap_or(0.0) + 0.5)
+                };
+            }
+            "MediaType" => {
+                item.media_type = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.media_type.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Name" => {
+                item.name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "NormalizationGain" => {
+                item.normalization_gain = if null {
+                    None
+                } else {
+                    Some(item.normalization_gain.unwrap_or(0.0) + 0.5)
+                };
+            }
+            "OfficialRating" => {
+                item.official_rating = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.official_rating.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "OriginalLanguage" => {
+                item.original_language = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.original_language.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "OriginalTitle" => {
+                item.original_title = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.original_title.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Overview" => {
+                item.overview = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.overview.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "OwnerId" => {
+                item.owner_id = if null { None } else { Some(other.to_owned()) };
+            }
+            "ParentId" => {
+                item.parent_id = if null { None } else { Some(other.to_owned()) };
+            }
+            "ParentIndexNumber" => {
+                item.parent_index_number = if null {
+                    None
+                } else {
+                    Some(item.parent_index_number.unwrap_or(0) + 1)
+                };
+            }
+            "Path" => {
+                item.path = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.path.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "PreferredMetadataCountryCode" => {
+                item.preferred_metadata_country_code = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.preferred_metadata_country_code
+                            .clone()
+                            .unwrap_or_default()
+                    ))
+                };
+            }
+            "PreferredMetadataLanguage" => {
+                item.preferred_metadata_language = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.preferred_metadata_language.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "PremiereDate" => {
+                item.premiere_date = if null {
+                    None
+                } else {
+                    item.premiere_date.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "PresentationUniqueKey" => {
+                item.presentation_unique_key = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.presentation_unique_key.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "PrimaryVersionId" => {
+                item.primary_version_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.primary_version_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ProductionLocations" => {
+                item.production_locations = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.production_locations.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "ProductionYear" => {
+                item.production_year = if null {
+                    None
+                } else {
+                    Some(item.production_year.unwrap_or(0) + 1)
+                };
+            }
+            "RunTimeTicks" => {
+                item.run_time_ticks = if null {
+                    None
+                } else {
+                    Some(item.run_time_ticks.unwrap_or(0) + 1)
+                };
+            }
+            "SeasonId" => {
+                item.season_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.season_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "SeasonName" => {
+                item.season_name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.season_name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "SeriesId" => {
+                item.series_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.series_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "SeriesName" => {
+                item.series_name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.series_name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "SeriesPresentationUniqueKey" => {
+                item.series_presentation_unique_key = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.series_presentation_unique_key
+                            .clone()
+                            .unwrap_or_default()
+                    ))
+                };
+            }
+            "ShowId" => {
+                item.show_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.show_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Size" => {
+                item.size = if null {
+                    None
+                } else {
+                    Some(item.size.unwrap_or(0) + 1)
+                };
+            }
+            "SortName" => {
+                item.sort_name = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.sort_name.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "StartDate" => {
+                item.start_date = if null {
+                    None
+                } else {
+                    item.start_date.map(|d| d + chrono::TimeDelta::days(1))
+                };
+            }
+            "Studios" => {
+                item.studios = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.studios.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Tagline" => {
+                item.tagline = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.tagline.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Tags" => {
+                item.tags = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.tags.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "TopParentId" => {
+                item.top_parent_id = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.top_parent_id.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "TotalBitrate" => {
+                item.total_bitrate = if null {
+                    None
+                } else {
+                    Some(item.total_bitrate.unwrap_or(0) + 1)
+                };
+            }
+            "Type" => {
+                if !null {
+                    item.type_ = crate::item_type_lookup::stored_type_name(BaseItemKind::Episode)
+                        .unwrap()
+                        .to_owned();
+                }
+            }
+            "UnratedType" => {
+                item.unrated_type = if null {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (changed)",
+                        item.unrated_type.clone().unwrap_or_default()
+                    ))
+                };
+            }
+            "Width" => {
+                item.width = if null {
+                    None
+                } else {
+                    Some(item.width.unwrap_or(0) + 1)
+                };
+            }
+            other_column => panic!("no variation for column {other_column}"),
+        }
+    }
+
+    /// The differential check of `scan_save_changes_row` against the real
+    /// scan upsert: for every written column, over a stored row that is
+    /// locked or not, and an incoming value that is NULL, equal or
+    /// different, the stored row changes (anything but `DateLastSaved`)
+    /// exactly when `scan_save_changes_row` says it would.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn scan_save_changes_row_predicts_the_scan_upsert_column_by_column() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let (id, parent, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, parent, BaseItemKind::Folder).await;
+        seed_item(&db, other, BaseItemKind::Folder).await;
+        let at = |s: &str| {
+            Some(
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+        };
+        let text = |s: &str| Some(s.to_owned());
+        let base = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(id),
+            album: text("Album"),
+            album_artists: text("AA"),
+            artists: text("A"),
+            audio: Some(1),
+            channel_id: text("CH"),
+            clean_name: None,
+            community_rating: Some(7.5),
+            critic_rating: Some(80.0),
+            custom_rating: text("CR"),
+            data: text(r#"{"VideoType":"VideoFile"}"#),
+            date_created: at("2020-01-01T00:00:00Z"),
+            date_last_media_added: at("2020-01-02T00:00:00Z"),
+            date_last_refreshed: at("2020-01-03T00:00:00Z"),
+            date_last_saved: at("2020-01-04T00:00:00Z"),
+            date_modified: at("2020-01-05T00:00:00Z"),
+            end_date: at("2020-01-06T00:00:00Z"),
+            episode_title: text("ET"),
+            external_id: text("X"),
+            external_series_id: text("XS"),
+            external_service_id: text("XSV"),
+            extra_type: Some(2),
+            forced_sort_name: text("Forced"),
+            genres: text("Drama"),
+            height: Some(1080),
+            index_number: Some(3),
+            inherited_parental_rating_sub_value: Some(1),
+            inherited_parental_rating_value: Some(12),
+            is_folder: false,
+            is_in_mixed_folder: false,
+            is_locked: false,
+            is_movie: true,
+            is_repeat: false,
+            is_series: false,
+            is_virtual_item: false,
+            lufs: Some(-14.0),
+            media_type: text("Video"),
+            name: text("Name"),
+            normalization_gain: Some(1.5),
+            official_rating: text("PG"),
+            original_language: text("en"),
+            original_title: text("Original"),
+            overview: text("Overview"),
+            owner_id: Some(guid_to_db(parent)),
+            parent_id: Some(guid_to_db(parent)),
+            parent_index_number: Some(1),
+            path: text("/media/movie.mkv"),
+            preferred_metadata_country_code: text("US"),
+            preferred_metadata_language: text("en"),
+            premiere_date: at("1999-03-30T00:00:00Z"),
+            presentation_unique_key: None,
+            primary_version_id: None,
+            production_locations: text("USA"),
+            production_year: Some(1999),
+            run_time_ticks: Some(100),
+            season_id: text("SEASON"),
+            season_name: text("Season 1"),
+            series_id: text("SERIES"),
+            series_name: text("Series"),
+            series_presentation_unique_key: text("SPK"),
+            show_id: text("SHOW"),
+            size: Some(10),
+            sort_name: None,
+            start_date: at("2020-01-07T00:00:00Z"),
+            studios: text("Studio"),
+            tagline: text("Tagline"),
+            tags: text("Tag"),
+            top_parent_id: text("TOP"),
+            total_bitrate: Some(8000),
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+            unrated_type: text("UT"),
+            width: Some(1920),
+        };
+        let columns: Vec<&str> = super::written_columns(&base)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| *name != "Id")
+            .collect();
+        let snapshot_sql = format!(
+            r#"SELECT {} FROM "BaseItems" WHERE "Id" = ?1"#,
+            columns
+                .iter()
+                .filter(|c| **c != "DateLastSaved")
+                .map(|c| format!(r#"quote("{c}")"#))
+                .collect::<Vec<_>>()
+                .join(" || '|' || ")
+        );
+        let snapshot = || async {
+            sqlx::query_scalar::<_, String>(&snapshot_sql)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("snapshot")
+        };
+        let other = guid_to_db(other);
+        let (mut checked, mut changed_cases) = (0, 0);
+        for column in &columns {
+            for locked in [false, true] {
+                for mode in ["null", "equal", "different"] {
+                    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                        .bind(guid_to_db(id))
+                        .execute(db.writer())
+                        .await
+                        .expect("reset");
+                    svc.save_items(std::slice::from_ref(&base))
+                        .await
+                        .expect("seed");
+                    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = ?1 WHERE "Id" = ?2"#)
+                        .bind(locked)
+                        .bind(guid_to_db(id))
+                        .execute(db.writer())
+                        .await
+                        .expect("lock");
+                    let stored = repo.retrieve_item(id).await.expect("read").expect("row");
+                    let mut incoming = base.clone();
+                    if mode != "equal" {
+                        vary(&mut incoming, column, mode == "null", &other);
+                    }
+                    let predicted = super::scan_save_changes_row(&incoming, &stored);
+                    let before = snapshot().await;
+                    svc.save_scanned_items(std::slice::from_ref(&incoming))
+                        .await
+                        .expect("scan save");
+                    let row_moved = snapshot().await != before;
+                    assert_eq!(
+                        row_moved, predicted,
+                        "column {column}, locked {locked}, incoming {mode}"
+                    );
+                    checked += 1;
+                    changed_cases += usize::from(row_moved);
+                }
+            }
+        }
+        assert_eq!(checked, columns.len() * 6);
+        assert!(
+            changed_cases > columns.len(),
+            "the cases have teeth: {changed_cases} changed"
+        );
+    }
+
+    /// The comparison mirrors the statement: its column list is the
+    /// statement's, in bind order.
+    #[test]
+    fn written_columns_follow_the_upsert_column_order() {
+        let head = super::UPSERT_SQL
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(cols, _)| cols)
+            .expect("column list");
+        let statement: Vec<&str> = head
+            .split(',')
+            .map(|c| c.trim().trim_matches('"'))
+            .collect();
+        let bound: Vec<&str> =
+            super::written_columns(&ferrofin_db::entities::base_items::BaseItemEntity::default())
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+        assert_eq!(bound, statement);
+    }
+
+    /// `scan_save_changes_row` answers "would the scan save change this
+    /// row?" the way the statement does: a row read back after a save is
+    /// unchanged by saving it again; any column the scan owns changes it;
+    /// the columns the statement guards do not.
+    #[tokio::test]
+    async fn a_row_read_back_after_a_scan_save_is_unchanged_by_saving_it_again() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let repo = crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let id = Uuid::new_v4();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+            name: Some("The Matrix".into()),
+            overview: Some("A hacker learns the truth.".into()),
+            community_rating: Some(8.2),
+            // Nanosecond precision, as a stat reports it; the table keeps
+            // 100 ns.
+            date_modified: Some(at("2026-09-01T08:30:00.123456789Z")),
+            date_created: Some(at("2026-01-02T03:04:05Z")),
+            size: Some(10),
+            data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
+            ..Default::default()
+        };
+        svc.save_scanned_items(std::slice::from_ref(&item))
+            .await
+            .expect("save");
+        let stored = repo.retrieve_item(id).await.expect("read").expect("row");
+        assert!(!super::scan_save_changes_row(&stored, &stored));
+        assert!(
+            !super::scan_save_changes_row(&item, &stored),
+            "the row as built (no derived columns, full-precision mtime) \
+             saves to the same stored values"
+        );
+
+        // A scan-owned column changes it.
+        let renamed = ferrofin_db::entities::base_items::BaseItemEntity {
+            overview: Some("Reality is a simulation.".into()),
+            ..item.clone()
+        };
+        assert!(super::scan_save_changes_row(&renamed, &stored));
+        let moved = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_modified: Some(at("2026-09-02T08:30:00Z")),
+            ..item.clone()
+        };
+        assert!(super::scan_save_changes_row(&moved, &stored));
+
+        // Guarded columns do not: a NULL never clears Size/DateModified/the
+        // refresh dates, DateCreated only fills a gap, and DateLastSaved is
+        // the save's own stamp.
+        let guarded = ferrofin_db::entities::base_items::BaseItemEntity {
+            size: None,
+            date_modified: None,
+            date_last_refreshed: None,
+            date_created: Some(at("2026-09-24T00:00:00Z")),
+            date_last_saved: Some(at("2026-09-24T00:00:00Z")),
+            ..item.clone()
+        };
+        assert!(!super::scan_save_changes_row(&guarded, &stored));
+
+        // A locked row keeps its user-owned columns, but not the file facts.
+        let locked = ferrofin_db::entities::base_items::BaseItemEntity {
+            is_locked: true,
+            ..stored.clone()
+        };
+        assert!(!super::scan_save_changes_row(&renamed, &locked));
+        assert!(super::scan_save_changes_row(&moved, &locked));
+    }
+
+    #[tokio::test]
+    async fn scan_stored_links_reads_images_ancestors_and_external_streams() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (parent, item, bare) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [parent, item, bare] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        svc.set_ancestors(item, &[parent]).await.expect("ancestors");
+        let poster = ferrofin_traits::options::ItemImageInfo {
+            path: "/media/poster.jpg".into(),
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            date_modified: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            width: 10,
+            height: 20,
+            blur_hash: Some("hash".into()),
+        };
+        svc.save_item_images(item, std::slice::from_ref(&poster))
+            .await
+            .expect("images");
+        let streams: Vec<ferrofin_db::entities::base_items::MediaStreamInfoEntity> = [
+            (0, 2, true, Some("/media/movie.eng.srt")),
+            (1, 0, true, Some("/media/movie.fra.mka")),
+            (2, 1, false, Some("/media/movie.mkv")),
+            (3, 2, true, None),
+        ]
+        .into_iter()
+        .map(|(stream_index, stream_type, is_external, path)| {
+            ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                item_id: guid_to_db(item),
+                stream_index,
+                stream_type,
+                is_external,
+                path: path.map(str::to_owned),
+                ..Default::default()
+            }
+        })
+        .collect();
+        {
+            use ferrofin_traits::persistence::MediaStreamRepository as _;
+            crate::media_stream_repository::FerrofinMediaStreamRepository::new(db.clone())
+                .save_media_streams(item, &streams)
+                .await
+                .expect("streams");
+        }
+
+        let links = svc
+            .scan_stored_links(&[item, bare])
+            .await
+            .expect("read")
+            .expect("supported");
+        let got = links.get(&item).expect("item links");
+        assert_eq!(got.images, vec![poster]);
+        assert_eq!(got.ancestors, vec![parent]);
+        assert_eq!(
+            got.external_subtitles,
+            vec!["/media/movie.eng.srt".to_owned()]
+        );
+        assert_eq!(got.external_audio, vec!["/media/movie.fra.mka".to_owned()]);
+        assert!(
+            !links.contains_key(&bare),
+            "an item with no rows reads as no entry"
+        );
+    }
+
     // One test for the whole scan statement: its guards are derived from one
     // text substitution, so they are asserted together.
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]

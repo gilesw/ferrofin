@@ -5,6 +5,7 @@
 //! listening sessions, keyed by MusicBrainz artist id. Requests use server quota
 //! headers when available, with a one-second minimum for the public Labs server.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::RateLimiter;
 use std::time::Duration;
 
@@ -184,7 +185,7 @@ impl ListenBrainzClient {
             );
             return Vec::new();
         }
-        let Ok(mut artists) = resp.json::<Vec<SimilarArtist>>().await else {
+        let Ok(mut artists) = resp.counted_json::<Vec<SimilarArtist>>().await else {
             return Vec::new();
         };
         artists.sort_by(|a, b| {

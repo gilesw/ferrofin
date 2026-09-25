@@ -17,6 +17,7 @@
 //! network failure, yields no image rather than an error — exactly like the
 //! upstream provider returning `null`.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use std::sync::{Arc, Mutex};
 
@@ -144,7 +145,7 @@ impl StudiosClient {
         }
         let url = format!("{repo_url}/thumbs.txt");
         let list = match self.http.get(&url).send_limited(&self.limiter).await {
-            Ok(resp) => match resp.text().await {
+            Ok(resp) => match resp.counted_text().await {
                 Ok(body) => body
                     .lines()
                     .map(str::trim)
@@ -187,7 +188,7 @@ impl StudiosClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        resp.counted_bytes().await.ok()
     }
 
     /// The thumb URL for `studio_name`, or `None` when the repository has no

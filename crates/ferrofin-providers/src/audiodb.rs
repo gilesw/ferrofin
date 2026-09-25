@@ -9,6 +9,7 @@
 //! - artist: `GET /artist-mb.php?i={musicbrainz_artist_id}`
 //! - album:  `GET /album-mb.php?i={musicbrainz_release_group_id}`
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
@@ -155,7 +156,7 @@ impl AudioDbClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.json().await.ok()
+        resp.counted_json().await.ok()
     }
 
     /// Artist metadata + artwork by MusicBrainz artist id.

@@ -10,6 +10,7 @@
 //! then fetches full metadata (overview, tagline, genres, studios, rating,
 //! certification, premiere date, and cast + key crew) alongside the artwork.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use secrecy::{ExposeSecret, SecretString};
@@ -976,7 +977,7 @@ impl TmdbClient {
             tracing::debug!(provider = "tmdb", status = %resp.status(), "tmdb returned non-success");
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<SearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SearchResponse>().await else {
             tracing::warn!(provider = "tmdb", "tmdb response parse failed");
             return Vec::new();
         };
@@ -1028,7 +1029,7 @@ impl TmdbClient {
             return None;
         }
         let hit = resp
-            .json::<SearchResponse>()
+            .counted_json::<SearchResponse>()
             .await
             .ok()?
             .results
@@ -1074,7 +1075,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let parsed = resp.json::<SeasonResponse>().await.ok()?;
+        let parsed = resp.counted_json::<SeasonResponse>().await.ok()?;
         Some(season_details_from(parsed, &cfg))
     }
 
@@ -1108,7 +1109,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<CollectionSearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<CollectionSearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1145,7 +1146,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let parsed: CollectionResponse = resp.json().await.ok()?;
+        let parsed: CollectionResponse = resp.counted_json().await.ok()?;
         // The single `poster_path`/`backdrop_path` come first (they are TMDB's
         // own pick), then the rest of the `images` lists — same order the C#
         // `ConvertPostersToRemoteImageInfo`/`ConvertBackdrops…` pair yields.
@@ -1211,7 +1212,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<SearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1250,7 +1251,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return (Vec::new(), 0);
         }
-        let Ok(parsed) = resp.json::<SimilarResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<SimilarResponse>().await else {
             return (Vec::new(), 0);
         };
         (
@@ -1285,7 +1286,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
         // Borrowed, not moved: the closure is called once per image family and
@@ -1372,7 +1373,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<ImagesResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<ImagesResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1434,7 +1435,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let credits = resp.json::<CreditsResponse>().await.ok()?;
+        let credits = resp.counted_json::<CreditsResponse>().await.ok()?;
         let mut people = Vec::new();
         // `TmdbEpisodeProvider` applies `HideMissingCastMembers` +
         // `MaxCastMembers` to the cast and to the guest stars SEPARATELY (two
@@ -1532,7 +1533,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let found = resp.json::<FindResponse>().await.ok()?;
+        let found = resp.counted_json::<FindResponse>().await.ok()?;
         let hits = match kind {
             TmdbKind::Movie => found.movie_results,
             TmdbKind::Series => found.tv_results,
@@ -1596,7 +1597,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let d = resp.json::<DetailsResponse>().await.ok()?;
+        let d = resp.counted_json::<DetailsResponse>().await.ok()?;
 
         let premiere = d
             .release_date
@@ -1675,7 +1676,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return Vec::new();
         }
-        let Ok(parsed) = resp.json::<PersonSearchResponse>().await else {
+        let Ok(parsed) = resp.counted_json::<PersonSearchResponse>().await else {
             return Vec::new();
         };
         parsed
@@ -1720,7 +1721,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let p = resp.json::<PersonLookupResponse>().await.ok()?;
+        let p = resp.counted_json::<PersonLookupResponse>().await.ok()?;
         Some(TmdbPersonHit {
             tmdb_id: p.id.unwrap_or(tmdb_id),
             name: non_empty(p.name),
@@ -1753,7 +1754,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        let p = resp.json::<PersonDetailsResponse>().await.ok()?;
+        let p = resp.counted_json::<PersonDetailsResponse>().await.ok()?;
         let details = TmdbPersonDetails {
             biography: p.biography.filter(|s| !s.is_empty()),
             birthday: p.birthday.filter(|s| !s.is_empty()),
@@ -1776,7 +1777,7 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        resp.counted_bytes().await.ok()
     }
 }
 
@@ -1874,6 +1875,26 @@ fn year_from(date: Option<&str>) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `200` whose body does not decode is a provider failure, not a
+    /// miss: the scan must not stamp a refresh that only looked empty.
+    #[tokio::test]
+    async fn a_malformed_success_body_counts_as_a_failure() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/season/1", r#"{"episodes": "not a list"}"#.to_owned()),
+            ("/season/2", r#"{"episodes": []}"#.to_owned()),
+        ])
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let (details, failures) =
+            crate::rate_limit::count_request_failures(client.season_details(1399, 1)).await;
+        assert!(details.is_none());
+        assert_eq!(failures, 1);
+        let (details, failures) =
+            crate::rate_limit::count_request_failures(client.season_details(1399, 2)).await;
+        assert!(details.is_some());
+        assert_eq!(failures, 0);
+    }
 
     #[test]
     fn year_parsed_from_date_prefix() {

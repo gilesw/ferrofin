@@ -159,6 +159,16 @@ impl Fixture {
     }
 }
 
+/// Moves `path`'s mtime `seconds` into the future.
+fn touch(path: &Path, seconds: u64) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open");
+    let now = std::time::SystemTime::now() + std::time::Duration::from_secs(seconds);
+    file.set_modified(now).expect("set mtime");
+}
+
 fn trailer_urls(row: &BaseItemEntity) -> Vec<String> {
     ferrofin_core::item_data::read_remote_trailers(row.data.as_deref())
         .into_iter()
@@ -192,10 +202,13 @@ async fn a_rescan_keeps_what_the_providers_supplied() {
         Some("A hacker learns the truth.")
     );
     assert_eq!(first.size, Some(10), "Size is the file's length");
-    assert_eq!(
-        fx.raw_dates(BaseItemKind::Movie, &file).await.0,
-        None,
-        "a created row has no DateLastSaved"
+    // Upstream saves a new item in its first refresh right after creating it
+    // (`RefreshMetadata`: `SaveItemAsync` when `isFirstRefresh`), which
+    // stamps `DateLastSaved`.
+    let created_stamp = fx.raw_dates(BaseItemKind::Movie, &file).await.0;
+    assert!(
+        created_stamp.is_some(),
+        "a created row is stamped by its first refresh"
     );
 
     // No provider this time.
@@ -213,12 +226,16 @@ async fn a_rescan_keeps_what_the_providers_supplied() {
         trailer_urls(&kept),
         ["https://www.youtube.com/watch?v=vKQi3bBA1y8"]
     );
-    assert!(
-        fx.raw_dates(BaseItemKind::Movie, &file).await.0.is_some(),
-        "an updated row is stamped with its save time"
+    assert_eq!(
+        fx.raw_dates(BaseItemKind::Movie, &file).await.0,
+        created_stamp,
+        "an unchanged item is not saved again, so its DateLastSaved stays"
     );
 
-    // TMDB answers again with a new synopsis: the provider wins.
+    // The file changes and TMDB answers again with a new synopsis: the
+    // changed file makes the refresh run every provider, and the provider
+    // wins.
+    touch(&file, 3_600);
     let (base, _) = spawn_tmdb("Reality is a simulation.");
     fx.tmdb_scanner(&base, tmp.path())
         .scan_all()

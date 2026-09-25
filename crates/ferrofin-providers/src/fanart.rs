@@ -15,6 +15,7 @@
 //! by community likes. The `music` leg (artist by MusicBrainz artist id, album
 //! by album-artist id + release-group id) is served the same way.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
@@ -181,7 +182,7 @@ impl FanartClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.json().await.ok()
+        resp.counted_json().await.ok()
     }
 
     /// Movie artwork by TMDb (or IMDb) id, ranked. Port of `MovieProvider`.

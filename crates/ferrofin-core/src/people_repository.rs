@@ -529,7 +529,7 @@ type PersonRepairRow = (
 /// Dedupes credited people case-insensitively by `(name, person_type)`, matching
 /// the C# `DistinctBy(name.ToLower + "-" + type)` and preserving first-seen order
 /// (which becomes the credit `ListOrder`).
-fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
+pub(crate) fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
     let mut seen = std::collections::HashSet::new();
     let mut deduped: Vec<&PeopleEntity> = Vec::new();
     for person in people {

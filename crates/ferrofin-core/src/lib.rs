@@ -205,6 +205,7 @@ pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
 pub mod quick_connect_manager;
+mod refresh_plan;
 pub mod resolvers;
 pub mod scheduled_tasks;
 pub mod search_manager;

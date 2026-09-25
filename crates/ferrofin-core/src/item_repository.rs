@@ -1686,7 +1686,7 @@ const ALL_ARTIST_TYPES: &[ItemValueType] = &[ItemValueType::Artist, ItemValueTyp
 /// [`ImageType`]. The discriminants are the fixed `ImageInfoImageType` values and
 /// line up 1:1 with [`ImageType`]; an out-of-range value falls back to
 /// [`ImageType::Primary`] (the C# default when parsing a legacy row).
-fn image_type_from_disc(disc: i32) -> ImageType {
+pub(crate) fn image_type_from_disc(disc: i32) -> ImageType {
     match disc {
         1 => ImageType::Art,
         2 => ImageType::Backdrop,

@@ -113,7 +113,7 @@ impl RateLimiter {
         if request.method() != reqwest::Method::GET {
             return None;
         }
-        self.execute(http, request, interval)
+        self.execute_observed(http, request, interval)
             .await
             .ok()
             .filter(|response| response.status().is_success())
@@ -133,7 +133,26 @@ impl RateLimiter {
     ) -> Result<reqwest::Response, RequestError> {
         let (http, request) = request.build_split();
         let request = request.map_err(|error| RequestError::Http(error.without_url()))?;
-        self.execute(http, request, interval).await
+        self.execute_observed(http, request, interval).await
+    }
+
+    /// [`execute`](Self::execute), counting a failed outcome into the
+    /// caller's [`count_request_failures`] scope.
+    async fn execute_observed(
+        &self,
+        http: reqwest::Client,
+        request: reqwest::Request,
+        interval: Duration,
+    ) -> Result<reqwest::Response, RequestError> {
+        let result = self.execute(http, request, interval).await;
+        let failed = match &result {
+            Err(_) => true,
+            Ok(response) => is_failure_status(response.status()),
+        };
+        if failed {
+            note_request_failure();
+        }
+        result
     }
 
     async fn execute(
@@ -263,13 +282,98 @@ impl RateLimiter {
     ) -> Option<T> {
         let response = self.send_get(request, interval).await?;
         let context = request_context(&self.provider, response.url());
-        match response.json().await {
+        match response.counted_json().await {
             Ok(body) => Some(body),
             Err(error) => {
                 tracing::warn!(provider = %self.provider, %context, error = %error.without_url(), "Metadata provider response could not be parsed");
                 None
             }
         }
+    }
+}
+
+tokio::task_local! {
+    /// The failed provider requests of the [`count_request_failures`] scope
+    /// the current task is running in, if any.
+    static REQUEST_FAILURES: std::cell::Cell<u32>;
+}
+
+/// Whether a final response status means the provider failed, rather than
+/// answered. A 404 is an answer ("nothing here"): the provider clients
+/// report it as a miss, the way `TMDbLib` returns `null` for it instead of
+/// throwing. Every other non-success status (a 5xx or 429 that outlived
+/// its retries, an auth failure, a rejected request) is a failure.
+fn is_failure_status(status: reqwest::StatusCode) -> bool {
+    !status.is_success() && status != reqwest::StatusCode::NOT_FOUND
+}
+
+/// Counts one failed provider call into the enclosing
+/// [`count_request_failures`] scope. Outside any scope it does nothing.
+///
+/// Every request through a [`RateLimiter`] is counted already; a provider
+/// that does not go through one (a sandboxed plugin, say) calls this when it
+/// fails, so its failure is told apart from a miss the same way.
+pub fn note_request_failure() {
+    let _ = REQUEST_FAILURES.try_with(|failures| failures.set(failures.get().saturating_add(1)));
+}
+
+/// Runs `future` and returns its output together with how many provider
+/// calls made while it ran **failed**:
+///
+/// - a request through a [`RateLimiter`] that ended in a transport error,
+///   was skipped by an open circuit or a cooldown, or whose final status is
+///   neither a success nor a 404 (a 404 is an answer: "nothing here");
+/// - a response body that could not be read or decoded (every provider
+///   client in this crate reads bodies through a counting reader);
+/// - anything that called [`note_request_failure`] (a provider outside this
+///   crate, such as a sandboxed plugin, or a cached failure being re-read).
+///
+/// This is what tells a provider that *errored* from one that *found
+/// nothing* — the provider clients collapse both into `None` — so a caller
+/// can apply upstream's rule that a refresh with a provider failure is not
+/// recorded as complete (`MetadataService.RefreshMetadata` stamps
+/// `DateLastRefreshed` only when `RefreshResult.Failures == 0`). Requests
+/// made from other tasks (anything `tokio::spawn`ed inside `future`) are not
+/// counted: a task-local does not cross a spawn.
+pub async fn count_request_failures<F: std::future::Future>(future: F) -> (F::Output, u32) {
+    REQUEST_FAILURES
+        .scope(std::cell::Cell::new(0), async move {
+            let output = future.await;
+            (output, REQUEST_FAILURES.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+/// Body reads of a provider response that count a failed read or decode
+/// into the enclosing [`count_request_failures`] scope — a truncated or
+/// malformed `200` is a failure, not an answer. Every provider client in this
+/// crate reads its bodies through these.
+pub(crate) trait CountedBody: Sized {
+    /// `Response::json`, counting an error.
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error>;
+    /// `Response::bytes` (as a `Vec`), counting an error.
+    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error>;
+    /// `Response::text`, counting an error.
+    async fn counted_text(self) -> Result<String, reqwest::Error>;
+}
+
+/// Counts `result`'s error, if any, and hands it back.
+fn counted<T>(result: Result<T, reqwest::Error>) -> Result<T, reqwest::Error> {
+    if result.is_err() {
+        note_request_failure();
+    }
+    result
+}
+
+impl CountedBody for reqwest::Response {
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error> {
+        counted(self.json().await)
+    }
+    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error> {
+        counted(self.bytes().await.map(|b| b.to_vec()))
+    }
+    async fn counted_text(self) -> Result<String, reqwest::Error> {
+        counted(self.text().await)
     }
 }
 
@@ -859,6 +963,59 @@ mod tests {
             times
         });
         (url, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_failures_are_counted_but_a_404_is_an_answer() {
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(200, ""), (404, ""), (401, ""), (400, "")]).await;
+        let client = RateLimiter::new("counted");
+        let http = reqwest::Client::new();
+        let (statuses, failures) = count_request_failures(async {
+            let mut statuses = Vec::new();
+            for _ in 0..4 {
+                let response = client
+                    .send_request(http.get(&url), Duration::ZERO)
+                    .await
+                    .unwrap();
+                statuses.push(response.status().as_u16());
+            }
+            statuses
+        })
+        .await;
+        assert_eq!(statuses, vec![200, 404, 401, 400]);
+        assert_eq!(failures, 2, "401 and 400 failed; 200 and 404 answered");
+        assert_eq!(task.await.unwrap().len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_and_undecodable_requests_count_as_failures() {
+        let _clock = TestClock::start();
+        let blocked = RateLimiter::new("blocked");
+        blocked.state.lock().await.postpone(Duration::from_mins(2));
+        let http = reqwest::Client::new();
+        let ((), skipped) = count_request_failures(async {
+            assert!(
+                blocked
+                    .send_get(http.get("http://127.0.0.1:9/"), Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+        })
+        .await;
+        assert_eq!(skipped, 1, "a cooldown skip is a failure, not a miss");
+
+        let (url, task) = scripted_server(vec![(200, "")]).await;
+        let client = RateLimiter::new("decode");
+        let (value, failures) =
+            count_request_failures(client.get_json::<Vec<u8>>(http.get(&url), Duration::ZERO))
+                .await;
+        assert!(value.is_none());
+        assert_eq!(failures, 1, "an undecodable body is a failure");
+        task.await.unwrap();
+
+        // Outside any scope nothing is counted, and nothing panics.
+        note_request_failure();
     }
 
     #[tokio::test(start_paused = true)]

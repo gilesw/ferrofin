@@ -11,6 +11,7 @@
 //! an extensionless URL is stored as a PNG, and a URL that answers JSON is
 //! refused instead of being written into the library as artwork.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -65,7 +66,7 @@ pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     let content_type = resolve_content_type(declared.as_deref(), url);
-    let bytes = resp.bytes().await.ok()?.to_vec();
+    let bytes = resp.counted_bytes().await.ok()?;
     Some((bytes, content_type))
 }
 

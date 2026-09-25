@@ -710,6 +710,26 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// What the library scan's change detection compares a rescan of each of
+    /// `item_ids` against, besides its `BaseItems` row: its image rows, its
+    /// ancestor closure and the external subtitle/audio files its stored
+    /// streams came from. Read one window of the plan at a time.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then treats every item as changed. An
+    /// item with no rows of a kind simply has an empty list.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn scan_stored_links(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<Option<HashMap<Uuid, StoredItemLinks>>, ServiceError> {
+        let _ = item_ids;
+        Ok(None)
+    }
+
     /// Sets a single image (`image`) on an item, replacing any existing rows of
     /// the same [`ImageType`](ferrofin_model::entities::ImageType) — the write path
     /// for an uploaded poster/backdrop/logo (`ImageController.SetItemImage`).
@@ -1125,6 +1145,21 @@ pub trait MediaAttachmentRepository: Send + Sync {
 }
 
 fn _assert_object_safe_media_attachment_repository(_: &dyn MediaAttachmentRepository) {}
+
+/// One item's stored rows besides its `BaseItems` row, as
+/// [`ItemPersistenceService::scan_stored_links`] reads them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StoredItemLinks {
+    /// The item's `BaseItemImageInfos` rows, in type-then-row order.
+    pub images: Vec<ItemImageInfo>,
+    /// The item's `AncestorIds` closure.
+    pub ancestors: Vec<Uuid>,
+    /// The paths of its external subtitle streams (`IsExternal`), upstream's
+    /// `Video.SubtitleFiles`.
+    pub external_subtitles: Vec<String>,
+    /// The paths of its external audio streams, upstream's `Video.AudioFiles`.
+    pub external_audio: Vec<String>,
+}
 
 /// What a previous scan already recorded about one image file: the probed
 /// dimensions, the blurhash, and the file mtime those were computed from.
