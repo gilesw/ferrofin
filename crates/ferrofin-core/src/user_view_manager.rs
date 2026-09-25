@@ -15,8 +15,8 @@
 //! from the injected [`VirtualFolderManager`] (C# `CollectionFolder.CollectionType`).
 //!
 //! Not ported here: the special "grouped" views (all-movies/all-tv merges),
-//! channel views, and per-user view ordering from display preferences. Those
-//! layer on top of the row set returned here.
+//! channel views, and per-user view ordering from display preferences. Hidden
+//! views (`MyMediaExcludes`) are filtered from the row set returned here.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -758,7 +758,8 @@ impl UserViewManager for FerrofinUserViewManager {
         let views = self
             .without_childless_linked_libraries(user_id, views)
             .await?;
-        self.without_disabled_live_tv(user_id, views).await
+        let views = self.without_disabled_live_tv(user_id, views).await?;
+        self.without_hidden_views(user_id, views).await
     }
 
     async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
@@ -1030,6 +1031,33 @@ pub(crate) fn exclude_item_types_for(
 }
 
 impl FerrofinUserViewManager {
+    /// `UserViewManager.GetUserViews` omits views in the user's
+    /// `MyMediaExcludes` preference unless `IncludeHidden` was requested.
+    /// `/UserViews` has no caller for `IncludeHidden`, so apply the default
+    /// behavior here. Keep media-folder and playlist endpoints unaffected.
+    async fn without_hidden_views(
+        &self,
+        user_id: Uuid,
+        views: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(db) = &self.db else {
+            return Ok(views);
+        };
+        let excluded = user_entity_ext::guid_preference(
+            db.pool(),
+            &ferrofin_db::store::guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+        )
+        .await?;
+        if excluded.is_empty() {
+            return Ok(views);
+        }
+        Ok(views
+            .into_iter()
+            .filter(|view| Uuid::parse_str(&view.id).is_ok_and(|id| !excluded.contains(&id)))
+            .collect())
+    }
+
     /// The collection type of every configured library keyed by its folder
     /// item id (C# `CollectionFolder.CollectionType`). Empty without a
     /// virtual-folder manager wired (unit tests), which makes every parent a
@@ -1492,6 +1520,31 @@ mod tests {
             names(manager.get_user_views(user_id).await.expect("views"))
                 .contains(&"Playlists".to_owned()),
             "a visible child lists the view"
+        );
+
+        // The profile's "Display on home screen" toggle stores the view id in
+        // MyMediaExcludes. That hides the home view while leaving the playlist
+        // folder and playlist endpoints untouched.
+        let playlist_view_id = manager
+            .get_user_views(user_id)
+            .await
+            .expect("views")
+            .into_iter()
+            .find(|view| view.name.as_deref() == Some("Playlists"))
+            .and_then(|view| Uuid::parse_str(&view.id).ok())
+            .expect("derived Playlists view");
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(playlist_view_id)],
+        )
+        .await
+        .expect("hide Playlists on home");
+        assert!(
+            !names(manager.get_user_views(user_id).await.expect("views"))
+                .contains(&"Playlists".to_owned()),
+            "MyMediaExcludes hides the Playlists home view"
         );
     }
 
