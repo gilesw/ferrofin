@@ -736,6 +736,14 @@ impl FerrofinUserViewManager {
 #[async_trait]
 impl UserViewManager for FerrofinUserViewManager {
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views_with_hidden(user_id, false).await
+    }
+
+    async fn get_user_views_with_hidden(
+        &self,
+        user_id: Uuid,
+        include_hidden: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         // Upstream materializes the Live TV view on read, from inside
         // `GetUserViews` itself (UserViewManager.cs:128-133).
         self.ensure_live_tv_view(user_id).await?;
@@ -759,7 +767,11 @@ impl UserViewManager for FerrofinUserViewManager {
             .without_childless_linked_libraries(user_id, views)
             .await?;
         let views = self.without_disabled_live_tv(user_id, views).await?;
-        self.without_hidden_views(user_id, views).await
+        if include_hidden {
+            Ok(views)
+        } else {
+            self.without_hidden_views(user_id, views).await
+        }
     }
 
     async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
@@ -1545,6 +1557,16 @@ mod tests {
             !names(manager.get_user_views(user_id).await.expect("views"))
                 .contains(&"Playlists".to_owned()),
             "MyMediaExcludes hides the Playlists home view"
+        );
+        assert!(
+            names(
+                manager
+                    .get_user_views_with_hidden(user_id, true)
+                    .await
+                    .expect("views including hidden")
+            )
+            .contains(&"Playlists".to_owned()),
+            "profile settings can still list the hidden view to re-enable it"
         );
     }
 

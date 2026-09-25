@@ -1209,6 +1209,19 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Gets the top-level views including any the user hid from their home
+    /// screen. Used by profile settings so hidden views can be re-enabled.
+    /// Managers that do not implement hidden-view filtering can use the
+    /// ordinary view list for both requests.
+    async fn get_user_views_with_hidden(
+        &self,
+        user_id: Uuid,
+        include_hidden: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = include_hidden;
+        self.get_user_views(user_id).await
+    }
+
     /// Gets the server's media folders — the user-root children.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
