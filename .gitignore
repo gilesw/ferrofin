@@ -1,4 +1,5 @@
 /target
+dist/
 **/*.rs.bk
 *.pdb
 # local media/data used for manual First-Light testing
