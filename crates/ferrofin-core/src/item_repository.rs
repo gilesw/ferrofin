@@ -220,9 +220,8 @@ impl FerrofinItemRepository {
             .collect())
     }
 
-    /// Resolves the virtual library views a browse names into the physical
-    /// folders its items actually hang off, returning `None` when there is
-    /// nothing to resolve.
+    /// Resolves virtual library views to every parent id their items may use:
+    /// Jellyfin's physical folder ids and the library id itself.
     ///
     /// Port of `LibraryManager.GetTopParentIdsForQuery`'s `CollectionFolder`
     /// arm and `CollectionFolder.GetActualChildren`. On a Jellyfin database a
@@ -233,9 +232,9 @@ impl FerrofinItemRepository {
     /// (`PhysicalFolderIds`); the physical folders themselves hang off the
     /// AggregateFolder, so there is no relational path to follow instead.
     ///
-    /// A Ferrofin-written database keeps no `Data` blob and hangs items off the
-    /// collection folder directly, so every lookup here comes back empty and
-    /// the query is left exactly as it was.
+    /// Ferrofin-written items hang directly off the collection folder. An
+    /// adopted library can contain both those items and older Jellyfin items
+    /// under its physical folder ids, so both sets must be queried.
     async fn resolve_views(
         &self,
         filter: &InternalItemsQuery,
@@ -382,8 +381,9 @@ impl FerrofinItemRepository {
     ///
     /// `None` means "leave this to the ancestor closure" — the item is not a view
     /// at all (which is what `SetTopParentIdsOrAncestors` does when the parents are
-    /// not all `ICollectionFolder`/`UserView`), or it is a collection folder with no
-    /// physical folders, which on a Ferrofin-written database is every one of them.
+    /// not all `ICollectionFolder`/`UserView`). A collection folder resolves to
+    /// its own id plus any Jellyfin physical folder ids, covering native and
+    /// adopted items together.
     /// `Some(vec![])` is different and deliberate: a *view* that resolves to
     /// nothing, which upstream turns into a match-nothing scope rather than letting
     /// the query widen to every library.
@@ -393,7 +393,7 @@ impl FerrofinItemRepository {
     /// 1. a Live TV view stands for itself;
     /// 2. a `DisplayParentId` is followed (and a dangling one resolves to nothing);
     /// 3. so is a `ParentId`;
-    /// 4. a `CollectionFolder` becomes its `PhysicalFolderIds`;
+    /// 4. a `CollectionFolder` becomes its own id plus `PhysicalFolderIds`;
     /// 5. anything else a view could be resolves to nothing.
     ///
     /// Both of the views a real 10.11.8 database carries take one of the first two
@@ -441,14 +441,8 @@ impl FerrofinItemRepository {
                 .await?
                 .remove(&id)
                 .unwrap_or_default();
-            // A collection folder with NO physical folders means two different
-            // things, and only one of them is "an empty library". On a
-            // Ferrofin-written database no collection folder has them — items hang
-            // off the folder directly and there is no `Data` blob — so answering
-            // "match nothing" here would empty every native browse. Deliberate
-            // divergence, same as the one `resolve_views` already documents: an
-            // unresolvable collection folder falls through to the ancestor closure,
-            // which is right for both database shapes.
+            // The library id is included by physical_folders_by_view, covering
+            // native items and adopted items already rewritten by a scan.
             return Ok((!folders.is_empty()).then_some(folders));
         }
         if kind != Some(BaseItemKind::UserView) {
@@ -593,15 +587,12 @@ impl FerrofinItemRepository {
             }))
     }
 
-    /// The physical folders each of `ids` stands for, for those that are
-    /// Jellyfin collection folders. Ids that are not — every id on a
-    /// Ferrofin-written database — are simply absent from the map.
+    /// All item-parent ids each collection folder in `ids` stands for.
     ///
     /// One statement for the whole set, and restricted to the collection-folder
-    /// type: only those rows carry `PhysicalFolderIds` (7 of 7 on the real
-    /// library, no other type), so without the guard every ordinary browse of a
-    /// series or a folder would read and JSON-parse that item's `Data` blob to
-    /// learn nothing.
+    /// type, so ordinary browses never read or parse unrelated items' `Data`
+    /// blobs. A folder's own id is always included; `PhysicalFolderIds` are
+    /// appended when present.
     async fn physical_folders_by_view(
         &self,
         ids: &[Uuid],
@@ -1463,14 +1454,13 @@ fn push_representative_rank(
     qb.push(r#"bi."Id") AS "rep_rank""#);
 }
 
-/// The physical folders each of `ids` stands for, for those that are Jellyfin
-/// collection folders — see
+/// The item-parent ids each of `ids` stands for, for collection folders — see
 /// [`FerrofinItemRepository::physical_folders_by_view`], which is the doc for
 /// why this translation exists at all.
 ///
 /// A free function because the child-count service needs the same one: a
-/// library's `ChildCount` is its physical folders' children, and grouping on
-/// the raw `ParentId` reports 0 for every library on an adopted database.
+/// library's `ChildCount` includes physical-folder children and direct children
+/// written by Ferrofin, which can coexist after adoption.
 pub(crate) async fn physical_folders_by_view(
     db: &Database,
     ids: &[Uuid],
@@ -1480,23 +1470,24 @@ pub(crate) async fn physical_folders_by_view(
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         // `+"Type"`: the id list is the selective side; see `append_type_filters`.
-        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
+        r#"SELECT "Id", "Data" FROM "BaseItems" WHERE +"Type" = "#,
     );
     qb.push_bind(collection_folder).push(" AND ");
     push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
-    let rows: Vec<(String, String)> = qb
-        .build_query_as::<(String, String)>()
+    let rows: Vec<(String, Option<String>)> = qb
+        .build_query_as::<(String, Option<String>)>()
         .fetch_all(db.pool())
         .await
         .map_err(db_err)?;
     Ok(rows
         .iter()
         .filter_map(|(id, blob)| {
-            let folders = parse_physical_folder_ids(blob);
-            if folders.is_empty() {
-                return None;
+            let id = Uuid::parse_str(id).ok()?;
+            let mut parents = vec![id];
+            if let Some(blob) = blob {
+                parents.extend(parse_physical_folder_ids(&blob));
             }
-            Some((Uuid::parse_str(id).ok()?, folders))
+            Some((id, parents))
         })
         .collect())
 }
