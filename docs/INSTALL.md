@@ -136,75 +136,42 @@ identify the seven tested fixture paths and the server image used.
 The gate checks the exact migration history and refuses unknown or incomplete histories;
 support does not extend automatically to other 10.11.x or 12.x releases. Upgrade an older
 installation to a supported version under Jellyfin before copying it; do not edit migration
-history to bypass the check. Adoption is one-way: keep a full backup to return to Jellyfin.
+history to bypass the check. Keep the original Jellyfin installation intact until Ferrofin
+has been verified so you can roll back if needed.
 
-#### Stop both servers and copy the complete state
+#### Stop both servers and copy the Jellyfin state
 
-Keep Jellyfin and Ferrofin stopped throughout the copy. The example below uses the Debian
-package layout: all data in `/var/lib/jellyfin`, with configuration stored separately in
-`/etc/jellyfin`. Change both source paths for your installation. For Docker, stop the
-container and use the host paths of its data/config mounts; layouts vary by image.
-
-Copy **all files**, including hidden files, from the entire data and configuration
-directories. Preserve the directory structure: `data/jellyfin.db` can stay nested because
-Ferrofin detects that layout. Include the database's `-wal` and `-shm` companions when
-present. Do not copy a database while either server is writing to it.
+Install `rsync` and stop both services before copying. Run the checked-in script from a
+Ferrofin checkout. It uses the Debian package paths by default, copies the complete data
+tree and `/etc/jellyfin` into Ferrofin's data/config directories, and assigns the copied
+files to the `ferrofin` user. `--ignore-existing` keeps files already present at the
+destination. In particular, Jellyfin's `root/default/` library folders are copied to
+`/var/lib/ferrofin/data/root/default/`, where Ferrofin discovers them.
 
 ```sh
-sudo sh <<'SH'
-set -eu
-systemctl stop jellyfin ferrofin
-source_data=/var/lib/jellyfin
-source_config=/etc/jellyfin
-destination=/var/lib/ferrofin/data
-
-test -d "$source_data"
-test -d "$source_config"
-test -f "$source_data/data/jellyfin.db" || test -f "$source_data/jellyfin.db"
-test -f "$source_config/system.xml"
-test -f "$source_config/network.xml"
-
-# An independent backup, readable only by root. Originals are left in place.
-backup=$(mktemp -d /var/lib/ferrofin-migration.XXXXXX)
-printf 'Migration backup: %s\n' "$backup"
-mkdir "$backup/jellyfin-data" "$backup/jellyfin-config"
-cp -a "$source_data/." "$backup/jellyfin-data/"
-cp -a "$source_config/." "$backup/jellyfin-config/"
-
-# Preserve a previous Ferrofin installation, including its DB, WAL and JSON.
-# Mixing it into the copy would cause its database/settings to win on startup.
-if [ -e "$destination" ]; then
-    mv "$destination" "$backup/previous-ferrofin-data"
-fi
-mkdir -p "$destination"
-cp -a "$backup/jellyfin-data/." "$destination/"
-# A copied config symlink must not send writes back into the original install.
-if [ -L "$destination/config" ]; then
-    mv "$destination/config" "$backup/copied-config-symlink"
-fi
-mkdir -p "$destination/config"
-cp -a "$backup/jellyfin-config/." "$destination/config/"
-chown -R ferrofin:ferrofin "$destination"
-SH
+sudo systemctl stop jellyfin ferrofin
+sudo apt-get install -y rsync
+sudo scripts/migrate-jellyfin.sh
 ```
 
-If a preflight check fails, verify the source paths and locate the missing file before
-continuing. If the destination is a mount point, use a separate empty destination and
-update `data_dir` and the unit's writable paths instead of moving the mount point.
+The script must run after installing Ferrofin but before its first start. It refuses to
+copy over an existing Ferrofin database, because `--ignore-existing` would otherwise
+silently keep that database instead of adopting Jellyfin's. It leaves the original
+Jellyfin files untouched. For Docker or nonstandard package layouts, pass the source data
+directory, source config directory, and Ferrofin data directory as arguments, in that
+order:
 
-This copies library definitions (`root/default/`), metadata and images (`metadata/`),
-playlists, plugin files, and configuration alongside the database. Jellyfin .NET plugins
-are retained in the copy but cannot run in Ferrofin; they require Ferrofin-compatible
-replacements. A copied symbolic link still points at its original target: separately back
-up any external state directories and arrange access to them. Include any separately
-configured cache, metadata, or configuration directories in your backup as well.
+```sh
+sudo scripts/migrate-jellyfin.sh /path/to/jellyfin/data /path/to/jellyfin/config /path/to/ferrofin/data
+```
 
-The destination's `config/` is Ferrofin's default `config_dir` for this guide. If you set
-`config_dir` explicitly, copy the configuration there instead, using a clean destination.
-`network.xml` is essential: it carries remote-access policy, IP filters, trusted proxies,
-and local-network definitions. Omitting it restores defaults, including remote access
-enabled and an empty IP filter. Existing Ferrofin JSON takes precedence over copied XML,
-which is why the example preserves the previous destination and starts with a clean one.
+The copy includes library definitions, metadata, images, playlists, plugin files, and
+configuration. Jellyfin .NET plugins are retained in the copy but cannot run in Ferrofin;
+they require Ferrofin-compatible replacements. `network.xml` carries remote-access
+policy, IP filters, trusted proxies, and local-network definitions. A copied symbolic
+link still points at its original target, so ensure any linked external state remains
+available to Ferrofin. If Jellyfin uses custom cache, metadata, or configuration paths,
+copy those separately to the configured Ferrofin paths.
 
 #### Unicode usernames
 
@@ -246,9 +213,9 @@ The copy includes all source files, but only settings supported by Ferrofin are 
 review warnings about unsupported fields. Keep Jellyfin stopped while Ferrofin uses the
 same media paths, and prevent its service/container from automatically restarting.
 
-Adoption is one-way. To roll back, stop Ferrofin and restart Jellyfin against its untouched
-original state, or restore the full backup while both are stopped. Do not point Jellyfin
-at the adopted database. Changes made in Ferrofin after migration are not copied back.
+Adoption is one-way. To roll back before retiring Jellyfin, stop Ferrofin and restart
+Jellyfin against its untouched original state. Do not point Jellyfin at the adopted
+database. Changes made in Ferrofin after migration are not copied back.
 See [`docs/UPGRADING.md`](UPGRADING.md).
 
 ## Upgrading
