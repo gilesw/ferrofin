@@ -31,7 +31,7 @@ use ferrofin_model::configuration::LibraryOptions as LibraryOptionsModel;
 use crate::item_persistence_service::series_key_scope;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::{CollectionTypeOptions, ImageType, VideoType};
+use ferrofin_model::entities::{CollectionTypeOptions, ImageType, MetadataField, VideoType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_model::media_info::MediaInfo;
@@ -42,6 +42,7 @@ use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
 use ferrofin_providers::library_options::fetcher_names;
+use ferrofin_providers::metadata_merge::ALL_LOCKABLE_FIELDS;
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
     RemoteImage, TmdbClient, TmdbDetails, TmdbKind,
@@ -146,6 +147,10 @@ struct LocalNfo {
     /// the refresh save the item (and so moves `DateLastSaved` past the
     /// sidecar's mtime, ending its change).
     found: bool,
+    /// `<lockdata>true</lockdata>`: upstream's `isLocalLocked`.
+    is_locked: bool,
+    /// `<lockedfields>`: unioned into the item's `LockedFields`.
+    locked_fields: Vec<MetadataField>,
 }
 
 impl RemoteMetadata {
@@ -897,6 +902,20 @@ struct RefreshContext<'a> {
     superseded: std::collections::HashSet<usize>,
 }
 
+/// Whether `item`'s planned ancestor closure differs from the stored one
+/// (as a set); unknown links count as changed.
+fn ancestors_changed(links: Option<&StoredItemLinks>, item: &Planned) -> bool {
+    links.is_none_or(|l| {
+        let mut stored: Vec<Uuid> = l.ancestors.clone();
+        let mut planned = item.ancestors.clone();
+        stored.sort_unstable();
+        stored.dedup();
+        planned.sort_unstable();
+        planned.dedup();
+        stored != planned
+    })
+}
+
 /// The plan indices of every copy of a repeated id but its last.
 ///
 /// Overlapping library locations plan the same kind+path id more than once,
@@ -1081,6 +1100,9 @@ struct StoredRows {
     /// rows were not read: every existing id for a scanner without an item
     /// repository, and the rows that failed to read one by one.
     exist_unread: std::collections::HashSet<Uuid>,
+    /// Ids in the current window whose stored row exists but failed to read
+    /// on its own (see [`Stored::Undecodable`]).
+    undecodable: std::collections::HashSet<Uuid>,
     /// The current window's image, ancestor and external-stream rows, by id;
     /// `None` when they could not be read (every item then counts as
     /// changed).
@@ -1103,6 +1125,7 @@ static NO_STORED_LINKS: StoredItemLinks = StoredItemLinks {
     ancestors: Vec::new(),
     external_subtitles: Vec::new(),
     external_audio: Vec::new(),
+    locked_fields: Vec::new(),
 };
 
 impl StoredRows {
@@ -1134,6 +1157,7 @@ impl StoredRows {
     fn get(&self, id: Uuid) -> Stored<'_> {
         match &self.rows {
             None => Stored::Unread,
+            Some(_) if self.undecodable.contains(&id) => Stored::Undecodable,
             Some(_) if self.exist_unread.contains(&id) => Stored::Unread,
             Some(rows) => rows.get(&id).map_or(Stored::New, Stored::Existing),
         }
@@ -1154,6 +1178,13 @@ enum Stored<'a> {
     /// Treated as existing (not announced as added), as the per-item existence
     /// check this replaced treated its own failure.
     Unread,
+    /// The item's row exists but failed to read on its own (a stored value
+    /// the decoder rejects). With no stored row nothing can be merged onto
+    /// it, so no provider runs and the item is not re-saved as a scanned
+    /// row: only its file facts are written, column by column
+    /// ([`ItemPersistenceService::update_file_facts`]), so a user's edits
+    /// and locks on it survive.
+    Undecodable,
 }
 
 impl<'a> Stored<'a> {
@@ -1161,7 +1192,7 @@ impl<'a> Stored<'a> {
     fn row(self) -> Option<&'a BaseItemEntity> {
         match self {
             Self::Existing(row) => Some(row),
-            Self::New | Self::Unread => None,
+            Self::New | Self::Unread | Self::Undecodable => None,
         }
     }
 }
@@ -1824,11 +1855,12 @@ impl LibraryScanner {
                 plan: stored_rows
                     .plan(scanned)
                     .unwrap_or_else(|| self.plan_item(&refresh, None, item, None)),
-                // A locked item's metadata, cast, and artwork are user-owned:
-                // run no NFO or remote providers for it, and leave its
-                // people/images untouched. The scan-upsert's `IsLocked` guard
-                // backstops the metadata columns; file-derived facts (the
-                // probe) still update.
+                // A locked item's metadata and cast are user-owned: no NFO
+                // or remote provider runs for it (`RefreshWithProviders`
+                // returns on `IsLocked`), and its people are left alone. The
+                // scan-upsert's `IsLocked` guard backstops the metadata
+                // columns; file-derived facts (the probe) still update, and
+                // its local images are still validated and discovered.
                 locked: locked_items.contains(&item.id),
                 policy: policy_for(item, &fetcher_policies),
             };
@@ -1899,6 +1931,24 @@ impl LibraryScanner {
             locked,
             policy,
         } = pass;
+        if matches!(stored, Stored::Undecodable) {
+            // Only the file facts are written, and only when they moved;
+            // nothing else can be judged without the stored row (its plan
+            // runs nothing, so no probe result waits for it either). A
+            // moved parent moves the ancestor closure with it.
+            let facts_moved = self.persistence.update_file_facts(&item.entity).await?;
+            let ancestors_moved = ancestors_changed(links, item);
+            if ancestors_moved {
+                self.persistence
+                    .set_ancestors(item.id, &item.ancestors)
+                    .await?;
+            }
+            return Ok(if facts_moved || ancestors_moved {
+                ItemSaved::Saved
+            } else {
+                ItemSaved::Unchanged
+            });
+        }
         let stored_row = stored.row();
         // Probe first so the item row is saved already carrying its duration and
         // size (the streams themselves are saved after, since they FK the row).
@@ -1928,6 +1978,15 @@ impl LibraryScanner {
         };
         let mut people = local.people;
         let nfo_ids = local.ids;
+        // `var isLocalLocked = temp.Item.IsLocked` (`MetadataService.cs:873`):
+        // an NFO's `<lockdata>true` skips the remote providers for this pass
+        // and, through the merge's metadata-settings half, locks the item
+        // (`target.IsLocked = target.IsLocked || source.IsLocked`); `false`
+        // never unlocks it.
+        let nfo_locked = local.is_locked;
+        if nfo_locked {
+            entity.is_locked = true;
+        }
         // Sidecar ids first, then any this row already carries: both are
         // `info.GetProviderId`, which the fetchers resolve by before they
         // ever search by title.
@@ -1938,7 +1997,7 @@ impl LibraryScanner {
         // remote providers. Best-effort: failures don't abort (they only keep
         // the refresh from being stamped), and NFO-provided people take
         // precedence.
-        let remote = if plan.remote_metadata && !locked {
+        let remote = if plan.remote_metadata && !locked && !nfo_locked {
             let gate = RemoteGate {
                 forced: plan.run_all_providers,
                 view: EnrichedView::of(&entity, stored_row),
@@ -1981,7 +2040,7 @@ impl LibraryScanner {
         // helper merges their (filtered) ids with the built-ins'. They are
         // remote providers, so they run when the remote ones do.
         let built_in_ids = merge_provider_ids(nfo_ids, remote.provider_ids);
-        let all_provider_ids = if plan.remote_metadata {
+        let all_provider_ids = if plan.remote_metadata && !nfo_locked {
             let (ids, failed) = count_request_failures(self.apply_dynamic_metadata(
                 &mut entity,
                 &built_in_ids,
@@ -1999,11 +2058,34 @@ impl LibraryScanner {
         // An existing item is saved as its stored row with this scan's
         // file facts and provider results merged on (upstream's Default
         // refresh), never as the row rebuilt from disk.
+        // The fields the user locked keep their stored values through the
+        // merge (`MergeData(temp, metadata, item.LockedFields, …)`). Unknown
+        // links (a failed read) lock every field rather than risk one.
+        let locked_fields = links.map_or(ALL_LOCKABLE_FIELDS, |l| l.locked_fields.as_slice());
+        // The NFO's `<lockedfields>` join the item's set (when this
+        // window's links could not be read the union is skipped: the pass
+        // fails closed, every field treated as locked):
+        // `target.LockedFields.Concat(source.LockedFields).Distinct()`
+        // (`MetadataService.cs:1372-1379`). This pass's merge still checks
+        // the stored set, as upstream's passes `item.LockedFields`.
+        let grown_locks: Option<Vec<MetadataField>> = links.and_then(|l| {
+            let mut all = l.locked_fields.clone();
+            for field in &local.locked_fields {
+                if !all.contains(field) {
+                    all.push(*field);
+                }
+            }
+            (all.len() > l.locked_fields.len()).then_some(all)
+        });
         entity = saved_row(
             stored_row,
             &guesses,
             &entity,
-            SaveFacts { locked, probe_ran },
+            SaveFacts {
+                locked,
+                probe_ran,
+                locked_fields,
+            },
         );
         self.apply_parental_rating_score(&mut entity);
         // A series' presentation key depends on the ids just settled;
@@ -2016,50 +2098,38 @@ impl LibraryScanner {
             state.series_keys,
         );
         let settled_ids = settle_provider_ids(state.art_cache, &entity.id, &all_provider_ids);
-        // Artwork: local validation always, the remote image providers only
-        // when the plan runs them. A locked row's images are left alone.
-        //
-        // TODO(parity, open work item — NOT an accepted divergence; Phase 3L of
-        // PLAN_SCAN_CHANGE_DETECTION): upstream does NOT skip the whole pass for
-        // a locked row. v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs:412`
-        // returns true for `provider is ILocalImageProvider` BEFORE the
-        // `item.IsLocked` check, so only the REMOTE image providers are gated —
-        // Jellyfin keeps re-discovering a sidecar `poster.jpg` on a locked item.
-        // Un-gating it here waits for the per-field locks and the removal of
-        // the editor's auto-lock (`item_update.rs`), or a scan could replace a
-        // user-chosen image.
-        let artwork = if locked {
-            None
-        } else {
-            let art = ArtworkPass {
-                entity: &entity,
-                streams: &rows.streams,
-                policy,
-                embedded_images,
-                remote: plan.remote_images != ImageFetch::None,
-                stored: links.map(|l| l.images.as_slice()),
-            };
-            let (artwork, failed) = count_request_failures(Box::pin(self.collect_artwork(
-                item.id,
-                art,
-                state.art_cache,
-            )))
-            .await;
-            failures += failed;
-            artwork
+        // Artwork: local validation always — a locked row included — and
+        // the remote image providers only when the plan runs them.
+        // `ProviderManager.CanRefreshImages` (`ProviderManager.cs:433-441`)
+        // enables every `ILocalImageProvider` BEFORE its `item.IsLocked`
+        // check, and `RefreshMetadata` validates the local images whatever
+        // the lock (`MetadataService.cs:123-143`), so a new sidecar
+        // `poster.jpg` on a locked item is still discovered. The lock refuses
+        // the remote and dynamic (embedded-cover) providers outside an image
+        // full refresh; the plan already refuses the remote ones.
+        let dynamic_images = !locked
+            || state.refresh.request.options.image_refresh_mode
+                == ferrofin_traits::providers::MetadataRefreshMode::FullRefresh;
+        let art = ArtworkPass {
+            entity: &entity,
+            streams: &rows.streams,
+            policy,
+            embedded_images,
+            remote: plan.remote_images != ImageFetch::None,
+            dynamic_images,
+            stored: links.map(|l| l.images.as_slice()),
         };
+        let (artwork, failed) = count_request_failures(Box::pin(self.collect_artwork(
+            item.id,
+            art,
+            state.art_cache,
+        )))
+        .await;
+        failures += failed;
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
-        let ancestors_changed = links.is_none_or(|l| {
-            let mut stored: Vec<Uuid> = l.ancestors.clone();
-            let mut planned = item.ancestors.clone();
-            stored.sort_unstable();
-            stored.dedup();
-            planned.sort_unstable();
-            planned.dedup();
-            stored != planned
-        });
+        let ancestors_changed = ancestors_changed(links, item);
         let row_changed = stored_row
             .is_none_or(|row| crate::item_persistence_service::scan_save_changes_row(&entity, row));
         // Upstream's `updateType > None`: a local provider answered (the
@@ -2075,10 +2145,17 @@ impl LibraryScanner {
         let backfill_only = plan.remote_metadata && !plan.run_all_providers;
         let local_answered =
             (local.found || embedded_found) && (plan.run_all_providers || plan.local_monitor_fired);
+        // A `Cast` lock leaves the credits as stored: upstream's merge keeps
+        // `metadata.People` null under it (`MetadataService.cs:1235`) and
+        // `SaveItemAsync` writes people only when non-null (`:320-324`).
+        // A new item has no locks.
+        let cast_locked = stored_row.is_some() && locked_fields.contains(&MetadataField::Cast);
         let people_changed = backfill_only
+            && !cast_locked
             && (people_fetched || !people.is_empty())
             && self.people_differ(item.id, &people).await;
         let changed = probe_ran
+            || grown_locks.is_some()
             || local_answered
             || people_changed
             || settled_ids.changed
@@ -2153,7 +2230,18 @@ impl LibraryScanner {
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
         }
-        self.persist_people(item.id, people, people_fetched).await;
+        if !cast_locked {
+            self.persist_people(item.id, people, people_fetched).await;
+        }
+        if let Some(fields) = &grown_locks {
+            let ids: Vec<i32> = fields
+                .iter()
+                .map(|f| ferrofin_db::enums::metadata_field::to_i32(*f))
+                .collect();
+            // Additive: a stored id this server doesn't name must survive the
+            // union (upstream `LockedFields.Concat(…).Distinct()`).
+            self.persistence.add_locked_fields(item.id, &ids).await?;
+        }
         self.persist_probe_rows(item.id, &rows).await?;
         if let Some(images) = artwork.filter(|_| images_changed)
             && let Err(err) = self.persistence.save_item_images(item.id, &images).await
@@ -2190,6 +2278,7 @@ impl LibraryScanner {
         window.links = None;
         window.plans.clear();
         window.exist_unread.clear();
+        window.undecodable.clear();
         let ids: Vec<Uuid> = planned[start..end].iter().map(|p| p.id).collect();
         self.read_window_rows(&ids, window).await;
         window.links = match self.persistence.scan_stored_links(&ids).await {
@@ -2217,6 +2306,10 @@ impl LibraryScanner {
                 // reach the probe pipeline, whose results are taken in order.
                 if refresh.superseded.contains(&(start + offset)) {
                     plan.probe = false;
+                }
+                // An undecodable row runs nothing (`Stored::Undecodable`).
+                if matches!(window.get(item.id), Stored::Undecodable) {
+                    plan = crate::refresh_plan::ItemRefreshPlan::IDLE;
                 }
                 plan
             })
@@ -2249,27 +2342,36 @@ impl LibraryScanner {
                 // stored columns). Re-read the window row by row so only the
                 // undecodable rows lose their stored state.
                 let mut rows = HashMap::new();
-                let mut failed = 0_usize;
+                let mut first_error: Option<String> = None;
                 for &id in ids {
                     match repo.retrieve_item(id).await {
                         Ok(Some(row)) => {
                             rows.insert(id, row);
                         }
                         Ok(None) => {}
-                        Err(_) => {
-                            // Unknown, not absent: still scanned and saved,
-                            // but not announced as added.
-                            failed += 1;
-                            window.exist_unread.insert(id);
+                        Err(item_err) => {
+                            // Unknown, not absent: never announced as
+                            // added, and refreshed only as far as its file
+                            // facts (`Stored::Undecodable`).
+                            first_error.get_or_insert_with(|| item_err.to_string());
+                            window.undecodable.insert(id);
                         }
                     }
                 }
                 window.rows = Some(rows);
+                // One warning per failed window, naming its unreadable items
+                // (at most a window's worth) so they can be found and fixed:
+                // until then no provider runs for them and only their file
+                // facts are kept current.
+                let item_ids: Vec<String> =
+                    window.undecodable.iter().map(ToString::to_string).collect();
                 tracing::warn!(
                     %err,
-                    failed,
-                    "failed to read a window of stored items; re-read it per item, \
-                     treating the unreadable ones as existing"
+                    failed = item_ids.len(),
+                    item_ids = %item_ids.join(","),
+                    first_error = first_error.as_deref().unwrap_or_default(),
+                    "failed to read a window of stored items; re-read it per item — the \
+                     unreadable ones run no provider and get their file facts only"
                 );
             }
         }
@@ -3202,7 +3304,19 @@ impl LibraryScanner {
                 })
                 .await?;
 
-            let (mut updated, changed) = apply_album_child_metadata(album, &tracks);
+            // `UpdateGenres`/`UpdateStudios` skip a field the album locked.
+            let locked_fields = match self
+                .persistence
+                .locked_fields_for_items(&[album_uuid])
+                .await
+            {
+                Ok(mut map) => map.remove(&album_uuid).unwrap_or_default(),
+                Err(err) => {
+                    tracing::warn!(%err, item_id = %album_uuid, "failed to read the album's locked fields");
+                    ALL_LOCKABLE_FIELDS.to_vec()
+                }
+            };
+            let (mut updated, changed) = apply_album_child_metadata(album, &tracks, &locked_fields);
             if changed {
                 self.persistence
                     .save_items(std::slice::from_ref(&updated))
@@ -3213,6 +3327,13 @@ impl LibraryScanner {
                         .save_item_values(album_uuid, &values)
                         .await?;
                 }
+            }
+            // MusicBrainz, AudioDb and fanart are remote providers:
+            // `CanRefreshMetadata` / `CanRefreshImages` refuse them all for a
+            // locked item (`ProviderManager.cs:438,589`). Its local images
+            // were validated by the item walk.
+            if album.is_locked {
+                return Ok(());
             }
 
             // The embedded ids from any track (they share an album's release).
@@ -3260,11 +3381,14 @@ impl LibraryScanner {
             self.enrich_album_artwork(
                 album_uuid,
                 &mut updated,
-                resolved.release_group_id.as_deref(),
-                album_artist.as_deref(),
-                artist_mbid,
+                AlbumRemoteKeys {
+                    release_group_id: resolved.release_group_id.as_deref(),
+                    album_artist: album_artist.as_deref(),
+                    artist_mbid,
+                },
                 policy,
                 dated,
+                &locked_fields,
             )
             .await?;
         }
@@ -3273,17 +3397,24 @@ impl LibraryScanner {
 
     /// AudioDb album metadata (description/year) + AudioDb/fanart album artwork,
     /// keyed by the release-group id (fanart also needs the album-artist's mbid).
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The album's `LockedFields` shield its name and overview, as the merge
+    /// of a remote provider's result would (`MergeData(…, item.LockedFields,
+    /// …)`).
     async fn enrich_album_artwork(
         &self,
         album_uuid: Uuid,
         updated: &mut BaseItemEntity,
-        release_group_id: Option<&str>,
-        album_artist: Option<&str>,
-        artist_mbid: &HashMap<String, String>,
+        keys: AlbumRemoteKeys<'_>,
         policy: FetcherPolicy<'_>,
         already_changed: bool,
+        locked_fields: &[MetadataField],
     ) -> Result<(), ServiceError> {
+        let AlbumRemoteKeys {
+            release_group_id,
+            album_artist,
+            artist_mbid,
+        } = keys;
         let mut changed = already_changed;
         let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
         if policy.metadata_enabled("MusicAlbum", fetcher_names::AUDIODB)
@@ -3295,12 +3426,16 @@ impl LibraryScanner {
             // upstream OVERWRITES — `item.Name = result.strAlbum` — rather than
             // filling a gap, so this is not gated on the existing name.
             if let Some(name) = a.name
+                && !locked_fields.contains(&MetadataField::Name)
                 && updated.name.as_deref() != Some(name.as_str())
             {
                 updated.name = Some(name);
                 changed = true;
             }
-            if updated.overview.is_none() && a.description.is_some() {
+            if updated.overview.is_none()
+                && !locked_fields.contains(&MetadataField::Overview)
+                && a.description.is_some()
+            {
                 updated.overview = a.description;
                 changed = true;
             }
@@ -3327,6 +3462,9 @@ impl LibraryScanner {
     /// Resolves and persists each `MusicArtist`'s `MusicBrainzArtist` id — the
     /// embedded album-artist id from its tracks, else a MusicBrainz name search —
     /// then its AudioDb bio/genre + AudioDb/fanart artwork.
+    // One straight pass per artist: id, name, life span, AudioDb, fanart; the
+    // Phase 3L lock gates tipped it over the line count.
+    #[allow(clippy::too_many_lines)]
     async fn enrich_artists(
         &self,
         items: &dyn ItemRepository,
@@ -3341,6 +3479,19 @@ impl LibraryScanner {
                 ..Default::default()
             })
             .await?;
+        // Every artist's `LockedFields` in one read; a failed read locks
+        // every field rather than risk one.
+        let artist_ids: Vec<Uuid> = artists
+            .iter()
+            .filter_map(|a| Uuid::parse_str(&a.id).ok())
+            .collect();
+        let artist_locks = match self.persistence.locked_fields_for_items(&artist_ids).await {
+            Ok(map) => Some(map),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read the artists' locked fields");
+                None
+            }
+        };
         for artist in artists {
             let Ok(artist_uuid) = Uuid::parse_str(&artist.id) else {
                 continue;
@@ -3348,6 +3499,15 @@ impl LibraryScanner {
             let Some(name) = artist.name.as_deref().filter(|n| !n.is_empty()) else {
                 continue;
             };
+            // Every source below is a remote provider, which a locked item
+            // never runs (`ProviderManager.cs:438,589`).
+            if artist.is_locked {
+                continue;
+            }
+            let locked: &[MetadataField] =
+                artist_locks.as_ref().map_or(ALL_LOCKABLE_FIELDS, |map| {
+                    map.get(&artist_uuid).map_or(&[][..], Vec::as_slice)
+                });
             let policy = policy_of(policies, artist.top_parent_id.as_deref());
             // The MusicBrainz checkbox gates the REMOTE surface only (the
             // name search and the persisted provider-id row) — an mbid
@@ -3389,6 +3549,7 @@ impl LibraryScanner {
             let mut changed = false;
             if let Some(mb_name) = searched_name
                 && mb_enabled
+                && !locked.contains(&MetadataField::Name)
                 && updated.name.as_deref() != Some(mb_name.as_str())
                 && mb.replace_artist_name().await
             {
@@ -3424,11 +3585,15 @@ impl LibraryScanner {
                 && let Some(adb) = &self.audiodb
                 && let Some(a) = adb.artist(&id).await
             {
-                if updated.overview.is_none() && a.biography.is_some() {
+                if updated.overview.is_none()
+                    && !locked.contains(&MetadataField::Overview)
+                    && a.biography.is_some()
+                {
                     updated.overview = a.biography;
                     changed = true;
                 }
                 if updated.genres.as_deref().unwrap_or_default().is_empty()
+                    && !locked.contains(&MetadataField::Genres)
                     && let Some(genre) = a.genre.filter(|g| !g.is_empty())
                 {
                     updated.genres = Some(genre);
@@ -3853,6 +4018,8 @@ impl LibraryScanner {
                 .collect(),
             ids: ids.filter(|(_, v)| !v.trim().is_empty()).collect(),
             found: true,
+            is_locked: result.item.is_locked,
+            locked_fields: result.item.locked_fields.clone(),
         }
     }
 
@@ -4107,8 +4274,9 @@ impl LibraryScanner {
                 .and_then(|h| i32::try_from(h).ok())
                 .unwrap_or(0),
             name: entity.name.clone(),
-            // A field-level `MetadataField.Name` lock; the item-level lock
-            // already returned above.
+            // A field-level `MetadataField.Name` lock is honoured by the
+            // merge the scan saves through (`merge_onto_stored` keeps a
+            // locked name as stored); the item-level lock returned above.
             name_locked: false,
             ..Default::default()
         };
@@ -4679,6 +4847,55 @@ impl LibraryScanner {
         }
     }
 
+    /// The stored row and `LockedFields` of every credited person whose
+    /// biography is about to be fetched (one read each); a person the store
+    /// cannot answer for is absent.
+    async fn person_locks(
+        &self,
+        written: &[ferrofin_traits::persistence::WrittenPerson],
+    ) -> Option<HashMap<Uuid, PersonLock>> {
+        let ids: Vec<Uuid> = written
+            .iter()
+            .filter(|p| p.needs_details)
+            .map(|p| p.id)
+            .collect();
+        let Some(repo) = &self.item_repository else {
+            return Some(HashMap::new());
+        };
+        if ids.is_empty() {
+            return Some(HashMap::new());
+        }
+        // `None` = the rows couldn't be read, so no lock can be ruled out: the
+        // caller writes no biography this pass (fail closed, like the field read).
+        let rows = match repo.retrieve_items(&ids).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, "could not read credited people's rows");
+                return None;
+            }
+        };
+        // A failed read locks every field rather than risk one.
+        let mut fields = match self.persistence.locked_fields_for_items(&ids).await {
+            Ok(map) => Some(map),
+            Err(err) => {
+                tracing::warn!(%err, "could not read credited people's locked fields");
+                None
+            }
+        };
+        Some(
+            rows.into_iter()
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    let fields = fields.as_mut().map_or_else(
+                        || ALL_LOCKABLE_FIELDS.to_vec(),
+                        |map| map.remove(&id).unwrap_or_default(),
+                    );
+                    Some((id, PersonLock { row, fields }))
+                })
+                .collect(),
+        )
+    }
+
     /// Enriches credited people: downloads each one's TMDB profile image as their
     /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
     /// for each *newly-created* person. Best-effort and cached — images skip
@@ -4701,6 +4918,7 @@ impl LibraryScanner {
         // library with thousands of credited people is more image work than the
         // items themselves. One read per credited cast, not one per person.
         let stored = self.stored_person_image_metadata(&written).await;
+        let person_locks = self.person_locks(&written).await;
         for person in written {
             let id = person.id.to_string();
             if let Some(url) = person.image_url {
@@ -4736,14 +4954,31 @@ impl LibraryScanner {
             // Biography: only for people still missing one, and only when TMDB
             // actually has detail to store.
             if person.needs_details
+                && let Some(person_locks) = &person_locks
                 && let Some(tmdb_id) = person.provider_id
                 && let Some(details) = tmdb.person_details(tmdb_id).await
             {
+                // A locked person takes no remote provider's answer; a field
+                // lock keeps that field as stored (`MergeData(…,
+                // item.LockedFields, …)`).
+                let lock = person_locks.get(&person.id);
+                if lock.is_some_and(|l| l.row.is_locked) {
+                    continue;
+                }
+                let keeps = |field: MetadataField| lock.is_some_and(|l| l.fields.contains(&field));
                 let metadata = ferrofin_traits::persistence::PersonMetadata {
-                    overview: details.biography,
+                    overview: if keeps(MetadataField::Overview) {
+                        lock.and_then(|l| l.row.overview.clone())
+                    } else {
+                        details.biography
+                    },
                     premiere_date: details.birthday.as_deref().and_then(parse_ymd),
                     end_date: details.deathday.as_deref().and_then(parse_ymd),
-                    birthplace: details.place_of_birth,
+                    birthplace: if keeps(MetadataField::ProductionLocations) {
+                        lock.and_then(|l| l.row.production_locations.clone())
+                    } else {
+                        details.place_of_birth
+                    },
                 };
                 if let Err(err) = repo.set_person_metadata(person.id, metadata).await {
                     tracing::warn!(%err, person = %id, "failed to persist person biography");
@@ -4994,6 +5229,7 @@ impl LibraryScanner {
             policy,
             embedded_images,
             remote,
+            dynamic_images,
             stored,
         } = art;
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
@@ -5041,7 +5277,7 @@ impl LibraryScanner {
         if matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
         }
-        if !images.iter().any(|i| i.image_type == ImageType::Primary) {
+        if dynamic_images && !images.iter().any(|i| i.image_type == ImageType::Primary) {
             if let Some(album) = art_cache.track_albums.get(&item_id).copied() {
                 if policy.image_enabled(short, fetcher_names::EMBEDDED_IMAGES) {
                     images.extend(
@@ -7188,6 +7424,24 @@ fn photo_exif_fields(
     ]
 }
 
+/// A credited person's stored row and `LockedFields`.
+struct PersonLock {
+    /// The stored `Person` row.
+    row: BaseItemEntity,
+    /// Its locked fields.
+    fields: Vec<MetadataField>,
+}
+
+/// The keys an album's AudioDb/fanart lookups go by.
+struct AlbumRemoteKeys<'a> {
+    /// The resolved MusicBrainz release-group id.
+    release_group_id: Option<&'a str>,
+    /// The album's first album artist.
+    album_artist: Option<&'a str>,
+    /// Album-artist name → MusicBrainz artist id, from the tracks' tags.
+    artist_mbid: &'a HashMap<String, String>,
+}
+
 /// One item's inputs to the artwork pass, grouped so
 /// [`LibraryScanner::collect_artwork`] keeps a readable signature.
 struct ArtworkPass<'a> {
@@ -7202,6 +7456,10 @@ struct ArtworkPass<'a> {
     embedded_images: Vec<ItemImageInfo>,
     /// This refresh runs the remote image providers (and the dynamic ones).
     remote: bool,
+    /// The dynamic image providers (the embedded-cover extraction) may run:
+    /// always, but for a locked item only on an image full refresh
+    /// (`CanRefreshImages`, `ProviderManager.cs:438-441`).
+    dynamic_images: bool,
     /// The item's stored image rows, when known.
     stored: Option<&'a [ItemImageInfo]>,
 }
@@ -7880,11 +8138,13 @@ impl ResolverGuesses {
 
 /// The per-item facts [`saved_row`] needs besides the rows.
 #[derive(Clone, Copy)]
-struct SaveFacts {
+struct SaveFacts<'a> {
     /// The item is locked: no provider ran and no merge happens.
     locked: bool,
     /// A probe ran, so its measurements are this file's.
     probe_ran: bool,
+    /// The item's locked fields, which the merge leaves as stored.
+    locked_fields: &'a [MetadataField],
 }
 
 /// The row a scanned item is saved as. A new item (or one whose stored row
@@ -7895,11 +8155,11 @@ fn saved_row(
     stored: Option<&BaseItemEntity>,
     guesses: &ResolverGuesses,
     scanned: &BaseItemEntity,
-    facts: SaveFacts,
+    facts: SaveFacts<'_>,
 ) -> BaseItemEntity {
     let mut row = match stored {
         Some(stored) => {
-            let mut row = merge_onto_stored(stored, scanned, facts.locked, facts.probe_ran);
+            let mut row = merge_onto_stored(stored, scanned, facts);
             keep_stored_audio_tags(&mut row, stored, guesses.folder_album.as_deref());
             row
         }
@@ -7991,16 +8251,21 @@ fn keep_stored_audio_tags(
 /// the embedded readers applied. It plays upstream's provider result (`temp`
 /// in `RefreshWithProviders`, `MetadataService.cs:790-915`), so the merge is
 /// upstream's two calls: stored values fill what no provider returned, then
-/// the result replaces the stored row. A locked row skips the merge entirely
-/// (`if (item.IsLocked) return refreshResult;`) and takes only the file
-/// facts.
+/// the result replaces the stored row, except for the fields in the item's
+/// `LockedFields`, which keep their stored values. A locked row skips the
+/// merge entirely (`if (item.IsLocked) return refreshResult;`) and takes
+/// only the file facts.
 fn merge_onto_stored(
     stored: &BaseItemEntity,
     scanned: &BaseItemEntity,
-    locked: bool,
-    probe_ran: bool,
+    facts: SaveFacts<'_>,
 ) -> BaseItemEntity {
     use ferrofin_providers::metadata_merge::{MetadataResult, merge_data};
+    let SaveFacts {
+        locked,
+        probe_ran,
+        locked_fields,
+    } = facts;
     let mut row = stored.clone();
     if !locked {
         let mut temp = MetadataResult::of(scanned.clone());
@@ -8014,9 +8279,10 @@ fn merge_onto_stored(
             false,
         );
         // `shouldReplace` for "Scan for new and updated files" (Default,
-        // no `ReplaceAllMetadata`). `LockedFields` arrive with Phase 3L.
+        // no `ReplaceAllMetadata`), with the item's `LockedFields`
+        // (`MetadataService.cs:909-917`).
         let mut target = MetadataResult::of(row);
-        merge_data(&temp, &mut target, &[], true, true);
+        merge_data(&temp, &mut target, locked_fields, true, true);
         row = target.item;
     }
     overlay_file_facts(&mut row, scanned, probe_ran);
@@ -8705,6 +8971,7 @@ fn tvdb_people(people: &[ferrofin_providers::TvdbPerson]) -> Vec<PeopleEntity> {
 fn apply_album_child_metadata(
     album: &BaseItemEntity,
     tracks: &[BaseItemEntity],
+    locked_fields: &[MetadataField],
 ) -> (BaseItemEntity, bool) {
     // Aggregate the tracks' metadata onto the album row.
     let mut updated = album.clone();
@@ -8725,24 +8992,28 @@ fn apply_album_child_metadata(
         updated.run_time_ticks = Some(ticks);
         changed = true;
     }
-    // The item-level lock stands in for C#'s per-field
-    // `LockedFields.Contains(MetadataField.Genres|Studios)`: Ferrofin
-    // does not model field-level locks anywhere (see the photo pass's
-    // `name_locked`), and the item lock is the stricter guard.
+    // `UpdateMetadataFromChildren` returns on `item.IsLocked`
+    // (`MetadataService.cs:457-460`); below it, `UpdateGenres` and
+    // `UpdateStudios` each skip a field in the album's `LockedFields`
+    // (`MetadataService.cs:585,606`).
     if !album.is_locked {
         // `MetadataService.UpdateGenres`: `children.SelectMany(i =>
         // i.Genres).Distinct(OrdinalIgnoreCase)` — an unconditional
         // assignment, so an album whose tracks lost their genre tags
         // loses the genres too.
-        changed |= assign_from_children(
-            &mut updated.genres,
-            &distinct_ignoring_case(tracks.iter().map(|t| t.genres.as_deref())),
-        );
+        if !locked_fields.contains(&MetadataField::Genres) {
+            changed |= assign_from_children(
+                &mut updated.genres,
+                &distinct_ignoring_case(tracks.iter().map(|t| t.genres.as_deref())),
+            );
+        }
         // `MetadataService.UpdateStudios`, same shape.
-        changed |= assign_from_children(
-            &mut updated.studios,
-            &distinct_ignoring_case(tracks.iter().map(|t| t.studios.as_deref())),
-        );
+        if !locked_fields.contains(&MetadataField::Studios) {
+            changed |= assign_from_children(
+                &mut updated.studios,
+                &distinct_ignoring_case(tracks.iter().map(|t| t.studios.as_deref())),
+            );
+        }
         // `AlbumMetadataService.SetArtistsFromSongs` — the tracks' performer
         // credits, most-frequent first. Without this the album row's `Artists`
         // column stays NULL and the DTO omits both `Artists` and `ArtistItems`.
@@ -8764,8 +9035,9 @@ fn apply_album_child_metadata(
     // carries one does it fall back to the minimum child production
     // year (and `Select(i => i.ProductionYear ?? 0).Min()` means one
     // undated track suppresses that fallback entirely). This overwrites
-    // — C# does not merely fill a null.
-    if !tracks.is_empty() {
+    // — C# does not merely fill a null. It sits below the `IsLocked`
+    // return of `UpdateMetadataFromChildren` (`MetadataService.cs:457-460`).
+    if !album.is_locked && !tracks.is_empty() {
         if let Some(date) = tracks.iter().filter_map(|t| t.premiere_date).min() {
             let year = i64::from(date.year());
             if updated.premiere_date != Some(date) || updated.production_year != Some(year) {
@@ -8788,8 +9060,12 @@ fn apply_album_child_metadata(
     // The album row's name starts as the folder stem, which is usually
     // release noise ("RHCP - Californication (1999) FLAC"). The tracks'
     // ALBUM tag is authoritative when they agree — upstream's album
-    // metadata comes from the tags, not the directory.
-    if let Some(tagged) = album_name_consensus(tracks)
+    // metadata comes from the tags, not the directory. Upstream renames
+    // only an unlocked album without a `Name` field lock
+    // (`AlbumMetadataService.cs:77-92`).
+    if !album.is_locked
+        && !locked_fields.contains(&MetadataField::Name)
+        && let Some(tagged) = album_name_consensus(tracks)
         && updated.name.as_deref() != Some(tagged.as_str())
     {
         updated.sort_name = Some(create_sort_name(&tagged));
@@ -10179,6 +10455,103 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Phase 3L: a person's biography fetch is a remote provider, so it
+    /// writes nothing onto a locked `Person`, and a field lock keeps the
+    /// stored overview or birthplace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_people_honours_person_locks() {
+        use super::Uuid;
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, WrittenPerson};
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"id": 1, "name": "P", "biography": "TMDB bio.", "place_of_birth": "Leeds"}"#;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let (locked, field_locked, open) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let person = |id: Uuid, is_locked: bool| BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+            name: Some("P".into()),
+            overview: Some("Mine".into()),
+            is_locked,
+            ..Default::default()
+        };
+        persistence
+            .save_items(&[
+                person(locked, true),
+                person(field_locked, false),
+                person(open, false),
+            ])
+            .await
+            .expect("seed");
+        persistence
+            .replace_locked_fields(field_locked, &[6])
+            .await
+            .expect("Overview lock");
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_metadata(
+                    Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base)),
+                    tmp.path().join("People"),
+                );
+        let written = |id| WrittenPerson {
+            id,
+            needs_details: true,
+            image_url: None,
+            provider_id: Some(1),
+        };
+        scanner
+            .enrich_people(
+                &FerrofinPeopleRepository::new(db.clone()),
+                vec![written(locked), written(field_locked), written(open)],
+            )
+            .await;
+        let row = |id| {
+            let items = Arc::clone(&items);
+            async move { items.retrieve_item(id).await.unwrap().unwrap() }
+        };
+        let l = row(locked).await;
+        assert_eq!(
+            (l.overview.as_deref(), l.production_locations),
+            (Some("Mine"), None)
+        );
+        let f = row(field_locked).await;
+        assert_eq!(f.overview.as_deref(), Some("Mine"), "Overview locked");
+        assert_eq!(f.production_locations.as_deref(), Some("Leeds"));
+        let o = row(open).await;
+        assert_eq!(o.overview.as_deref(), Some("TMDB bio."));
+    }
+
     /// A person's downloaded profile art must be persisted with its real pixel
     /// dimensions (and blurhash), not the `0x0` placeholder `download_images`
     /// returns.
@@ -10693,7 +11066,7 @@ mod tests {
             track("Artist 03", 20_000_000),
             track("Artist 03", 20_000_000),
         ];
-        let (updated, changed) = apply_album_child_metadata(&album, &tracks);
+        let (updated, changed) = apply_album_child_metadata(&album, &tracks, &[]);
         assert!(changed);
         assert_eq!(updated.artists.as_deref(), Some("Artist 03"));
         assert_eq!(updated.album_artists.as_deref(), Some("Artist 03"));
@@ -10702,7 +11075,7 @@ mod tests {
         // Zero-length tracks still assign 0 — Jellyfin emits `RunTimeTicks: 0`,
         // it never omits the field.
         let silent = [track("Artist 03", 0)];
-        let (updated, _) = apply_album_child_metadata(&album, &silent);
+        let (updated, _) = apply_album_child_metadata(&album, &silent, &[]);
         assert_eq!(updated.run_time_ticks, Some(0));
     }
 
@@ -10725,7 +11098,7 @@ mod tests {
             ..Default::default()
         };
         let tracks = [track("A|B"), track("b"), track("B")];
-        let (updated, _) = apply_album_child_metadata(&album, &tracks);
+        let (updated, _) = apply_album_child_metadata(&album, &tracks, &[]);
         assert_eq!(updated.artists.as_deref(), Some("B|A"));
     }
 
@@ -10750,10 +11123,276 @@ mod tests {
             run_time_ticks: Some(20_000_000),
             ..Default::default()
         }];
-        let (updated, changed) = apply_album_child_metadata(&album, &tracks);
+        let (updated, changed) = apply_album_child_metadata(&album, &tracks, &[]);
         assert!(changed);
         assert_eq!(updated.artists.as_deref(), Some("Hand Edited"));
         assert_eq!(updated.run_time_ticks, Some(20_000_000));
+    }
+
+    /// `AlbumMetadataService.UpdateMetadataFromChildren` (`:77-92`) and
+    /// `MetadataService.UpdateMetadataFromChildren` (`:457-460`): a locked
+    /// album keeps its name and premiere date, a `Name`-locked one its name;
+    /// both still get their runtime.
+    #[test]
+    fn a_locked_or_name_locked_album_keeps_its_name_and_a_locked_one_its_date() {
+        use super::{MetadataField, apply_album_child_metadata};
+        use chrono::TimeZone as _;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let at = |y| chrono::Utc.with_ymd_and_hms(y, 1, 1, 0, 0, 0).unwrap();
+        let album = |is_locked| BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            is_folder: true,
+            is_locked,
+            name: Some("My Album".to_owned()),
+            premiere_date: Some(at(2001)),
+            production_year: Some(2001),
+            ..Default::default()
+        };
+        let tracks = [BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            album: Some("Tagged Album".to_owned()),
+            premiere_date: Some(at(1999)),
+            run_time_ticks: Some(5),
+            ..Default::default()
+        }];
+        let (locked, _) = apply_album_child_metadata(&album(true), &tracks, &[]);
+        assert_eq!(locked.name.as_deref(), Some("My Album"));
+        assert_eq!(locked.premiere_date, Some(at(2001)));
+        assert_eq!(locked.run_time_ticks, Some(5));
+        let (name_locked, _) =
+            apply_album_child_metadata(&album(false), &tracks, &[MetadataField::Name]);
+        assert_eq!(name_locked.name.as_deref(), Some("My Album"));
+        assert_eq!(
+            name_locked.premiere_date,
+            Some(at(1999)),
+            "only Name is locked"
+        );
+        let (open, _) = apply_album_child_metadata(&album(false), &tracks, &[]);
+        assert_eq!(open.name.as_deref(), Some("Tagged Album"));
+    }
+
+    /// `UpdateGenres`/`UpdateStudios` (`MetadataService.cs:585,606`): an
+    /// unlocked album with a locked `Genres` field keeps its genres while
+    /// its studios still follow the tracks.
+    #[test]
+    fn an_album_field_lock_keeps_only_that_field() {
+        use super::{MetadataField, apply_album_child_metadata};
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+
+        let album = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.MusicAlbum".to_owned(),
+            is_folder: true,
+            genres: Some("Hand Picked".to_owned()),
+            studios: Some("Old Label".to_owned()),
+            ..Default::default()
+        };
+        let tracks = [BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Audio.Audio".to_owned(),
+            genres: Some("Rock".to_owned()),
+            studios: Some("New Label".to_owned()),
+            ..Default::default()
+        }];
+        let (updated, _) = apply_album_child_metadata(&album, &tracks, &[MetadataField::Genres]);
+        assert_eq!(updated.genres.as_deref(), Some("Hand Picked"));
+        assert_eq!(updated.studios.as_deref(), Some("New Label"));
+    }
+
+    /// A TheAudioDb stand-in answering every album and artist lookup with a
+    /// description, biography and genre; returns its base URL and a request
+    /// counter.
+    fn spawn_audiodb() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = if line.contains("/album-mb.php") {
+                    r#"{"album":[{"strAlbum":"AudioDb Album","strDescriptionEN":"Album text."}]}"#
+                } else {
+                    r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// The music post-pass under Phase 3L's lock rules, over one album with
+    /// one track and its artist: `(album, artist, audiodb requests, album
+    /// MusicBrainz id stored, artist MusicBrainz id stored)` after the pass.
+    // A fixture: seeding the album, track, artist and ids is the length.
+    #[allow(clippy::too_many_lines)]
+    async fn music_pass_with_locks(
+        album_locked: bool,
+        artist_locked: bool,
+        field_locks: &[super::MetadataField],
+    ) -> (BaseItemEntity, BaseItemEntity, usize, bool, bool) {
+        use super::{HashMap, InternalItemsQuery, Uuid};
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use chrono::TimeZone as _;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let (album_id, track_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let stored = |k| stored_type_name(k).unwrap().to_owned();
+        // Dated, so no MusicBrainz release/artist details are fetched.
+        let dated = Some(chrono::Utc.with_ymd_and_hms(1959, 8, 17, 0, 0, 0).unwrap());
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(album_id),
+                    type_: stored(BaseItemKind::MusicAlbum),
+                    name: Some("Kind of Blue".into()),
+                    premiere_date: dated,
+                    is_locked: album_locked,
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(track_id),
+                    type_: stored(BaseItemKind::Audio),
+                    name: Some("So What".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
+                    album_artists: Some("Miles Davis".into()),
+                    premiere_date: dated,
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("seed");
+        persistence
+            .set_ancestors(track_id, &[album_id])
+            .await
+            .expect("ancestors");
+        for (k, v) in [
+            ("MusicBrainzAlbum", "rel-x"),
+            ("MusicBrainzReleaseGroup", "rg-x"),
+            ("MusicBrainzAlbumArtist", "aa-x"),
+        ] {
+            persistence.save_provider_id(track_id, k, v).await.unwrap();
+        }
+        persistence
+            .save_item_values(track_id, &[(1, "Miles Davis".into())])
+            .await
+            .expect("materialize artist");
+        let artist = items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::MusicArtist],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+            .expect("artists")
+            .into_iter()
+            .next()
+            .expect("the artist");
+        let artist_id = Uuid::parse_str(&artist.id).expect("id");
+        persistence
+            .save_items(&[BaseItemEntity {
+                is_locked: artist_locked,
+                premiere_date: dated,
+                end_date: dated,
+                ..artist
+            }])
+            .await
+            .expect("artist");
+        for id in [album_id, artist_id] {
+            persistence
+                .replace_locked_fields(
+                    id,
+                    &field_locks
+                        .iter()
+                        .map(|f| ferrofin_db::enums::metadata_field::to_i32(*f))
+                        .collect::<Vec<_>>(),
+                )
+                .await
+                .expect("locks");
+        }
+
+        let (base, hits) = spawn_audiodb();
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
+                Arc::clone(&items),
+            )
+            .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::with_base_url(
+                &base,
+            )));
+        scanner.enrich_music(&HashMap::new()).await.expect("enrich");
+        let has_id = |key: &'static str, id: Uuid| {
+            let items = Arc::clone(&items);
+            async move {
+                items
+                    .get_items_with_provider_id(key)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|(i, _)| *i == id)
+            }
+        };
+        (
+            items.retrieve_item(album_id).await.unwrap().unwrap(),
+            items.retrieve_item(artist_id).await.unwrap().unwrap(),
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            has_id("MusicBrainzAlbum", album_id).await,
+            has_id("MusicBrainzArtist", artist_id).await,
+        )
+    }
+
+    /// Phase 3L, music post-pass: a locked album or artist runs no remote
+    /// source (MusicBrainz ids, AudioDb, fanart); an unlocked one with
+    /// `Overview`/`Genres` field locks gets the remote ids but not those
+    /// fields; with no lock at all AudioDb fills them.
+    #[tokio::test]
+    async fn the_music_pass_honours_item_and_field_locks() {
+        let (album, artist, hits, album_mb, artist_mb) =
+            music_pass_with_locks(true, true, &[]).await;
+        assert_eq!(hits, 0, "no AudioDb request for locked items");
+        assert!(!album_mb && !artist_mb, "no MusicBrainz id written");
+        assert_eq!(album.overview, None);
+        assert_eq!(artist.overview, None);
+
+        let (album, artist, hits, album_mb, artist_mb) = music_pass_with_locks(
+            false,
+            false,
+            &[super::MetadataField::Overview, super::MetadataField::Genres],
+        )
+        .await;
+        assert!(hits > 0);
+        assert!(album_mb && artist_mb);
+        assert_eq!(album.overview, None, "Overview locked");
+        assert_eq!(artist.overview, None, "Overview locked");
+        assert_eq!(artist.genres, None, "Genres locked");
+
+        let (album, artist, ..) = music_pass_with_locks(false, false, &[]).await;
+        assert_eq!(album.overview.as_deref(), Some("Album text."));
+        assert_eq!(artist.overview.as_deref(), Some("Artist bio."));
+        assert_eq!(artist.genres.as_deref(), Some("Jazz"));
     }
 
     #[tokio::test]
@@ -11757,6 +12396,18 @@ mod tests {
         locked: bool,
         probe_ran: bool,
     ) -> BaseItemEntity {
+        save_with_locks(stored, planned, pipeline, locked, &[], probe_ran)
+    }
+
+    /// [`save_as`] for an item whose `LockedFields` are `locked_fields`.
+    fn save_with_locks(
+        stored: Option<&BaseItemEntity>,
+        planned: &BaseItemEntity,
+        pipeline: impl FnOnce(&mut BaseItemEntity, &super::ResolverGuesses),
+        locked: bool,
+        locked_fields: &[super::MetadataField],
+        probe_ran: bool,
+    ) -> BaseItemEntity {
         let mut scanned = planned.clone();
         let guesses = super::ResolverGuesses::take(&mut scanned, stored);
         pipeline(&mut scanned, &guesses);
@@ -11764,7 +12415,11 @@ mod tests {
             stored,
             &guesses,
             &scanned,
-            super::SaveFacts { locked, probe_ran },
+            super::SaveFacts {
+                locked,
+                probe_ran,
+                locked_fields,
+            },
         )
     }
 
@@ -11881,6 +12536,57 @@ mod tests {
         assert_eq!(saved.sort_name.as_deref(), Some("heat"));
         assert_eq!(saved.production_year, Some(1995));
         assert_eq!(saved.date_created, Some(at(2026)));
+    }
+
+    /// Phase 3L: a rescan whose providers run (Default mode's
+    /// replace-with-fallback merge) replaces the unlocked fields and leaves
+    /// the locked ones as stored (`MergeData(temp, metadata,
+    /// item.LockedFields, shouldReplace, true)`).
+    #[test]
+    fn a_provider_pass_keeps_the_locked_fields_and_replaces_the_rest() {
+        let planned = planned_movie();
+        let stored = BaseItemEntity {
+            name: Some("My Heat".into()),
+            overview: Some("My own overview".into()),
+            genres: Some("Drama".into()),
+            tagline: Some("Stored tagline".into()),
+            ..planned.clone()
+        };
+        let provider = |e: &mut BaseItemEntity, _: &super::ResolverGuesses| {
+            e.name = Some("Heat".into());
+            e.overview = Some("A group of professional bank robbers…".into());
+            e.genres = Some("Action|Crime".into());
+            e.tagline = Some("A Los Angeles crime saga".into());
+        };
+        let locks = [super::MetadataField::Overview, super::MetadataField::Genres];
+        let saved = save_with_locks(Some(&stored), &planned, provider, false, &locks, false);
+        assert_eq!(saved.overview.as_deref(), Some("My own overview"));
+        assert_eq!(saved.genres.as_deref(), Some("Drama"));
+        assert_eq!(saved.name.as_deref(), Some("Heat"), "unlocked: replaced");
+        assert_eq!(saved.tagline.as_deref(), Some("A Los Angeles crime saga"));
+
+        // No providers ran (an unchanged item, or one whose only change was
+        // its file): the edit survives without any lock.
+        let saved = save_as(Some(&stored), &planned, |_, _| {}, false, false);
+        assert_eq!(saved.overview.as_deref(), Some("My own overview"));
+        assert_eq!(saved.name.as_deref(), Some("My Heat"));
+
+        // Unknown links lock everything: a read failure never overwrites.
+        let saved = save_with_locks(
+            Some(&stored),
+            &planned,
+            provider,
+            false,
+            super::ALL_LOCKABLE_FIELDS,
+            false,
+        );
+        assert_eq!(saved.name.as_deref(), Some("My Heat"));
+        assert_eq!(saved.overview.as_deref(), Some("My own overview"));
+        assert_eq!(
+            saved.tagline.as_deref(),
+            Some("A Los Angeles crime saga"),
+            "Tagline is not a lockable field"
+        );
     }
 
     /// Review regression (a): a provider value that happens to equal the
@@ -12261,6 +12967,7 @@ mod tests {
             super::SaveFacts {
                 locked: false,
                 probe_ran: false,
+                locked_fields: &[],
             },
         );
         // The season response's episode 1 (the path's episode 3 is not in it).
@@ -12598,6 +13305,7 @@ mod tests {
             super::SaveFacts {
                 locked: false,
                 probe_ran: false,
+                locked_fields: &[],
             },
         )
     }

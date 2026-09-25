@@ -8,6 +8,28 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — editing an item no longer locks it
+
+Earlier versions locked an item (`LockData`) whenever a metadata-editor save changed one of
+its fields, whether or not "Lock this item" was ticked. This version saves exactly what the
+editor sends, and protects individual fields through the editor's per-field checkboxes
+(`LockedFields`) instead, as Jellyfin does.
+
+Items locked by an earlier version are not changed by the upgrade: there is no way to
+tell an automatic lock from one you set on purpose. For those items:
+
+- they stay locked, so no remote metadata provider (TMDB, TVDB, MusicBrainz, …) updates
+  them;
+- they do not read their `.nfo` while locked, which is how Jellyfin treats a locked
+  item;
+- their sidecar artwork next to the media (`poster.jpg`, `fanart.jpg`, …) is rediscovered
+  on the next scan, as it would be for any locked item in Jellyfin;
+- the metadata editor shows "Lock this item" ticked. Untick it and save to unlock the
+  item; on a series, season, album, collection or other folder, that unlocks everything
+  under it too.
+
+To find them, list `GET /Items?Recursive=true&IsLocked=true`.
+
 ## Unreleased — the schema moves to Jellyfin 12.0
 
 Back up the data directory before starting this version. On first boot migration `0032`

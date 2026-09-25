@@ -649,8 +649,7 @@ fn merge_people_matches_names_loosely_and_drops_invalid_ids() {
     assert_eq!(result.expect("people")[0].provider_id, Some(37_917));
 }
 
-/// `MergeBaseItemData_MergeMetadataSettings_MergesWhenSet` (upstream's
-/// `LockedFields` half waits for Phase 3L's column).
+/// `MergeBaseItemData_MergeMetadataSettings_MergesWhenSet`.
 #[rstest]
 #[case(false, false)]
 #[case(true, false)]
@@ -675,16 +674,20 @@ fn merge_metadata_settings_merges_when_set(
         date_created: Some(old_date),
         ..item(BaseItemKind::Movie)
     };
-    let mut target = MetadataResult::of(target);
-    merge_data(
-        &MetadataResult::of(source),
-        &mut target,
-        &[],
-        true,
-        merge_metadata_settings,
-    );
+    let new_locked = vec![MetadataField::Genres, MetadataField::Cast];
+    let old_locked = vec![MetadataField::Genres];
+    let source = MetadataResult {
+        locked_fields: new_locked.clone(),
+        ..MetadataResult::of(source)
+    };
+    let mut target = MetadataResult {
+        locked_fields: old_locked.clone(),
+        ..MetadataResult::of(target)
+    };
+    merge_data(&source, &mut target, &[], true, merge_metadata_settings);
     let t = &target.item;
     if merge_metadata_settings {
+        assert_eq!(target.locked_fields, new_locked);
         assert!(t.is_locked);
         assert_eq!(t.preferred_metadata_country_code.as_deref(), Some("new"));
         assert_eq!(t.preferred_metadata_language.as_deref(), Some("new"));
@@ -693,6 +696,7 @@ fn merge_metadata_settings_merges_when_set(
             Some(if default_date { old_date } else { new_date })
         );
     } else {
+        assert_eq!(target.locked_fields, old_locked);
         assert!(!t.is_locked);
         assert_eq!(t.preferred_metadata_country_code.as_deref(), Some("old"));
         assert_eq!(t.preferred_metadata_language.as_deref(), Some("old"));
@@ -768,6 +772,7 @@ fn fully_populated(tag: &str, kind: BaseItemKind) -> MetadataResult {
         },
         people: Some(vec![person(&format!("{tag} person"))]),
         provider_ids: Vec::new(),
+        locked_fields: Vec::new(),
     }
 }
 
@@ -975,4 +980,106 @@ fn kind_specific_rules() {
     });
     merge_data(&source, &mut book, &[], true, false);
     assert_eq!(book.item.series_name.as_deref(), Some("Discworld"));
+}
+
+/// The dashboard's three refresh choices, as `RefreshWithProviders`
+/// (`MetadataService.cs:895-918`) makes its two `MergeData` calls for each:
+/// the stored values first fill the provider result (skipped under
+/// `RemoveOldMetadata`), then the result merges onto the item under the
+/// item's `LockedFields`, replacing unless the mode is a fill-missing
+/// `FullRefresh`.
+#[derive(Clone, Copy, Debug)]
+enum RefreshChoice {
+    /// "Scan for new and updated files" when the providers run (a first or
+    /// required refresh): `Default`, `shouldReplace = true`.
+    Default,
+    /// "Search for missing metadata": `FullRefresh`, no `ReplaceAllMetadata`.
+    SearchMissing,
+    /// "Replace all metadata": `FullRefresh` + `ReplaceAllMetadata` +
+    /// `RemoveOldMetadata`.
+    ReplaceAll,
+}
+
+/// `stored` after a refresh whose providers answered `provider`.
+fn refresh(
+    stored: &BaseItemEntity,
+    provider: &BaseItemEntity,
+    choice: RefreshChoice,
+    locked: &[MetadataField],
+) -> BaseItemEntity {
+    let mut temp = MetadataResult::of(provider.clone());
+    let current = MetadataResult::of(stored.clone());
+    if !matches!(choice, RefreshChoice::ReplaceAll) {
+        merge_data(&current, &mut temp, &[], false, false);
+    }
+    let replace = !matches!(choice, RefreshChoice::SearchMissing);
+    let mut target = current;
+    merge_data(&temp, &mut target, locked, replace, true);
+    target.item
+}
+
+/// Phase 3L: a user's edit made without `LockData` against a provider that
+/// says otherwise, in each refresh mode, with and without a lock on the
+/// edited field. Only a lock protects it from a replacing merge; the
+/// fill-missing "Search for missing metadata" keeps it either way.
+#[rstest]
+#[case::default_unlocked(RefreshChoice::Default, false, "Provider overview")]
+#[case::default_locked(RefreshChoice::Default, true, "My overview")]
+#[case::search_missing_unlocked(RefreshChoice::SearchMissing, false, "My overview")]
+#[case::search_missing_locked(RefreshChoice::SearchMissing, true, "My overview")]
+#[case::replace_all_unlocked(RefreshChoice::ReplaceAll, false, "Provider overview")]
+#[case::replace_all_locked(RefreshChoice::ReplaceAll, true, "My overview")]
+fn an_edited_overview_follows_the_mode_unless_locked(
+    #[case] choice: RefreshChoice,
+    #[case] lock_overview: bool,
+    #[case] overview: &str,
+) {
+    let stored = BaseItemEntity {
+        name: Some("Stored name".into()),
+        overview: Some("My overview".into()),
+        tagline: None,
+        ..item(BaseItemKind::Movie)
+    };
+    let provider = BaseItemEntity {
+        name: Some("Provider name".into()),
+        overview: Some("Provider overview".into()),
+        tagline: Some("Provider tagline".into()),
+        ..item(BaseItemKind::Movie)
+    };
+    let locks: Vec<MetadataField> = if lock_overview {
+        vec![MetadataField::Overview]
+    } else {
+        Vec::new()
+    };
+    let saved = refresh(&stored, &provider, choice, &locks);
+    assert_eq!(saved.overview.as_deref(), Some(overview), "{choice:?}");
+    // The unlocked fields on the same item follow the mode regardless.
+    let name = match choice {
+        RefreshChoice::SearchMissing => "Stored name",
+        RefreshChoice::Default | RefreshChoice::ReplaceAll => "Provider name",
+    };
+    assert_eq!(saved.name.as_deref(), Some(name), "{choice:?}");
+    assert_eq!(saved.tagline.as_deref(), Some("Provider tagline"));
+}
+
+/// "Replace all metadata" clears what the providers did not return — but
+/// never a locked field.
+#[test]
+fn replace_all_clears_unlocked_fields_the_providers_left_empty_but_not_locked_ones() {
+    let stored = BaseItemEntity {
+        overview: Some("My overview".into()),
+        tagline: Some("My tagline".into()),
+        genres: Some("Drama".into()),
+        ..item(BaseItemKind::Movie)
+    };
+    let provider = item(BaseItemKind::Movie);
+    let saved = refresh(
+        &stored,
+        &provider,
+        RefreshChoice::ReplaceAll,
+        &[MetadataField::Overview, MetadataField::Genres],
+    );
+    assert_eq!(saved.overview.as_deref(), Some("My overview"));
+    assert_eq!(saved.genres.as_deref(), Some("Drama"));
+    assert_eq!(saved.tagline, None, "unlocked and not returned: cleared");
 }

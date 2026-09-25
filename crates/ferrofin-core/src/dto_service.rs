@@ -116,6 +116,9 @@ struct Prefetched {
     /// which is `series.Studios.FirstOrDefault()` and therefore lives on a row
     /// the projected item is not.
     series_studios: HashMap<Uuid, String>,
+    /// Locked metadata fields per item id (populated only when the
+    /// `Settings` field is requested — the gate `LockedFields` rides on).
+    locked_fields: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>,
     /// Credited people per item id (populated only when the `People` field is
     /// requested), so a page's cast/crew loads in one query.
     people: HashMap<Uuid, Vec<ferrofin_db::entities::base_items::PeopleEntity>>,
@@ -2381,7 +2384,15 @@ impl FerrofinDtoService {
             dto.forced_sort_name = item.forced_sort_name.clone();
             dto.preferred_metadata_country_code = item.preferred_metadata_country_code.clone();
             dto.preferred_metadata_language = item.preferred_metadata_language.clone();
-            dto.locked_fields = Some(Vec::new()); // Jellyfin emits item.LockedFields ([] here)
+            // `dto.LockedFields = item.LockedFields` (`DtoService.cs:1120`):
+            // the stored set, `[]` when the item has none.
+            dto.locked_fields = Some(
+                prefetched
+                    .locked_fields
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
 
         dto.end_date = item.end_date;
@@ -3530,7 +3541,15 @@ impl FerrofinDtoService {
                 Ok(HashMap::new())
             }
         };
-        let (user_data, people) = tokio::try_join!(user_data_fut, people_fut)?;
+        let locked_fields_fut = async {
+            if options.contains_field(ItemFields::Settings) {
+                self.library.get_locked_fields_batch(&ids).await
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let (user_data, people, locked_fields) =
+            tokio::try_join!(user_data_fut, people_fut, locked_fields_fut)?;
         // The page ids that can actually own media sources. A folder or a
         // by-name item (person, genre, studio, …) owns no stream, chapter,
         // trickplay or alternate-version row, so asking for them is four
@@ -4019,6 +4038,7 @@ impl FerrofinDtoService {
             photo_album_names,
             series_provider_ids,
             series_studios,
+            locked_fields,
             people,
             person_images,
             value_ids,

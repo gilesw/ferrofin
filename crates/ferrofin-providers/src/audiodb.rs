@@ -134,9 +134,9 @@ impl AudioDbClient {
         self.plugin.attach(plugins);
     }
 
-    /// Points the client at `base_url` (a mock server) for tests.
-    #[cfg(test)]
-    pub(crate) fn with_base_url(base_url: &str) -> Self {
+    /// Points the client at `base_url` (a mock server in tests).
+    #[must_use]
+    pub fn with_base_url(base_url: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
             limiter: RateLimiter::new("audiodb"),

@@ -32,7 +32,7 @@ use ferrofin_db::entities::base_items::{
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -712,11 +712,13 @@ pub trait ItemPersistenceService: Send + Sync {
 
     /// What the library scan's change detection compares a rescan of each of
     /// `item_ids` against, besides its `BaseItems` row: its image rows, its
-    /// ancestor closure and the external subtitle/audio files its stored
-    /// streams came from. Read one window of the plan at a time.
+    /// ancestor closure, the external subtitle/audio files its stored
+    /// streams came from, and its locked metadata fields (which the scan's
+    /// merge must honour). Read one window of the plan at a time.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
-    /// stub/fake services); the scan then treats every item as changed. An
+    /// stub/fake services); the scan then treats every item as changed and
+    /// every lockable field as locked. An
     /// item with no rows of a kind simply has an empty list.
     ///
     /// # Errors
@@ -728,6 +730,80 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<Option<HashMap<Uuid, StoredItemLinks>>, ServiceError> {
         let _ = item_ids;
         Ok(None)
+    }
+
+    /// Writes only the file facts of a scanned item whose stored row could
+    /// not be read — its `Path`, `ParentId`, `TopParentId` and, when the
+    /// stat has them, `DateModified` and `Size` — and only when one of them
+    /// differs from what is stored (stamping `DateLastSaved` then). Every
+    /// other column keeps its stored value. Returns whether the row was
+    /// written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_file_facts(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let _ = item;
+        Ok(false)
+    }
+
+    /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
+    /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
+    /// item with none is absent from the map.
+    ///
+    /// The default knows of no locks (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn locked_fields_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        let _ = item_ids;
+        Ok(HashMap::new())
+    }
+
+    /// Replaces an item's whole locked-field set with `field_ids` — the
+    /// `BaseItemMetadataFields` half of upstream's item save, which deletes
+    /// the item's rows and inserts the current `LockedFields`
+    /// (`ItemPersistenceService.SaveItems`). The ids are `MetadataField`
+    /// values as stored; like upstream's enum, a value this server does not
+    /// name is kept (the read skips it). Duplicates are written once.
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn replace_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
+        Ok(())
+    }
+
+    /// Adds `field_ids` to an item's locked-field set without removing any it
+    /// already has — upstream's `LockedFields.Concat(…).Distinct()` union for
+    /// an NFO's `<lockedfields>`, which keeps stored ids this server does not
+    /// name (a plain replace would drop them).
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
+        Ok(())
     }
 
     /// Sets a single image (`image`) on an item, replacing any existing rows of
@@ -1159,6 +1235,9 @@ pub struct StoredItemLinks {
     pub external_subtitles: Vec<String>,
     /// The paths of its external audio streams, upstream's `Video.AudioFiles`.
     pub external_audio: Vec<String>,
+    /// Its locked metadata fields (`BaseItemMetadataFields`), which the scan's
+    /// merge never overwrites.
+    pub locked_fields: Vec<MetadataField>,
 }
 
 /// What a previous scan already recorded about one image file: the probed

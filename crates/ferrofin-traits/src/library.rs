@@ -33,7 +33,7 @@ use ferrofin_model::dto::{
     UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::CollectionTypeOptions;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::media_info::LiveStreamRequest;
@@ -354,6 +354,44 @@ pub trait LibraryManager: Send + Sync {
         provider_ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
         let _ = (item_id, provider_ids);
+        Ok(())
+    }
+
+    /// The locked metadata fields (upstream's `BaseItem.LockedFields`) of
+    /// each of `item_ids`; an item with none is absent.
+    ///
+    /// The default knows of no locks, so the API-layer test doubles keep
+    /// compiling; the real manager reads `BaseItemMetadataFields`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the fields cannot be read.
+    async fn get_locked_fields_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        let _ = item_ids;
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Replaces an item's locked-field set — the write behind
+    /// `ItemUpdateController.UpdateItem`'s `item.LockedFields =
+    /// request.LockedFields`. `field_ids` are `MetadataField` values as the
+    /// client sent them, an unknown one included (upstream stores it too). Like the external ids, the set lives in its
+    /// own table, so it cannot ride along with
+    /// [`update_items`](Self::update_items).
+    ///
+    /// The default is a no-op (for test doubles).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the set cannot be persisted.
+    async fn update_item_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, field_ids);
         Ok(())
     }
 

@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::ImageType;
+use ferrofin_model::entities::{ImageType, MetadataField};
 use ferrofin_model::net::mime_types;
 use ferrofin_model::providers::{
     ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteSearchResult,
@@ -1517,9 +1517,28 @@ impl LocalProviderManager {
         }
     }
 
+    /// The item's locked metadata fields. Without a store nothing is
+    /// persisted, so nothing is locked; a failed read locks every field
+    /// rather than let a refresh overwrite one the user locked.
+    async fn stored_locked_fields(&self, item_id: Uuid) -> Vec<MetadataField> {
+        let Some(store) = &self.image_store else {
+            return Vec::new();
+        };
+        match store.locked_fields_for_items(&[item_id]).await {
+            Ok(mut map) => map.remove(&item_id).unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(%item_id, %err, "could not read the item's locked fields");
+                crate::metadata_merge::ALL_LOCKABLE_FIELDS.to_vec()
+            }
+        }
+    }
+
     /// The box-set refresh arm — port of `TmdbBoxSetProvider` +
     /// `TmdbBoxSetImageProvider`: search TMDB's collections by the box set's
     /// name, take the top hit, and apply its name/overview and artwork.
+    // The refresh context (client, row, ids, options, the item's field
+    // locks) is each one seam; a params struct would only rename it.
+    #[allow(clippy::too_many_arguments)]
     async fn refresh_box_set(
         &self,
         tmdb: &Arc<TmdbClient>,
@@ -1528,6 +1547,7 @@ impl LocalProviderManager {
         name: &str,
         collection_id: Option<i64>,
         options: &MetadataRefreshOptions,
+        locks: &FieldLocks,
     ) -> Result<bool, ServiceError> {
         // A `Tmdb` id already on the box set (or on the chosen Identify
         // result) pins the collection; else the name search's top hit.
@@ -1549,7 +1569,7 @@ impl LocalProviderManager {
                 collection.overview.as_deref(),
                 options.replace_all_metadata,
             );
-            self.persist_refreshed(entity).await?;
+            self.persist_refreshed(entity, locks).await?;
             if let Some(store) = &self.image_store {
                 store
                     .save_provider_id(item_id, "Tmdb", &collection_id.to_string())
@@ -1588,10 +1608,11 @@ impl LocalProviderManager {
         overview: Option<&str>,
         image_url: Option<&str>,
         options: &MetadataRefreshOptions,
+        locks: &FieldLocks,
     ) -> Result<bool, ServiceError> {
         if wants_fetch(options.metadata_refresh_mode) {
             apply_name_overview(entity, name, overview, options.replace_all_metadata);
-            self.persist_refreshed(entity).await?;
+            self.persist_refreshed(entity, locks).await?;
         }
         if wants_fetch(options.image_refresh_mode)
             && self.image_store.is_some()
@@ -1608,7 +1629,14 @@ impl LocalProviderManager {
     /// Persists a refreshed row through the item store, stamping
     /// `DateLastRefreshed` (C# `MetadataService.RefreshMetadata` sets it on
     /// every refresh, and the "refresh people" task keys off it).
-    async fn persist_refreshed(&self, entity: &mut BaseItemEntity) -> Result<(), ServiceError> {
+    async fn persist_refreshed(
+        &self,
+        entity: &mut BaseItemEntity,
+        locks: &FieldLocks,
+    ) -> Result<(), ServiceError> {
+        // The item's locked fields keep their stored values, whatever the
+        // applier wrote (`MergeData(temp, metadata, item.LockedFields, …)`).
+        crate::metadata_merge::keep_locked_fields(&locks.stored, entity, &locks.fields);
         if let Some(store) = &self.image_store {
             entity.date_last_refreshed = Some(Utc::now());
             store.save_items(std::slice::from_ref(entity)).await?;
@@ -1641,6 +1669,7 @@ impl LocalProviderManager {
         item_id: Uuid,
         target: RefreshTarget,
         options: &MetadataRefreshOptions,
+        locks: &FieldLocks,
     ) -> Result<bool, ServiceError> {
         let (series_id, series_name, series_year, season_number, episode_number) = match target {
             RefreshTarget::Season {
@@ -1696,6 +1725,7 @@ impl LocalProviderManager {
             overview.as_deref(),
             image_url.as_deref(),
             options,
+            locks,
         )
         .await
     }
@@ -1704,6 +1734,9 @@ impl LocalProviderManager {
     /// `TmdbSeriesProvider` + their image providers against a resolved TMDB
     /// id: apply the fetched details (and stamp the Tmdb/Imdb ids), then
     /// download the primary + backdrop. Returns whether an image was saved.
+    // The refresh context (client, row, ids, options, the item's field
+    // locks) is each one seam; a params struct would only rename it.
+    #[allow(clippy::too_many_arguments)]
     async fn refresh_title(
         &self,
         tmdb: &Arc<TmdbClient>,
@@ -1712,6 +1745,7 @@ impl LocalProviderManager {
         kind: TmdbKind,
         tmdb_id: i64,
         options: &MetadataRefreshOptions,
+        locks: &FieldLocks,
     ) -> Result<bool, ServiceError> {
         let Some(details) = tmdb.details(kind, tmdb_id, None).await else {
             return Ok(false);
@@ -1721,7 +1755,7 @@ impl LocalProviderManager {
         // scanner writes enriched rows with).
         if wants_fetch(options.metadata_refresh_mode) {
             apply_tmdb_details(entity, &details, options.replace_all_metadata);
-            self.persist_refreshed(entity).await?;
+            self.persist_refreshed(entity, locks).await?;
             // The fetch's own ids (TMDB + its IMDb id) join the set, as the C#
             // `SetProviderId` calls in the provider do.
             if let Some(store) = &self.image_store {
@@ -1759,6 +1793,9 @@ impl LocalProviderManager {
     /// `TmdbPersonImageProvider`: resolve the person's TMDB id (stored id,
     /// else the first name-search hit), apply biography/birth/death/birthplace,
     /// and download the profile image. Returns whether the image was saved.
+    // The refresh context (client, row, ids, options, the item's field
+    // locks) is each one seam; a params struct would only rename it.
+    #[allow(clippy::too_many_arguments)]
     async fn refresh_person(
         &self,
         tmdb: &Arc<TmdbClient>,
@@ -1767,6 +1804,7 @@ impl LocalProviderManager {
         name: &str,
         tmdb_id: Option<i64>,
         options: &MetadataRefreshOptions,
+        locks: &FieldLocks,
     ) -> Result<bool, ServiceError> {
         let tmdb_id = if let Some(id) = tmdb_id {
             id
@@ -1796,7 +1834,7 @@ impl LocalProviderManager {
                     entity.end_date = Some(date);
                 }
             }
-            self.persist_refreshed(entity).await?;
+            self.persist_refreshed(entity, locks).await?;
             if let Some(store) = &self.image_store {
                 store
                     .save_provider_id(item_id, "Tmdb", &tmdb_id.to_string())
@@ -1823,6 +1861,9 @@ impl LocalProviderManager {
     /// the item's provider record (its stored/chosen ids first, then a title
     /// search), applies the fetched metadata and downloads its artwork per the
     /// refresh modes, and reports what changed.
+    // One gate-then-dispatch sequence, read top to bottom; the field-lock
+    // snapshot tipped it over the line count.
+    #[allow(clippy::too_many_lines)]
     async fn refresh_item(
         &self,
         item_id: Uuid,
@@ -1857,6 +1898,11 @@ impl LocalProviderManager {
         let Some(mut entity) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
+        // The item's `LockedFields`: every write below keeps them as stored.
+        let locks = FieldLocks {
+            fields: self.stored_locked_fields(item_id).await,
+            stored: entity.clone(),
+        };
         // ── The one gate (C# `ProviderManager.CanRefreshMetadata` /
         // `CanRefreshImages`, v10.11.8 `MediaBrowser.Providers/Manager/
         // ProviderManager.cs`) ───────────────────────────────────────────────
@@ -1878,7 +1924,7 @@ impl LocalProviderManager {
             options.remove_old_metadata && options.replace_all_metadata && !entity.is_locked;
         if cleared {
             clear_provider_supplied_metadata(&mut entity);
-            self.persist_refreshed(&mut entity).await?;
+            self.persist_refreshed(&mut entity, &locks).await?;
         }
         let options = &self.gated_options(&entity, options).await;
         if !wants_fetch(options.metadata_refresh_mode) && !wants_fetch(options.image_refresh_mode) {
@@ -1925,21 +1971,37 @@ impl LocalProviderManager {
                     };
                     hit.tmdb_id
                 };
-                self.refresh_title(tmdb, &mut entity, item_id, kind, tmdb_id, options)
+                self.refresh_title(tmdb, &mut entity, item_id, kind, tmdb_id, options, &locks)
                     .await?
             }
             RefreshTarget::BoxSet { name } => {
                 let name = chosen_name.unwrap_or(&name);
-                self.refresh_box_set(tmdb, &mut entity, item_id, name, stored_tmdb_id, options)
-                    .await?
+                self.refresh_box_set(
+                    tmdb,
+                    &mut entity,
+                    item_id,
+                    name,
+                    stored_tmdb_id,
+                    options,
+                    &locks,
+                )
+                .await?
             }
             RefreshTarget::Person { name } => {
                 let name = chosen_name.unwrap_or(&name);
-                self.refresh_person(tmdb, &mut entity, item_id, name, stored_tmdb_id, options)
-                    .await?
+                self.refresh_person(
+                    tmdb,
+                    &mut entity,
+                    item_id,
+                    name,
+                    stored_tmdb_id,
+                    options,
+                    &locks,
+                )
+                .await?
             }
             tv @ (RefreshTarget::Season { .. } | RefreshTarget::Episode { .. }) => {
-                self.refresh_tv(tmdb, &mut entity, item_id, tv, options)
+                self.refresh_tv(tmdb, &mut entity, item_id, tv, options, &locks)
                     .await?
             }
         };
@@ -2635,6 +2697,17 @@ fn refresh_target_of(
     }
 }
 
+/// An item's `LockedFields` and the row they were read with: what every
+/// write of a single-item refresh puts back before it saves (see
+/// [`crate::metadata_merge::keep_locked_fields`]).
+#[derive(Debug, Default)]
+struct FieldLocks {
+    /// The item's row before the refresh touched it.
+    stored: BaseItemEntity,
+    /// Its locked fields.
+    fields: Vec<MetadataField>,
+}
+
 /// Fills or replaces an item row's name + overview (the season/episode TMDB
 /// fields), with the same fill-or-replace semantics as [`apply_tmdb_details`].
 fn apply_name_overview(
@@ -2819,13 +2892,10 @@ fn set_series_status(
 ///   upstream leaves the stored cast in place. Measured on the lab pair: after
 ///   an Apply, Jellyfin's movie kept its People array.
 ///
-/// NOT honoured, because Ferrofin has no storage for it: the C# skips
-/// `Name`/`Genres`/`Overview`/`OfficialRating`/`Studios`/`Tags`/
-/// `ProductionLocations`/`Cast`/`Runtime` whose `MetadataField` is in
-/// `item.LockedFields`. Ferrofin has no `LockedFields` column — `dto_service`
-/// serves a constant `[]` — so there is nothing to consult and the behaviour is
-/// identical on this server. Wiring LockedFields through must add the guard
-/// here in the same change.
+/// The C# skips `Name`/`Genres`/`Overview`/`OfficialRating`/`Studios`/
+/// `Tags`/`ProductionLocations`/`Cast`/`Runtime` whose `MetadataField` is in
+/// `item.LockedFields`; here the caller's `persist_refreshed` puts those
+/// back from the stored row before the save (`FieldLocks`).
 fn clear_provider_supplied_metadata(entity: &mut BaseItemEntity) {
     entity.original_title = None;
     entity.original_language = None;
@@ -3418,6 +3488,7 @@ mod tests {
         set_text, wants_fetch,
     };
     use crate::tmdb::TmdbDetails;
+    use ferrofin_model::entities::MetadataField;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
 
     use async_trait::async_trait;
@@ -5567,6 +5638,8 @@ mod tests {
         upserted: std::sync::Mutex<Vec<(Uuid, String, String)>>,
         saved: std::sync::Mutex<Vec<BaseItemEntity>>,
         item_values: std::sync::Mutex<RecordedItemValues>,
+        /// The `LockedFields` it answers with, per item.
+        locked: HashMap<Uuid, Vec<MetadataField>>,
     }
 
     #[async_trait]
@@ -5622,6 +5695,15 @@ mod tests {
         }
         async fn save_images(&self, _item: &BaseItemEntity) -> Result<(), ServiceError> {
             unimplemented!()
+        }
+        async fn locked_fields_for_items(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+            Ok(item_ids
+                .iter()
+                .filter_map(|id| self.locked.get(id).map(|f| (*id, f.clone())))
+                .collect())
         }
         async fn provider_ids_for_items(
             &self,
@@ -6615,6 +6697,7 @@ mod tests {
             Some("Plot."),
             Some("https://example.invalid/still.jpg"),
             &opts,
+            &super::FieldLocks::default(),
         )
         .await
         .expect("slice applies");
@@ -6633,6 +6716,7 @@ mod tests {
                 metadata_refresh_mode: MetadataRefreshMode::ValidationOnly,
                 ..MetadataRefreshOptions::default()
             },
+            &super::FieldLocks::default(),
         )
         .await
         .expect("slice no-ops");
@@ -7296,6 +7380,47 @@ mod tests {
             "a refused download writes no artwork"
         );
     }
+    /// Phase 3L: the single-item refresh honours `LockedFields` like the
+    /// merge does. "Identify → Apply" (`RemoveOldMetadata` +
+    /// `ReplaceAllMetadata`) with every fetcher gated off clears the
+    /// provider-owned fields — but not the ones the user locked.
+    #[tokio::test]
+    async fn a_refresh_keeps_the_locked_fields_as_stored() {
+        let item_id = Uuid::new_v4();
+        let mut movie = row("Movies.Movie", "Movie 0401");
+        movie.id = item_id.to_string();
+        movie.overview = Some("My own overview".to_owned());
+        movie.genres = Some("Drama".to_owned());
+        movie.tagline = Some("A tagline".to_owned());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::from([(item_id, movie)]),
+            seen: tx,
+        });
+        let store = Arc::new(RecordingStore {
+            locked: HashMap::from([(item_id, vec![MetadataField::Overview])]),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir());
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            replace_all_metadata: true,
+            remove_old_metadata: true,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_full_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let saved = store.saved.lock().expect("lock").clone();
+        let row = saved.last().expect("the cleared row is saved");
+        assert_eq!(row.overview.as_deref(), Some("My own overview"), "locked");
+        assert_eq!(row.genres, None, "unlocked: cleared");
+        assert_eq!(row.tagline, None, "unlocked: cleared");
+    }
+
     #[tokio::test]
     async fn identify_apply_persists_the_chosen_ids_even_when_every_fetcher_is_gated_off() {
         // The regression this guards: adding the library-options / IsLocked gate

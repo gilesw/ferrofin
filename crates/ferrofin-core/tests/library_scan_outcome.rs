@@ -106,9 +106,12 @@ fn repository(db: &Database) -> Arc<dyn ItemRepository> {
 }
 
 // One row the decoder rejects fails its whole window's batch read. The window
-// is then re-read row by row, so only that row is `Unread` (saved and counted
-// as updated, never announced); its healthy neighbours keep their stored
-// state, and a new file in the same window is still created and announced.
+// is then re-read row by row, so only that row is left unread; its healthy
+// neighbours keep their stored state, and a new file in the same window is
+// still created and announced. The unread row runs no provider and is not
+// re-saved from the scan (nothing can be merged onto a row that cannot be
+// read): only its file facts are written when they moved, so the user's
+// overview on it survives.
 #[tokio::test]
 async fn an_unreadable_row_leaves_only_itself_unread() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -130,7 +133,7 @@ async fn an_unreadable_row_leaves_only_itself_unread() {
     // A stored value the row decoder rejects. The scan upsert keeps a stored
     // `DateCreated`, so the row stays unreadable scan after scan.
     sqlx::query(
-        r#"UPDATE "BaseItems" SET "DateCreated" = 'not a date'
+        r#"UPDATE "BaseItems" SET "DateCreated" = 'not a date', "Overview" = 'My overview'
            WHERE "Type" LIKE '%Movies.Movie' AND "Name" = 'Alien'"#,
     )
     .execute(db.pool())
@@ -156,13 +159,58 @@ async fn an_unreadable_row_leaves_only_itself_unread() {
         rescan,
         ScanOutcome {
             created: 1,
-            updated: 1,
-            unchanged: 1,
+            unchanged: 2,
             ..ScanOutcome::default()
         },
-        "the new file is still created; the unreadable row is saved as an update \
-         (nothing can be compared with it), and the healthy row, re-read on its \
-         own, is found unchanged"
+        "the new file is still created; the unreadable row's file facts did not \
+         move, and the healthy row, re-read on its own, is found unchanged"
+    );
+    let overview: Option<String> = sqlx::query_scalar(
+        r#"SELECT "Overview" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' AND "Name" = 'Alien'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("overview");
+    assert_eq!(
+        overview.as_deref(),
+        Some("My overview"),
+        "the user's edit survives"
+    );
+
+    // A moved file fact (the file grew) is written, and only that.
+    std::fs::write(media.join("Alien (1979).mkv"), b"now longer").expect("grow");
+    let rescan = scanner.scan_all().await.expect("rescan");
+    assert_eq!(rescan.updated, 1);
+    let (size, overview): (Option<i64>, Option<String>) = sqlx::query_as(
+        r#"SELECT "Size", "Overview" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie' AND "Name" = 'Alien'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("row");
+    assert_eq!(size, Some(10));
+    assert_eq!(overview.as_deref(), Some("My overview"));
+
+    // A stale ancestor closure (here: lost) is rewritten from the plan.
+    let ancestors = || async {
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(alien))
+            .fetch_one(db.pool())
+            .await
+            .expect("ancestors")
+    };
+    let before = ancestors().await;
+    assert!(before > 0);
+    sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(alien))
+        .execute(db.pool())
+        .await
+        .expect("drop closure");
+    assert_eq!(scanner.scan_all().await.expect("rescan").updated, 1);
+    assert_eq!(ancestors().await, before, "the closure is restored");
+    assert_eq!(
+        scanner.scan_all().await.expect("rescan").updated,
+        0,
+        "then quiet"
     );
     assert_eq!(movie_rows(&db).await, 3, "no row is lost");
     let announced: Vec<uuid::Uuid> = added(&changes)

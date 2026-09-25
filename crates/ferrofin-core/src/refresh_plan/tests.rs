@@ -473,9 +473,59 @@ fn a_locked_item_never_runs_remote_metadata(
     let p = plan_with(Some(&stored), &video(), &opts, None, true);
     assert!(!p.remote_metadata);
     assert!(!p.run_all_providers);
-    // Local readers and the (forced) probe still run.
+    // The (forced, pre-refresh) probe still runs; the local readers do not:
+    // `RefreshWithProviders` returns on `IsLocked` before them.
     assert!(p.probe);
-    assert!(p.local_metadata);
+    assert!(!p.local_metadata);
+    assert_eq!(p.remote_images, images);
+}
+
+/// A locked item whose NFO changed: its change monitor does not bring the
+/// reader back (`MetadataService.cs:785-788` returns before any local
+/// provider runs), and nothing else runs either.
+#[test]
+fn a_locked_item_never_reads_a_changed_nfo() {
+    let opts = MetadataRefreshOptions::default();
+    let stored = StoredState {
+        is_locked: true,
+        ..current()
+    };
+    let fs = FileFacts {
+        local_metadata: Some(LocalMetadataFile {
+            mtime: now(),
+            format: LocalMetadataFormat::Nfo,
+        }),
+        ..video()
+    };
+    let p = plan(Some(&stored), &fs, &opts);
+    assert_eq!(runs(p), (false, false, false, ImageFetch::None));
+    assert!(!p.local_monitor_fired);
+    assert!(!save(p, &opts, false).save);
+}
+
+/// `ProviderManagerTests.GetMetadataProviders_CanRefreshMetadataLocked_
+/// WhenLocalOrForced` and `GetImageProviders_CanRefreshImagesLocked_
+/// WhenLocalOrFullRefresh`, as far as the decision models providers: on a
+/// locked item the remote metadata provider is refused, the forced probe is
+/// not, and the remote image providers run only on an image full refresh.
+#[rstest]
+#[case::remote_image_default(Default, ImageFetch::None)]
+#[case::remote_image_full_refresh(FullRefresh, ImageFetch::MissingOnly)]
+fn provider_manager_locked_gates(
+    #[case] image_mode: MetadataRefreshMode,
+    #[case] images: ImageFetch,
+) {
+    let opts = options(Default, image_mode);
+    let stored = StoredState {
+        date_last_refreshed: None,
+        is_locked: true,
+        ..current()
+    };
+    let p = plan(Some(&stored), &video(), &opts);
+    // `IRemoteMetadataProvider`, not forced: refused.
+    assert!(!p.remote_metadata);
+    // `ProbeProvider` is an `IForcedProvider`: allowed.
+    assert!(p.probe);
     assert_eq!(p.remote_images, images);
 }
 
@@ -488,7 +538,7 @@ fn a_new_locked_item_still_probes() {
         ..current()
     };
     let p = plan(Some(&stored), &video(), &opts);
-    assert_eq!(runs(p), (true, true, false, ImageFetch::None));
+    assert_eq!(runs(p), (true, false, false, ImageFetch::None));
     assert!(save(p, &opts, false).save);
 }
 
@@ -551,7 +601,8 @@ fn backfill_only_adds_remote_metadata(
     let p = plan_with(Some(&stored), &video(), &opts, None, true);
     assert_eq!(p.remote_metadata, remote);
     // A remote provider "reporting a change" runs every local reader too
-    // (`MetadataService.cs:689-693`), so an NFO's values survive the merge.
+    // (`MetadataService.cs:689-693`), so an NFO's values survive the merge;
+    // a locked item runs neither.
     assert_eq!(p.local_metadata, remote);
     assert!(!p.run_all_providers, "backfill is not upstream's run-all");
     assert!(!p.probe, "the backfill asks nothing of the file");

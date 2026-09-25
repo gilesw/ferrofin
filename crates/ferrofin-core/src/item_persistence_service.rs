@@ -2185,7 +2185,124 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 }
             }
         }
+        for (id, fields) in self.locked_fields_for_items(item_ids).await? {
+            out.entry(id).or_default().locked_fields = fields;
+        }
         Ok(Some(out))
+    }
+
+    async fn update_file_facts(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let date_modified = opt_datetime_to_db(item.date_modified);
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "Path" = ?2, "ParentId" = ?3, "TopParentId" = ?4,
+                   "DateModified" = coalesce(?5, "DateModified"),
+                   "Size" = coalesce(?6, "Size"),
+                   "DateLastSaved" = ?7
+               WHERE "Id" = ?1
+                 AND ("Path" IS NOT ?2 OR "ParentId" IS NOT ?3 OR "TopParentId" IS NOT ?4
+                      OR (?5 IS NOT NULL AND "DateModified" IS NOT ?5)
+                      OR (?6 IS NOT NULL AND "Size" IS NOT ?6))"#,
+        )
+        .bind(&item.id)
+        .bind(&item.path)
+        .bind(&item.parent_id)
+        .bind(&item.top_parent_id)
+        .bind(date_modified)
+        .bind(item.size)
+        .bind(datetime_to_db(chrono::Utc::now()))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(written.rows_affected() > 0)
+    }
+
+    async fn locked_fields_for_items(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>, ServiceError> {
+        let mut out: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>> = HashMap::new();
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // `IX_BaseItemMetadataFields_ItemId` serves the lookup; ordered by
+            // field so the set reads back the same way every time.
+            let sql = format!(
+                r#"SELECT "ItemId", "Id" FROM "BaseItemMetadataFields"
+                   WHERE "ItemId" IN ({placeholders}) ORDER BY "ItemId", "Id""#
+            );
+            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (item, field) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                let Ok(id) = Uuid::parse_str(&item) else {
+                    continue;
+                };
+                // An id this server does not know (a newer Jellyfin's field) is
+                // skipped rather than failing the item's read.
+                let Some(field) = i32::try_from(field)
+                    .ok()
+                    .and_then(|f| ferrofin_db::enums::metadata_field::from_i32(f).ok())
+                else {
+                    continue;
+                };
+                out.entry(id).or_default().push(field);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn replace_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // Upstream rewrites an updated item's `BaseItemMetadataFields` rows
+        // wholesale (`ItemPersistenceService.SaveItems`: delete, then add the
+        // current set) — one transaction here, like `replace_provider_ids`.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "BaseItemMetadataFields" WHERE "ItemId" = ?1"#)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        for field in field_ids {
+            // `OR IGNORE`: a set that names a field twice is one lock (the
+            // composite key would otherwise reject the save).
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (?1, ?2)"#,
+            )
+            .bind(*field)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
+    async fn add_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for field in field_ids {
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (?1, ?2)"#,
+            )
+            .bind(*field)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
     }
 
     async fn set_item_image(
@@ -4440,6 +4557,82 @@ mod tests {
         };
         assert!(!super::scan_save_changes_row(&renamed, &locked));
         assert!(super::scan_save_changes_row(&moved, &locked));
+    }
+
+    /// `BaseItemMetadataFields`: the editor's replace-all write (duplicates
+    /// written once, an empty set clearing it), the batch read in field
+    /// order with the stored discriminants upstream's enum values, and the
+    /// scan's window read carrying the set.
+    #[tokio::test]
+    async fn locked_fields_round_trip_through_base_item_metadata_fields() {
+        use ferrofin_model::entities::MetadataField;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        for id in [item, other] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        svc.replace_locked_fields(item, &[8, 0])
+            .await
+            .expect("first set");
+        // An id this server has no name for is stored as sent (upstream's
+        // enum carries it) and skipped on read.
+        svc.replace_locked_fields(item, &[6, 5, 6, 42])
+            .await
+            .expect("replaced");
+        let stored: Vec<(i64, String)> =
+            sqlx::query_as(r#"SELECT "Id", "ItemId" FROM "BaseItemMetadataFields" ORDER BY "Id""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("rows");
+        // `MetadataField.Name = 5`, `Overview = 6` (MetadataField.cs).
+        assert_eq!(
+            stored,
+            vec![
+                (5, guid_to_db(item)),
+                (6, guid_to_db(item)),
+                (42, guid_to_db(item))
+            ]
+        );
+
+        let map = svc
+            .locked_fields_for_items(&[item, other])
+            .await
+            .expect("read");
+        assert_eq!(
+            map.get(&item),
+            Some(&vec![MetadataField::Name, MetadataField::Overview])
+        );
+        assert!(!map.contains_key(&other));
+
+        let links = svc
+            .scan_stored_links(&[item])
+            .await
+            .expect("read")
+            .expect("supported");
+        assert_eq!(
+            links[&item].locked_fields,
+            vec![MetadataField::Name, MetadataField::Overview]
+        );
+
+        // The NFO union adds without deleting: the unnamed 42 survives.
+        svc.add_locked_fields(item, &[5, 0]).await.expect("added");
+        let ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItemMetadataFields" WHERE "ItemId" = ?1 ORDER BY "Id""#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        assert_eq!(ids, vec![0, 5, 6, 42]);
+
+        svc.replace_locked_fields(item, &[]).await.expect("cleared");
+        assert!(
+            svc.locked_fields_for_items(&[item])
+                .await
+                .expect("read")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

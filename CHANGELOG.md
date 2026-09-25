@@ -42,6 +42,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the user-view consolidation's reference moves, `HasVisibleChild` (a playlists or boxsets
   library with nothing the user can see has no view), and `ApplyAlternateVersionFiltering` (a
   version is hidden only behind a primary that exists in the same library)
+- Per-field metadata locks (`LockedFields`, stored in `BaseItemMetadataFields`): the
+  metadata editor's checkboxes round-trip, and scans and refreshes keep a locked field
+  as the user set it. Editing an item no longer locks it; `LockData` is exactly what the
+  editor sends, and a lock change on a folder reaches every descendant and linked member.
+  A series, season or album edit passes its rating and tag changes to its children, each
+  child's own field locks honoured. A locked item still has its local artwork validated
+  (a new `poster.jpg` is found). See [docs/UPGRADING.md](docs/UPGRADING.md) for items
+  locked by earlier versions
 
 ## [1.0.0] - 2026-09-05
 

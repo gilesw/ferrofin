@@ -63,7 +63,8 @@ pub(crate) struct StoredState {
     pub total_bitrate: Option<i64>,
     /// `IsVirtualItem`: a virtual item is never missing media info.
     pub is_virtual_item: bool,
-    /// `IsLocked`: remote providers never run for a locked item.
+    /// `IsLocked`: only the forced providers (the probe) and the local image
+    /// validation run for a locked item.
     pub is_locked: bool,
 }
 
@@ -173,6 +174,20 @@ pub(crate) struct ItemRefreshPlan {
     pub remote_images: ImageFetch,
 }
 
+impl ItemRefreshPlan {
+    /// A plan that runs nothing: no probe, no reader, no provider.
+    pub(crate) const IDLE: Self = Self {
+        is_first_refresh: false,
+        requires_refresh: false,
+        probe: false,
+        local_metadata: false,
+        local_monitor_fired: false,
+        remote_metadata: false,
+        run_all_providers: false,
+        remote_images: ImageFetch::None,
+    };
+}
+
 /// What a refresh pass did, as far as the save rule needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PassOutcome {
@@ -279,7 +294,8 @@ fn local_metadata_changed(stored: &StoredState, fs: &FileFacts) -> bool {
 ///   local reader when any of them did. No remote provider has a change
 ///   monitor, so a remote provider runs only in the run-all case — or, in
 ///   the scan, when `backfill` says so (never for a locked item, and never
-///   in `ValidationOnly` or `None` mode).
+///   in `ValidationOnly` or `None` mode). A locked item runs the probe only:
+///   no local reader and no remote provider.
 /// - `GetNonLocalImageProviders`: the remote image providers run on an
 ///   image full refresh or for an item never refreshed, and never for a
 ///   locked item outside an image full refresh (`CanRefreshImages`).
@@ -320,8 +336,13 @@ pub(crate) fn plan_item_refresh(
             let probe_changed = probe_changed(stored, fs);
             let local_changed = local_metadata_changed(stored, fs);
             let probe = fs.probe != ProbeKind::None && (run_all || probe_changed);
-            // `CanRefreshMetadata`: a locked item runs local and forced
-            // providers only.
+            // `CanRefreshMetadata` (`ProviderManager.cs:588-592`): a locked
+            // item runs local and forced providers only — and of those,
+            // `RefreshWithProviders` returns on `item.IsLocked`
+            // (`MetadataService.cs:785-788`) after the pre-refresh ones (the
+            // forced probe) and BEFORE the local readers, so an NFO is never
+            // read for a locked item either. Its local images are validated
+            // outside this decision (`MetadataService.cs:123-143`).
             let remote = !stored.is_locked && (run_all || (backfill && at_least_default));
             // "If any provider reports a change, always run local ones as
             // well" (`MetadataService.cs:689-693`): the backfill counts as a
@@ -331,11 +352,11 @@ pub(crate) fn plan_item_refresh(
             // also run the custom providers (the probe) then; the backfill
             // is Ferrofin's own trigger and asks nothing of the file, so it
             // does not re-probe.
-            let local = run_all || local_changed || probe_changed || remote;
+            let local = !stored.is_locked && (run_all || local_changed || probe_changed || remote);
             (
                 probe,
                 local,
-                local_changed || probe_changed,
+                !stored.is_locked && (local_changed || probe_changed),
                 remote,
                 run_all && !stored.is_locked,
             )

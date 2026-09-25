@@ -33,7 +33,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType};
+use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -648,6 +648,23 @@ impl LibraryManager for FerrofinLibraryManager {
         // the rest in one transaction.
         self.persistence
             .replace_provider_ids(item_id, provider_ids)
+            .await
+    }
+
+    async fn get_locked_fields_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        self.persistence.locked_fields_for_items(item_ids).await
+    }
+
+    async fn update_item_locked_fields(
+        &self,
+        item_id: Uuid,
+        field_ids: &[i32],
+    ) -> Result<(), ServiceError> {
+        self.persistence
+            .replace_locked_fields(item_id, field_ids)
             .await
     }
 

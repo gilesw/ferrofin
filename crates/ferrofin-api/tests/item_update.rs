@@ -23,6 +23,7 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::MetadataEditorInfo;
+use ferrofin_model::entities::MetadataField;
 use ferrofin_model::providers::ExternalIdInfo;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::dto::DtoService;
@@ -308,11 +309,32 @@ struct OkLibrary {
     /// External-id sets passed to `update_item_provider_ids` — a second write,
     /// because `BaseItemProviders` is its own table.
     provider_ids: RecordedProviderIds,
+    /// The item's children and locked fields, for the cascade tests.
+    tree: Arc<Tree>,
+}
+
+/// What the cascade tests shape around the fixture item: its stored row, its
+/// children by parent, its descendants, and every item's `LockedFields`.
+#[derive(Default)]
+struct Tree {
+    /// Replaces the fixture item's stored row when set.
+    root: Option<BaseItemEntity>,
+    /// Direct children by parent id (`parent_id` queries).
+    children: std::collections::HashMap<Uuid, Vec<BaseItemEntity>>,
+    /// Every descendant of the fixture item (the recursive `ancestor_ids` query).
+    descendants: Vec<BaseItemEntity>,
+    /// Stored `LockedFields` per item.
+    locked: std::collections::HashMap<Uuid, Vec<MetadataField>>,
+    /// `update_item_locked_fields` calls.
+    locked_written: Mutex<Vec<(Uuid, Vec<i32>)>>,
 }
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if let Some(root) = &self.tree.root {
+            return Ok((id == self.item_id).then(|| root.clone()));
+        }
         Ok((id == self.item_id).then(|| {
             let mut entity = base_item_entity(self.item_id);
             entity.is_folder = self.is_folder;
@@ -354,9 +376,46 @@ impl LibraryManager for OkLibrary {
     }
     async fn get_item_list(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+        if query.recursive && query.ancestor_ids == [self.item_id] {
+            return Ok(self.tree.descendants.clone());
+        }
+        let kinds: Vec<&str> = query
+            .include_item_types
+            .iter()
+            .filter_map(|k| k.stored_type_name())
+            .collect();
+        Ok(self
+            .tree
+            .children
+            .get(&query.parent_id)
+            .into_iter()
+            .flatten()
+            .filter(|c| kinds.is_empty() || kinds.contains(&c.type_.as_str()))
+            .cloned()
+            .collect())
+    }
+    async fn get_locked_fields_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MetadataField>>, ServiceError> {
+        Ok(item_ids
+            .iter()
+            .filter_map(|id| self.tree.locked.get(id).map(|f| (*id, f.clone())))
+            .collect())
+    }
+    async fn update_item_locked_fields(
+        &self,
+        item_id: Uuid,
+        fields: &[i32],
+    ) -> Result<(), ServiceError> {
+        self.tree
+            .locked_written
+            .lock()
+            .unwrap()
+            .push((item_id, fields.to_vec()));
+        Ok(())
     }
     async fn get_latest_item_list(
         &self,
@@ -655,6 +714,7 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
             scoped_scans: Arc::default(),
             provider_ids: Arc::default(),
             updated: Arc::default(),
+            tree: Arc::default(),
         }),
         queued,
     )
@@ -758,6 +818,7 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
             scoped_scans: Arc::default(),
             provider_ids: Arc::default(),
             updated: updated.clone(),
+            tree: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -778,23 +839,270 @@ async fn update_and_capture(item_id: Uuid, body: String) -> BaseItemEntity {
     written.first().expect("update written").clone()
 }
 
-/// An edit that changes a field locks the item even when the editor's
-/// LockData checkbox was unticked — Ferrofin's scan rebuilds rows from disk
-/// and preserves the editable columns only for locked rows, so an unlocked
-/// edit would be reverted on the next pass (deliberate upstream divergence).
+/// `item.IsLocked = request.LockData ?? false`: an edit made with the
+/// editor's "Lock this item" box unticked leaves the item unlocked (the old
+/// auto-lock is gone — the scan now merges onto the stored row and honours
+/// `LockedFields`, so the edit survives a rescan without it).
 #[tokio::test]
-async fn editing_a_field_auto_locks_the_item() {
+async fn an_edit_without_lock_data_leaves_the_item_unlocked() {
     let item_id = Uuid::from_u128(0x59);
-    // The fixture entity's name is "Test Item"; renaming it is a real change.
+    for body in [
+        r#""Name":"Renamed","LockData":false"#,
+        r#""Name":"Renamed""#,
+        r#""Name":"Renamed","LockData":null"#,
+    ] {
+        let written = update_and_capture(
+            item_id,
+            format!(r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video",{body}}}"#),
+        )
+        .await;
+        assert_eq!(written.name.as_deref(), Some("Renamed"));
+        assert!(!written.is_locked, "{body}: an edit never locks by itself");
+    }
     let written = update_and_capture(
         item_id,
         format!(
-            r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed","LockData":false}}"#
+            r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed","LockData":true}}"#
         ),
     )
     .await;
-    assert_eq!(written.name.as_deref(), Some("Renamed"));
-    assert!(written.is_locked, "a changed save must lock the item");
+    assert!(written.is_locked, "LockData=true locks");
+}
+
+/// Posts `body` for the fixture item of `library` and returns the library,
+/// so a test can read everything the handler wrote.
+async fn post_update(library: Arc<OkLibrary>, body: String) -> Arc<OkLibrary> {
+    let item_id = library.item_id;
+    let router = create_router(state_with_library(
+        Arc::clone(&library),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    library
+}
+
+/// An [`OkLibrary`] around `tree`.
+fn tree_library(item_id: Uuid, tree: Tree) -> Arc<OkLibrary> {
+    Arc::new(OkLibrary {
+        item_id,
+        is_folder: false,
+        top_parent_id: None,
+        scoped_scans: Arc::default(),
+        provider_ids: Arc::default(),
+        updated: Arc::default(),
+        tree: Arc::new(tree),
+    })
+}
+
+/// `if (request.LockedFields is not null) item.LockedFields =
+/// request.LockedFields;`: the set the editor sends is stored as sent (the
+/// metadata editor sends the fields whose box is UNticked), and a body
+/// without the key leaves the stored set alone.
+#[tokio::test]
+async fn locked_fields_are_stored_as_sent_and_absent_means_unchanged() {
+    let item_id = Uuid::from_u128(0x59);
+    let library = post_update(
+        tree_library(item_id, Tree::default()),
+        format!(
+            r#"{{"Id":"{item_id}","Type":"Movie","Name":"Test Item","LockData":false,
+                "LockedFields":["Overview","Name"]}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        *library.tree.locked_written.lock().unwrap(),
+        // `MetadataField.Overview` = 6, `Name` = 5.
+        vec![(item_id, vec![6, 5])]
+    );
+    let written = library.updated.lock().unwrap()[0].clone();
+    assert!(!written.is_locked, "field locks do not lock the item");
+
+    let library = post_update(
+        tree_library(item_id, Tree::default()),
+        format!(r#"{{"Id":"{item_id}","Type":"Movie","Name":"Test Item"}}"#),
+    )
+    .await;
+    assert!(library.tree.locked_written.lock().unwrap().is_empty());
+
+    // An empty list clears the set.
+    let library = post_update(
+        tree_library(item_id, Tree::default()),
+        format!(r#"{{"Id":"{item_id}","Type":"Movie","Name":"Test Item","LockedFields":[]}}"#),
+    )
+    .await;
+    assert_eq!(
+        *library.tree.locked_written.lock().unwrap(),
+        vec![(item_id, Vec::new())]
+    );
+}
+
+/// A row of `kind` under `parent`.
+fn child(id: u128, kind: &str, parent: Uuid, tags: Option<&str>) -> BaseItemEntity {
+    BaseItemEntity {
+        type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+        parent_id: Some(parent.to_string()),
+        tags: tags.map(ToOwned::to_owned),
+        official_rating: Some("Old rating".into()),
+        custom_rating: Some("Old custom".into()),
+        series_name: Some("Old series".into()),
+        ..base_item_entity(Uuid::from_u128(id))
+    }
+}
+
+/// `ItemUpdateController.UpdateItem`'s series walk (`:315-356`): the
+/// series' name, rating, custom rating and tag edit reach its seasons and
+/// their episodes, and each child's own `LockedFields` shields its
+/// `OfficialRating` and `Tags`.
+#[tokio::test]
+async fn a_series_edit_cascades_to_seasons_and_episodes_honouring_their_locks() {
+    let series_id = Uuid::from_u128(0x5E);
+    let season = child(0x51, "TV.Season", series_id, Some("Old|Keep|Mine"));
+    let season_id = Uuid::from_u128(0x51);
+    let locked_rating = child(0xE1, "TV.Episode", season_id, Some("Old|Keep"));
+    let open = child(0xE2, "TV.Episode", season_id, Some("Old|Keep"));
+    let tree = Tree {
+        root: Some(BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            is_folder: true,
+            tags: Some("Old|Keep".into()),
+            ..base_item_entity(series_id)
+        }),
+        children: std::collections::HashMap::from([
+            (series_id, vec![season]),
+            (season_id, vec![locked_rating, open]),
+        ]),
+        locked: std::collections::HashMap::from([
+            (season_id, vec![MetadataField::Tags]),
+            (Uuid::from_u128(0xE1), vec![MetadataField::OfficialRating]),
+        ]),
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(series_id, tree),
+        format!(
+            r#"{{"Id":"{series_id}","Type":"Series","Name":"New Series",
+                "OfficialRating":"TV-MA","CustomRating":"New custom",
+                "Tags":["Keep","New"]}}"#
+        ),
+    )
+    .await;
+    let written = library.updated.lock().unwrap().clone();
+    let by_id = |id: u128| {
+        written
+            .iter()
+            .rev()
+            .find(|e| e.id == Uuid::from_u128(id).to_string())
+            .cloned()
+            .expect("child written")
+    };
+    let season = by_id(0x51);
+    assert_eq!(season.series_name.as_deref(), Some("New Series"));
+    assert_eq!(season.official_rating.as_deref(), Some("TV-MA"));
+    assert_eq!(season.custom_rating.as_deref(), Some("New custom"));
+    assert_eq!(season.tags.as_deref(), Some("Old|Keep|Mine"), "Tags locked");
+    let locked = by_id(0xE1);
+    assert_eq!(
+        locked.official_rating.as_deref(),
+        Some("Old rating"),
+        "rating locked"
+    );
+    assert_eq!(
+        locked.custom_rating.as_deref(),
+        Some("New custom"),
+        "never lock-checked"
+    );
+    assert_eq!(
+        locked.tags.as_deref(),
+        Some("Keep|New"),
+        "Old removed, New added"
+    );
+    assert_eq!(locked.series_name.as_deref(), Some("New Series"));
+    let open = by_id(0xE2);
+    assert_eq!(open.official_rating.as_deref(), Some("TV-MA"));
+    assert_eq!(open.tags.as_deref(), Some("Keep|New"));
+}
+
+/// The season and album walks (`:357-381`): episodes / tracks take the
+/// rating and tag edit, not the series name.
+#[tokio::test]
+async fn season_and_album_edits_cascade_to_their_children() {
+    for (kind, child_kind) in [
+        ("TV.Season", "TV.Episode"),
+        ("Audio.MusicAlbum", "Audio.Audio"),
+    ] {
+        let parent = Uuid::from_u128(0x70);
+        let kid = child(0x71, child_kind, parent, None);
+        let tree = Tree {
+            root: Some(BaseItemEntity {
+                type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+                is_folder: true,
+                ..base_item_entity(parent)
+            }),
+            children: std::collections::HashMap::from([(parent, vec![kid])]),
+            ..Tree::default()
+        };
+        let library = post_update(
+            tree_library(parent, tree),
+            format!(r#"{{"Id":"{parent}","Name":"P","OfficialRating":"  ","Tags":["T"]}}"#),
+        )
+        .await;
+        let written = library.updated.lock().unwrap().clone();
+        let kid = written
+            .iter()
+            .find(|e| e.id == Uuid::from_u128(0x71).to_string())
+            .expect("child written");
+        assert_eq!(kid.official_rating, None, "{kind}: a blank rating clears");
+        assert_eq!(kid.tags.as_deref(), Some("T"), "{kind}");
+        assert_eq!(kid.series_name.as_deref(), Some("Old series"), "{kind}");
+    }
+}
+
+/// `if (isLockedChanged && item.IsFolder)`: a change of `LockData` on a
+/// folder reaches every descendant; an unchanged one touches none.
+#[tokio::test]
+async fn a_lock_change_on_a_folder_cascades_to_every_descendant() {
+    let folder = Uuid::from_u128(0x80);
+    let descendants = vec![
+        child(0x81, "TV.Season", folder, None),
+        child(0x82, "TV.Episode", Uuid::from_u128(0x81), None),
+    ];
+    let tree = || Tree {
+        root: Some(BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Folder".into(),
+            is_folder: true,
+            ..base_item_entity(folder)
+        }),
+        descendants: descendants.clone(),
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(folder, tree()),
+        format!(r#"{{"Id":"{folder}","Name":"F","LockData":true}}"#),
+    )
+    .await;
+    let written = library.updated.lock().unwrap().clone();
+    assert_eq!(written.len(), 3, "the folder, then both descendants");
+    assert!(written.iter().all(|e| e.is_locked));
+
+    // Unchanged (stored unlocked, sent unlocked): no descendant is written.
+    let library = post_update(
+        tree_library(folder, tree()),
+        format!(r#"{{"Id":"{folder}","Name":"F","LockData":false}}"#),
+    )
+    .await;
+    assert_eq!(library.updated.lock().unwrap().len(), 1);
 }
 
 /// A save that changes nothing honors the checkbox: LockData=false stays
@@ -836,6 +1144,7 @@ async fn update_item_replaces_the_external_ids() {
             scoped_scans: Arc::default(),
             provider_ids: recorded.clone(),
             updated: Arc::default(),
+            tree: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -883,6 +1192,7 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
             scoped_scans: Arc::default(),
             provider_ids: recorded.clone(),
             updated: Arc::default(),
+            tree: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -972,6 +1282,7 @@ async fn refresh_library_folder_queues_scoped_scan() {
             scoped_scans: scans.clone(),
             provider_ids: Arc::default(),
             updated: Arc::default(),
+            tree: Arc::default(),
         }),
         queued.clone(),
     ));
@@ -1009,6 +1320,7 @@ async fn refresh_nested_folder_scopes_to_owning_library() {
             scoped_scans: scans.clone(),
             provider_ids: Arc::default(),
             updated: Arc::default(),
+            tree: Arc::default(),
         }),
         Arc::new(Mutex::new(Vec::new())),
     ));
@@ -1144,4 +1456,37 @@ async fn external_id_infos_missing_item_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `GetRecursiveChildren()` includes the folder's linked children
+/// (`AddChildrenToList(includeLinkedChildren: true)`, `Folder.cs:1654-1682`):
+/// locking a box set locks its member movies, which are not its physical
+/// descendants.
+#[tokio::test]
+async fn a_lock_change_on_a_box_set_reaches_its_linked_members() {
+    let boxset = Uuid::from_u128(0x90);
+    let member = child(0x91, "Movies.Movie", Uuid::from_u128(0x99), None);
+    let tree = Tree {
+        root: Some(BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.BoxSet".into(),
+            is_folder: true,
+            ..base_item_entity(boxset)
+        }),
+        // Only the non-physical `parent_id` browse (which merges
+        // `LinkedChildren`) finds the member; the recursive ancestor query
+        // finds nothing.
+        children: std::collections::HashMap::from([(boxset, vec![member])]),
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(boxset, tree),
+        format!(r#"{{"Id":"{boxset}","Name":"B","LockData":true}}"#),
+    )
+    .await;
+    let written = library.updated.lock().unwrap().clone();
+    let member = written
+        .iter()
+        .find(|e| e.id == Uuid::from_u128(0x91).to_string())
+        .expect("member written");
+    assert!(member.is_locked);
 }

@@ -270,6 +270,9 @@ struct ItemsQuery {
     /// Restrict to 3D items (jellyfin-web sends `Is3D` → `is3D`).
     #[serde(default, rename = "is3D")]
     is_3d: Option<bool>,
+    /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
+    #[serde(default)]
+    is_locked: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -416,6 +419,7 @@ async fn get_items(
         is_4k: query.is_4k,
         is_hd: query.is_hd,
         is_3d: query.is_3d,
+        is_locked: query.is_locked,
         video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
         has_subtitles: query.has_subtitles,
         has_trailer: query.has_trailer,
@@ -1297,6 +1301,16 @@ mod tests {
         for short in ["CollectionFolder", "Folder", "UserRootFolder", "Series"] {
             assert!(!is_direct_children_browse(short), "{short}");
         }
+    }
+
+    /// `[FromQuery] bool? isLocked` → `IsLocked = isLocked`
+    /// (`ItemsController.cs:243,400`).
+    #[test]
+    fn items_query_reads_is_locked() {
+        let q: ItemsQuery = serde_urlencoded::from_str("isLocked=true").expect("parses");
+        assert_eq!(q.is_locked, Some(true));
+        let q: ItemsQuery = serde_urlencoded::from_str("recursive=true").expect("parses");
+        assert_eq!(q.is_locked, None);
     }
 
     // GET /Items must honour the camelCase `fields` param (the OpenAPI contract's casing, what

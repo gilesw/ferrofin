@@ -23,8 +23,8 @@
 //! (never replaced wholesale).
 //!
 //! The upstream properties Ferrofin has no storage for are not merged:
-//! `HomePageUrl`, `LockedFields` (Phase 3L of the scan plan adds it) and a
-//! person's `SortOrder`.
+//! `HomePageUrl` and a person's `SortOrder`. `LockedFields` lives in its own
+//! table (`BaseItemMetadataFields`), so it rides on [`MetadataResult`].
 //!
 //! It lives here, beside the providers, as upstream's lives in
 //! `MediaBrowser.Providers`: the library scan (`ferrofin-core`) and the
@@ -58,6 +58,9 @@ pub struct MetadataResult {
     pub people: Option<Vec<PeopleEntity>>,
     /// The external ids (`BaseItemProviders`), as `(provider, value)` pairs.
     pub provider_ids: Vec<(String, String)>,
+    /// The item's `LockedFields` (`BaseItemMetadataFields`), which the
+    /// metadata-settings half of the merge unions.
+    pub locked_fields: Vec<MetadataField>,
 }
 
 impl MetadataResult {
@@ -68,6 +71,7 @@ impl MetadataResult {
             item,
             people: None,
             provider_ids: Vec::new(),
+            locked_fields: Vec::new(),
         }
     }
 }
@@ -82,8 +86,9 @@ impl MetadataResult {
 /// `Runtime`, `Studios`, `Tags` and `ProductionLocations`).
 ///
 /// `merge_metadata_settings` additionally carries `IsLocked`,
-/// `DateCreated`, `DateModified` and the preferred metadata
-/// language/country — upstream passes it on the provider → item merge only.
+/// `LockedFields` (a union), `DateCreated`, `DateModified` and the preferred
+/// metadata language/country — upstream passes it on the provider → item
+/// merge only.
 pub fn merge_data(
     source: &MetadataResult,
     target: &mut MetadataResult,
@@ -102,6 +107,17 @@ pub fn merge_data(
     if unlocked(MetadataField::Cast) {
         merge_people_field(source.people.as_deref(), &mut target.people, replace_data);
     }
+    if merge_metadata_settings {
+        // `if (target.LockedFields.Length == 0) target.LockedFields =
+        // source.LockedFields; else target.LockedFields =
+        // target.LockedFields.Concat(source.LockedFields).Distinct()`
+        // (`MetadataService.cs:1372-1379`).
+        for field in &source.locked_fields {
+            if !target.locked_fields.contains(field) {
+                target.locked_fields.push(*field);
+            }
+        }
+    }
     target.provider_ids =
         merge_provider_ids(&source.provider_ids, &target.provider_ids, replace_data);
     merge_kind_specific(
@@ -110,6 +126,46 @@ pub fn merge_data(
         replace_data,
         merge_metadata_settings,
     );
+}
+
+/// Every field a `LockedFields` set can name (`MetadataField.cs`). What a
+/// caller treats as locked when an item's stored set could not be read, so a
+/// read failure never lets a write overwrite a field the user locked.
+pub const ALL_LOCKABLE_FIELDS: &[MetadataField] = &MetadataField::ALL;
+
+/// Puts `stored`'s value back on `row` for every field in `locked_fields`
+/// — the columns `merge_data` never touches for a locked field. For an
+/// applier that writes onto the stored row directly instead of merging (the
+/// single-item refresh until it moves onto [`merge_data`]), this gives the
+/// same result as the merge's lock check. `Cast` has no column: an applier
+/// that writes people must check it itself.
+pub fn keep_locked_fields(
+    stored: &BaseItemEntity,
+    row: &mut BaseItemEntity,
+    locked_fields: &[MetadataField],
+) {
+    for field in locked_fields {
+        match field {
+            MetadataField::Name => {
+                row.name.clone_from(&stored.name);
+                // The sort key is derived from the name.
+                row.sort_name.clone_from(&stored.sort_name);
+            }
+            MetadataField::Genres => row.genres.clone_from(&stored.genres),
+            MetadataField::OfficialRating => {
+                row.official_rating.clone_from(&stored.official_rating);
+            }
+            MetadataField::Overview => row.overview.clone_from(&stored.overview),
+            MetadataField::Runtime => row.run_time_ticks = stored.run_time_ticks,
+            MetadataField::Studios => row.studios.clone_from(&stored.studios),
+            MetadataField::Tags => row.tags.clone_from(&stored.tags),
+            MetadataField::ProductionLocations => {
+                row.production_locations
+                    .clone_from(&stored.production_locations);
+            }
+            MetadataField::Cast => {}
+        }
+    }
 }
 
 /// Whether a string field is empty in upstream's `string.IsNullOrEmpty`

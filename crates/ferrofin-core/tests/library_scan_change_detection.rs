@@ -14,6 +14,11 @@
 //! - an elapsed `AutomaticRefreshIntervalDays` refetches;
 //! - a provider that fails leaves the item unstamped (retried next scan), one
 //!   that finds nothing stamps it (owner decision D1).
+//!
+//! And the Phase 3L lock rules on the same path: an unlocked edit survives a
+//! quiet rescan, a provider pass replaces only the fields outside the item's
+//! `LockedFields`, and `LockData` refuses the remote providers while a new
+//! local poster is still discovered.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -1093,4 +1098,249 @@ async fn a_cast_with_one_person_in_two_roles_is_unchanged_on_a_backfill_pass() {
         "the backfill asked again"
     );
     assert_eq!(written(&db).await, Vec::<(String, i64)>::new());
+}
+
+/// A movie row's stored `(CommunityRating, Overview)`.
+async fn rating_and_overview(fx: &Fixture, path: &Path) -> (Option<f64>, Option<String>) {
+    sqlx::query_as(r#"SELECT "CommunityRating", "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(Fixture::id(path))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("row")
+}
+
+/// Phase 3L: an edit made without `LockData` survives a rescan that runs no
+/// provider (the item is unchanged). A rescan whose providers run (the file
+/// changed) replaces the unlocked fields with the provider's values, as
+/// upstream's Default merge does, but leaves a field in the item's
+/// `LockedFields` as the user set it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_survives_a_quiet_rescan_and_a_provider_pass_only_where_locked() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let id = Fixture::id(&fx.matrix);
+    fx.set(&fx.matrix, "Overview", Some("My overview".into()))
+        .await;
+
+    assert_eq!(fx.scan().await.unchanged, 2);
+    assert!(fx.tmdb.take().is_empty());
+    assert_eq!(
+        rating_and_overview(&fx, &fx.matrix).await.1.as_deref(),
+        Some("My overview"),
+        "no provider ran: the edit stands"
+    );
+    fx.set(&fx.matrix, "CommunityRating", Some("5".into()))
+        .await;
+
+    // Lock the Overview field (`MetadataField.Overview = 6`), then change
+    // the file so the providers run.
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (6, ?1)"#)
+        .bind(&id)
+        .execute(fx.db.writer())
+        .await
+        .expect("lock overview");
+    touch(&fx.matrix, 3_600);
+    assert_eq!(fx.scan().await.updated, 1);
+    assert!(!fx.tmdb.take().is_empty(), "the providers ran");
+    assert_eq!(
+        rating_and_overview(&fx, &fx.matrix).await,
+        (Some(8.0), Some("My overview".into())),
+        "the unlocked rating is replaced; the locked overview is kept"
+    );
+
+    // Unlocked, the next provider pass replaces the overview too.
+    sqlx::query(r#"DELETE FROM "BaseItemMetadataFields" WHERE "ItemId" = ?1"#)
+        .bind(&id)
+        .execute(fx.db.writer())
+        .await
+        .expect("unlock");
+    touch(&fx.matrix, 7_200);
+    assert_eq!(fx.scan().await.updated, 1);
+    assert_eq!(
+        rating_and_overview(&fx, &fx.matrix).await.1.as_deref(),
+        Some("About The Matrix.")
+    );
+}
+
+/// Phase 3L: `LockData` refuses every remote provider — even when the file
+/// changed, which would run them all for an unlocked item — but the local
+/// image validation still runs, so a new `poster.jpg` is discovered
+/// (`ProviderManager.CanRefreshImages` enables every `ILocalImageProvider`
+/// before its `IsLocked` check).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let id = Fixture::id(&fx.heat);
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+        .bind(&id)
+        .execute(fx.db.writer())
+        .await
+        .expect("lock");
+    let images = || async {
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT "Path" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+        )
+        .bind(&id)
+        .fetch_all(fx.db.pool())
+        .await
+        .expect("images")
+    };
+    assert!(images().await.is_empty());
+
+    std::fs::write(fx.heat.with_file_name("poster.jpg"), b"\xFF\xD8\xFFposter").expect("poster");
+    touch(&fx.heat, 3_600);
+    assert_eq!(fx.scan().await.updated, 1);
+    assert!(
+        fx.tmdb.take().is_empty(),
+        "no remote provider runs for a locked item"
+    );
+    let found = images().await;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].ends_with("poster.jpg"));
+}
+
+/// Phase 3L: a `Cast` field lock keeps the stored credits through a
+/// provider pass that returns a different cast (upstream leaves
+/// `metadata.People` null under the lock, and `SaveItemAsync` writes people
+/// only when non-null). Unlocked, the next pass takes the provider's cast.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cast_lock_keeps_the_stored_credits_through_a_provider_pass() {
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_traits::persistence::PeopleRepository as _;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let file = media
+        .join("The Matrix (1999)")
+        .join("The Matrix (1999).mkv");
+    std::fs::create_dir_all(file.parent().expect("dir")).expect("mkdir");
+    std::fs::write(&file, b"0123").expect("write");
+    let (base, _requests) = spawn_trailerless_tmdb();
+    let (db, scanner) = library(
+        tmp.path(),
+        &media,
+        CollectionTypeOptions::movies,
+        Some(&base),
+    )
+    .await;
+    assert_eq!(scanner.scan_all().await.expect("scan").created, 1);
+    let people = ferrofin_core::FerrofinPeopleRepository::new(db.clone());
+    let item = derive_item_id(BaseItemKind::Movie, &file.to_string_lossy()).expect("id");
+    let names = || async {
+        people
+            .get_people_batch(&[item])
+            .await
+            .expect("people")
+            .remove(&item)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names().await, ["Tmdb Actor"]);
+
+    // The user's own cast, locked (`MetadataField.Cast = 0`).
+    people
+        .update_people(
+            item,
+            &[PeopleEntity {
+                name: "My Actor".into(),
+                person_type: Some("Actor".into()),
+                ..PeopleEntity::default()
+            }],
+        )
+        .await
+        .expect("user cast");
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (0, ?1)"#)
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("lock cast");
+    // A backfill pass (no trailers) and a full provider pass (file changed).
+    scanner.scan_all().await.expect("backfill rescan");
+    assert_eq!(names().await, ["My Actor"], "the backfill kept the lock");
+    touch(&file, 3_600);
+    assert_eq!(scanner.scan_all().await.expect("rescan").updated, 1);
+    assert_eq!(
+        names().await,
+        ["My Actor"],
+        "the provider pass kept the lock"
+    );
+
+    sqlx::query(r#"DELETE FROM "BaseItemMetadataFields""#)
+        .execute(db.writer())
+        .await
+        .expect("unlock");
+    touch(&file, 7_200);
+    scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        names().await,
+        ["Tmdb Actor"],
+        "unlocked: the provider's cast"
+    );
+}
+
+/// Phase 3L: an NFO's `<lockdata>` and `<lockedfields>` (the parser reads
+/// both, as `BaseNfoParser` does). `<lockdata>true` makes the pass
+/// `isLocalLocked` — no remote provider runs for it — and the merge's
+/// metadata-settings half locks the item; `<lockedfields>` are unioned into
+/// the item's stored set (`MetadataService.cs:873,1365-1379`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_nfo_lockdata_locks_the_item_and_its_lockedfields_join_the_set() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), 0).await;
+    std::fs::write(
+        fx.matrix.with_extension("nfo"),
+        "<movie><title>The Matrix</title><plot>From the NFO.</plot>\
+         <lockdata>true</lockdata><lockedfields>Overview|Cast</lockedfields></movie>",
+    )
+    .expect("nfo");
+    std::fs::write(
+        fx.heat.with_extension("nfo"),
+        "<movie><title>Heat</title><lockedfields>Genres</lockedfields></movie>",
+    )
+    .expect("nfo");
+    assert_eq!(fx.scan().await.created, 2);
+    let requests = fx.tmdb.take();
+    // The remote metadata provider (the `/movie/{id}` details fetch) does
+    // not run for the NFO-locked item. Its remote image lookup still may:
+    // upstream picks the image providers before the pass, on the item's
+    // stored `IsLocked`.
+    assert!(
+        requests.iter().all(|r| !r.contains("/movie/603")),
+        "no remote metadata for the NFO-locked item: {requests:?}"
+    );
+    assert!(requests.iter().any(|r| r.contains("Heat")), "{requests:?}");
+    let row: (i64, Option<String>) =
+        sqlx::query_as(r#"SELECT "IsLocked", "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(Fixture::id(&fx.matrix))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("row");
+    assert_eq!(row, (1, Some("From the NFO.".to_owned())));
+    let locks = |path: &Path| {
+        let id = Fixture::id(path);
+        let db = fx.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                r#"SELECT "Id" FROM "BaseItemMetadataFields" WHERE "ItemId" = ?1 ORDER BY "Id""#,
+            )
+            .bind(id)
+            .fetch_all(db.pool())
+            .await
+            .expect("locks")
+        }
+    };
+    // Cast = 0, Overview = 6; Genres = 1.
+    assert_eq!(locks(&fx.matrix).await, [0, 6]);
+    assert_eq!(locks(&fx.heat).await, [1]);
+    let heat_locked: i64 =
+        sqlx::query_scalar(r#"SELECT "IsLocked" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(Fixture::id(&fx.heat))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("row");
+    assert_eq!(heat_locked, 0, "no <lockdata>: not locked");
+    let _ = fx.writes().await;
+    assert_eq!(fx.scan().await.unchanged, 2, "and a rescan is quiet");
 }
