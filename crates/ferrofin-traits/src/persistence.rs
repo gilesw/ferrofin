@@ -749,6 +749,22 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Writes an existing row's `RunTimeTicks` — the cumulative runtime of a
+    /// music album or artist — and nothing else, when it differs. An update,
+    /// never an insert: a row deleted meanwhile stays deleted, and the other
+    /// columns keep whatever a concurrent refresh wrote. Returns whether the
+    /// row was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_run_time_ticks(&self, item_id: Uuid, ticks: i64) -> Result<bool, ServiceError> {
+        let _ = (item_id, ticks);
+        Ok(false)
+    }
+
     /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
     /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
     /// item with none is absent from the map.

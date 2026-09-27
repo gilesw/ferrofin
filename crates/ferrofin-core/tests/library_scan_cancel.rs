@@ -8,6 +8,10 @@
 //! measured, which `IsMissingMediaInfo` would then never re-probe), and a
 //! hung ffprobe cannot keep a cancelled scan alive. The next scan picks up
 //! where it stopped.
+//!
+//! The same stopping points serve the scan queue's priority lane: an item
+//! refresh waiting there runs between two closing passes too, and an item
+//! refresh runs none of the library-wide ones.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -220,11 +224,9 @@ async fn scan(
     scanner
         .scan_target(
             &ScanTarget::All,
-            ScanRun {
-                options: &options,
-                ancestors: &options,
-                cancel,
-                progress,
+            match progress {
+                Some(progress) => ScanRun::new(&options, &options, cancel).with_progress(progress),
+                None => ScanRun::new(&options, &options, cancel),
             },
         )
         .await
@@ -358,6 +360,109 @@ async fn a_cancel_between_closing_passes_skips_the_rest() {
     let outcome = scanner.scan_all().await.expect("rescan");
     assert!(!outcome.stopped);
     assert_eq!(years(&db).await, 3, "the next scan runs the passes");
+}
+
+/// An item refresh's closing passes are the touched items' only: the
+/// library-wide passes (here the years pass) never run for it; the next
+/// library scan runs them.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_runs_no_library_wide_closing_pass() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
+    let options = MetadataRefreshOptions::default();
+    let outcome = scanner
+        .scan_target(
+            &ScanTarget::Items(vec![heat.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &options, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("item refresh");
+    assert_eq!(outcome.created, 1, "{outcome:?}");
+    assert_eq!(years(&db).await, 0, "no years pass");
+
+    scanner.scan_all().await.expect("scan");
+    assert_eq!(years(&db).await, 3);
+}
+
+/// A priority lane holding one item refresh, handed out once `ready`.
+struct ReadyLane {
+    ready: std::sync::atomic::AtomicBool,
+    pending: Mutex<Option<ferrofin_core::LaneRefresh>>,
+    served: Mutex<Vec<ScanOutcome>>,
+}
+
+impl ferrofin_core::PriorityLane for ReadyLane {
+    fn next(&self) -> Option<ferrofin_core::LaneRefresh> {
+        if self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pending.lock().expect("lock").take()
+        } else {
+            None
+        }
+    }
+    fn done(
+        &self,
+        _refresh: ferrofin_core::LaneRefresh,
+        outcome: &Result<ScanOutcome, ServiceError>,
+    ) {
+        let outcome = *outcome.as_ref().expect("served refresh");
+        self.served.lock().expect("lock").push(outcome);
+    }
+}
+
+/// A refresh that arrives while the scan runs its closing passes is served
+/// between two of them — it does not wait for the rest — and the passes
+/// then go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_is_served_between_closing_passes() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let probe = HeldProbe::new();
+    probe.release.add_permits(1);
+    let (db, scanner) = movie_library(tmp.path(), &probe, Vec::new()).await;
+    let heat = tmp.path().join("movies/Heat (1995)/Heat (1995).mkv");
+    let options = MetadataRefreshOptions::default();
+    let lane = Arc::new(ReadyLane {
+        ready: std::sync::atomic::AtomicBool::new(false),
+        pending: Mutex::new(Some(ferrofin_core::LaneRefresh {
+            target: ScanTarget::Items(vec![heat.to_string_lossy().into_owned()]),
+            options: options.clone(),
+            ancestors: options.clone(),
+            passes: ferrofin_core::ScanPasses::Touched,
+            cancel: ScanCancel::new(),
+            key: 1,
+        })),
+        served: Mutex::new(Vec::new()),
+    });
+    // Ready once the first closing pass is done (past 96 %).
+    let after_first_pass = {
+        let lane = Arc::clone(&lane);
+        move |percent: f64| {
+            if percent > 96.0 {
+                lane.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    };
+    let cancel = ScanCancel::new();
+    let outcome = scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&options, &options, &cancel)
+                .with_progress(&after_first_pass)
+                .with_lane(lane.as_ref()),
+        )
+        .await
+        .expect("scan");
+    assert!(!outcome.stopped);
+    let served = lane.served.lock().expect("lock").clone();
+    assert_eq!(served.len(), 1, "served between two closing passes");
+    assert_eq!(
+        served[0].unchanged, 1,
+        "Heat was already scanned: {served:?}"
+    );
+    assert_eq!(years(&db).await, 3, "the passes went on");
 }
 
 /// PNG magic: the artwork pass stores only bytes it recognizes as an image.

@@ -529,6 +529,36 @@ fn provider_manager_locked_gates(
     assert_eq!(p.remote_images, images);
 }
 
+/// A locked item keeps its local and forced providers, so a pass that runs
+/// every provider — or one whose local change monitor fired — has
+/// providers for `BeforeMetadataRefresh` to run ahead of, though none of
+/// them reads anything for it. An unlocked item's providers are counted
+/// where they run.
+#[test]
+fn a_locked_items_local_providers_count_for_the_refill() {
+    let stored = StoredState {
+        is_locked: true,
+        ..current()
+    };
+    let folder = FileFacts {
+        probe: ProbeKind::None,
+        ..video()
+    };
+    let default = MetadataRefreshOptions::default();
+    assert!(plan(Some(&stored), &folder, &options(FullRefresh, Default)).locked_local);
+    assert!(!plan(Some(&stored), &folder, &default).locked_local);
+    let nfo = FileFacts {
+        local_metadata: Some(LocalMetadataFile {
+            mtime: now(),
+            format: LocalMetadataFormat::Nfo,
+        }),
+        ..folder
+    };
+    assert!(plan(Some(&stored), &nfo, &default).locked_local);
+    assert!(!plan(Some(&stored), &folder, &options(NoRefresh, NoRefresh)).locked_local);
+    assert!(!plan(Some(&current()), &folder, &options(FullRefresh, Default)).locked_local);
+}
+
 #[test]
 fn a_new_locked_item_still_probes() {
     let opts = MetadataRefreshOptions::default();

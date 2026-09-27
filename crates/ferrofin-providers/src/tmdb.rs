@@ -1001,6 +1001,52 @@ impl TmdbClient {
         images
     }
 
+    /// The poster and backdrop TMDB picks for the title `tmdb_id` names —
+    /// `GET /movie/{id}` or `/tv/{id}`, their `poster_path`/`backdrop_path` —
+    /// in the shape [`images_for`](Self::images_for) returns for a name
+    /// search. What the scan's image pass fetches for an item whose TMDB id
+    /// is known: upstream's `TmdbMovieImageProvider`/`TmdbSeriesImageProvider`
+    /// look an item's artwork up by its id, never by its name, so an item
+    /// identified as another title gets that title's artwork. Empty on a miss
+    /// or any failure.
+    pub async fn images_by_id(&self, kind: TmdbKind, tmdb_id: i64) -> Vec<RemoteImage> {
+        let cfg = self.settings().await;
+        let key = cfg.api_key(self.api_key.expose_secret());
+        let path = match kind {
+            TmdbKind::Movie => "movie",
+            TmdbKind::Series => "tv",
+        };
+        let Ok(resp) = self
+            .http
+            .get(format!("{}/{path}/{tmdb_id}", self.base_url))
+            .query(&[("api_key", key)])
+            .send_limited(&self.limiter)
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(hit) = resp.counted_json::<SearchHit>().await else {
+            return Vec::new();
+        };
+        let mut images = Vec::new();
+        if let Some(poster) = hit.poster_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Primary,
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Poster, &poster),
+            });
+        }
+        if let Some(backdrop) = hit.backdrop_path.filter(|p| !p.is_empty()) {
+            images.push(RemoteImage {
+                image_type: ImageType::Backdrop,
+                url: cfg.image_url(crate::plugin_config::TmdbImageKind::Backdrop, &backdrop),
+            });
+        }
+        images
+    }
+
     /// Matches a TV series by name/year and returns its TMDB id + poster/backdrop.
     ///
     /// Unlike [`images_for`](Self::images_for) this keeps the id so seasons and

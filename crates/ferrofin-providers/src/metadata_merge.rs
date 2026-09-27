@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use serde_json::{Map, Value};
 
 /// A `Data` column value's JSON object; `NULL`, empty and malformed payloads
@@ -133,39 +134,188 @@ pub fn merge_data(
 /// read failure never lets a write overwrite a field the user locked.
 pub const ALL_LOCKABLE_FIELDS: &[MetadataField] = &MetadataField::ALL;
 
-/// Puts `stored`'s value back on `row` for every field in `locked_fields`
-/// — the columns `merge_data` never touches for a locked field. For an
-/// applier that writes onto the stored row directly instead of merging (the
-/// single-item refresh until it moves onto [`merge_data`]), this gives the
-/// same result as the merge's lock check. `Cast` has no column: an applier
-/// that writes people must check it itself.
-pub fn keep_locked_fields(
-    stored: &BaseItemEntity,
-    row: &mut BaseItemEntity,
-    locked_fields: &[MetadataField],
-) {
-    for field in locked_fields {
-        match field {
-            MetadataField::Name => {
-                row.name.clone_from(&stored.name);
-                // The sort key is derived from the name.
-                row.sort_name.clone_from(&stored.sort_name);
-            }
-            MetadataField::Genres => row.genres.clone_from(&stored.genres),
-            MetadataField::OfficialRating => {
-                row.official_rating.clone_from(&stored.official_rating);
-            }
-            MetadataField::Overview => row.overview.clone_from(&stored.overview),
-            MetadataField::Runtime => row.run_time_ticks = stored.run_time_ticks,
-            MetadataField::Studios => row.studios.clone_from(&stored.studios),
-            MetadataField::Tags => row.tags.clone_from(&stored.tags),
-            MetadataField::ProductionLocations => {
-                row.production_locations
-                    .clone_from(&stored.production_locations);
-            }
-            MetadataField::Cast => {}
+/// What one refresh pass's providers did, as the merge of
+/// `RefreshWithProviders` (`MetadataService.cs:895-917`) reads it.
+// Independent facts about the pass, each read by its own rule.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshAnswers {
+    /// `refreshResult.UpdateType > None`: a pre-refresh custom provider (the
+    /// probe), a local reader or a remote provider returned something.
+    pub any: bool,
+    /// `refreshResult.Failures > 0`: a provider failed.
+    pub failed: bool,
+    /// `hasRemoteMetadata`: a remote provider answered with metadata.
+    pub remote: bool,
+    /// `isLocalLocked`: the local metadata carried `<lockdata>`.
+    pub local_locked: bool,
+}
+
+/// The two `MergeData` calls `RefreshWithProviders` makes with a pass's
+/// provider result (`MetadataService.cs:895-917`): whether the stored values
+/// fill the result first, and whether the result then replaces the stored
+/// values or only fills what they lack. The library scan and the single-item
+/// refresh both merge by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshMerge {
+    /// "Add existing metadata to provider result if it does not exist
+    /// there": the stored values fill the provider result before it is
+    /// merged back. Off for `RemoveOldMetadata`, unless a provider failed and
+    /// no remote provider answered (erasing is only safe when something
+    /// replaces the old values) — and never off when nothing answered, where
+    /// upstream merges nothing at all, so the row stays as it was.
+    pub keep_existing: bool,
+    /// `shouldReplace` (or `isLocalLocked`): the provider result replaces the
+    /// stored values. Off for "Search for missing metadata" (`FullRefresh`
+    /// without `ReplaceAllMetadata`), where it only fills what is empty.
+    pub replace: bool,
+}
+
+impl RefreshMerge {
+    /// The Default refresh ("Scan for new and updated files"): the provider
+    /// result replaces, the stored values fill what it lacks.
+    pub const DEFAULT: Self = Self {
+        keep_existing: true,
+        replace: true,
+    };
+
+    /// The merge a pass refreshing with `options` runs, given what its
+    /// providers did.
+    #[must_use]
+    pub fn of(options: &MetadataRefreshOptions, answers: RefreshAnswers) -> Self {
+        let mode = options.metadata_refresh_mode;
+        let fetches = matches!(
+            mode,
+            MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+        );
+        Self {
+            keep_existing: !options.remove_old_metadata
+                || !answers.any
+                || (answers.failed && !answers.remote),
+            replace: answers.local_locked
+                || (fetches && options.replace_all_metadata)
+                || (mode == MetadataRefreshMode::Default && !options.replace_all_metadata),
         }
     }
+}
+
+/// `RefreshWithProviders`' merge of a pass's provider result `temp` onto the
+/// `stored` item, by `merge`: the stored values fill `temp` first when
+/// `merge.keep_existing` (`MergeData(metadata, temp, [], false, false)`),
+/// then `temp` is merged onto the stored item with its `locked_fields`
+/// (`MergeData(temp, metadata, item.LockedFields, shouldReplace, true)`).
+///
+/// `temp` is what the providers returned, starting from what upstream's
+/// `temp` starts with (the item's `ParentIndexNumber` and preferred metadata
+/// language and country, `:790-795`) where the caller has them.
+#[must_use]
+pub fn merge_refresh(
+    stored: &MetadataResult,
+    mut temp: MetadataResult,
+    locked_fields: &[MetadataField],
+    merge: RefreshMerge,
+) -> MetadataResult {
+    if merge.keep_existing {
+        merge_data(stored, &mut temp, &[], false, false);
+    }
+    let mut target = stored.clone();
+    merge_data(&temp, &mut target, locked_fields, merge.replace, true);
+    target
+}
+
+/// `BaseItem.SortName` as upstream saves it (`BaseItem.cs:540-561`,
+/// `AfterMetadataRefresh` resetting the cache): the `ForcedSortName`'s key
+/// when there is one, else the per-kind `CreateSortName` of the saved name —
+/// derived last, so an episode's or track's key embeds its final numbers.
+/// Upstream persists no other explicit sort key. Every refresh settles the
+/// row it saves with it, so a row the library scan saves and one the
+/// single-item refresh saves carry the same key.
+pub fn settle_sort_name(row: &mut BaseItemEntity) {
+    if let Some(forced) = row.forced_sort_name.clone().filter(|f| !f.is_empty()) {
+        row.sort_name = Some(forced_sort_name(row, &forced));
+    } else if let Some(name) = row.name.clone() {
+        row.sort_name = Some(derived_sort_name(row, &name));
+    }
+}
+
+/// `EnableAlphaNumericSorting` (`BaseItem.cs`, overridden to `false` by
+/// `Person.cs` only): whether `CreateSortName` runs the alphanumeric
+/// pipeline, or keeps the name verbatim apart from `TrimStart()`.
+fn alpha_numeric_sorting(kind: Option<BaseItemKind>) -> bool {
+    kind != Some(BaseItemKind::Person)
+}
+
+/// The `SortName` a non-empty `ForcedSortName` yields for `entity` — 12.0's
+/// `GetSortName(ForcedSortName, EnableAlphaNumericSorting, config)`, so a
+/// `Person` keeps it verbatim and every other kind cleans it like a derived
+/// key. The per-kind `CreateSortName` overrides in [`derived_sort_name`] do not
+/// apply to the forced branch.
+#[must_use]
+pub fn forced_sort_name(entity: &BaseItemEntity, forced: &str) -> String {
+    let kind = BaseItemKind::from_stored_type_name(&entity.type_);
+    ferrofin_util::sort_name::get_sort_name(forced, alpha_numeric_sorting(kind))
+}
+
+/// The sort name a row derives from `title`, honouring the per-kind
+/// `CreateSortName` overrides (episodes and seasons sort by number, tracks by
+/// disc and track number, a person by the name verbatim, everything else by
+/// the name pipeline).
+#[must_use]
+pub fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
+    match entity.type_.rsplit('.').next().unwrap_or(&entity.type_) {
+        "Episode" => episode_sort_name(entity.parent_index_number, entity.index_number, title),
+        "Season" => season_sort_name(entity.index_number, title),
+        "Audio" | "AudioBook" => {
+            audio_sort_name(entity.parent_index_number, entity.index_number, title)
+        }
+        _ => ferrofin_util::sort_name::get_sort_name(
+            title,
+            alpha_numeric_sorting(BaseItemKind::from_stored_type_name(&entity.type_)),
+        ),
+    }
+}
+
+/// Port of C# `Episode.CreateSortName`: the zero-padded season/episode numbers
+/// ahead of the title (`001 - 0004 - The Title`).
+///
+/// This override REPLACES the generic name-derived sort name — an episode must
+/// sort by its position in the season, never alphabetically by title. Clients
+/// build their play queue from the season's episodes in `SortName` order, so a
+/// title-derived sort name scrambles the queue: "next episode" points at the
+/// wrong item, and at the alphabetically-last episode there is no next at all
+/// (a dead Next button and no autoplay).
+#[must_use]
+pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
+    let season = parent_index.map_or_else(String::new, |n| format!("{n:03} - "));
+    let episode = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    format!("{season}{episode}{name}")
+}
+
+/// Port of C# `Season.CreateSortName`: the zero-padded season number, or the
+/// name when the season has no number (so `Specials` (0000) sorts first).
+#[must_use]
+pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
+    index.map_or_else(
+        || ferrofin_util::sort_name::create_sort_name(name),
+        |n| format!("{n:04}"),
+    )
+}
+
+/// Port of C# `Audio.CreateSortName` (v10.11.8
+/// `MediaBrowser.Controller/Entities/Audio/Audio.cs`):
+/// `ParentIndexNumber.ToString("0000 - ") + IndexNumber.ToString("0000 - ") + Name`,
+/// each prefix omitted when its number is absent, and the **raw** name appended
+/// — `Audio` overrides `CreateSortName` outright, so the alphanumeric
+/// lowercase/pad pipeline never runs on a track.
+///
+/// A track stored with the alphanumeric key instead sorts in a different place
+/// than Jellyfin puts it, which reorders every album and every search-hint page
+/// that contains one.
+#[must_use]
+pub fn audio_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
+    let disc = parent_index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let track = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    format!("{disc}{track}{name}")
 }
 
 /// Whether a string field is empty in upstream's `string.IsNullOrEmpty`
@@ -702,6 +852,40 @@ pub fn merge_provider_ids(
         }
     }
     out.retain(|(k, v)| is_valid_provider_id(k, v));
+    out
+}
+
+/// `ProviderIdsExtensions.SetProviderIds` (`ProviderIdsExtensions.cs:
+/// 227-241`): the id set `ids` becomes, each pair through `TrySetProviderId`
+/// (`:155-189`) — a blank name or value, or a name holding `=` (it could not
+/// be read back from the database), is dropped; name and value are trimmed;
+/// an id that cannot belong to its provider ([`is_valid_provider_id`]) is
+/// dropped; a known provider's name takes its canonical spelling
+/// (`MetadataProvider`); a later pair for the same name (ignoring case)
+/// replaces an earlier one.
+#[must_use]
+pub fn set_provider_ids<'a>(
+    ids: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in ids {
+        if name.trim().is_empty() || value.trim().is_empty() || name.contains('=') {
+            continue;
+        }
+        let (name, value) = (name.trim(), value.trim());
+        if !is_valid_provider_id(name, value) {
+            continue;
+        }
+        let name = ferrofin_model::entities_media::MetadataProvider::all()
+            .iter()
+            .map(|p| p.as_name())
+            .find(|known| known.eq_ignore_ascii_case(name))
+            .unwrap_or(name);
+        match out.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+            Some(existing) => value.clone_into(&mut existing.1),
+            None => out.push((name.to_owned(), value.to_owned())),
+        }
+    }
     out
 }
 

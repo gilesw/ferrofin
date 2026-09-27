@@ -24,6 +24,11 @@
 //! three choices, `ValidationOnly`, `None`): which providers run, how their
 //! answer merges onto a stored row carrying an edited and an empty field, and
 //! what is stamped and saved.
+//!
+//! And Phase 5b: a file item's `POST /Items/{id}/Refresh` is the scan of its
+//! own path — the same decision, merge, locks, probe, NFO and providers,
+//! touching nothing else of its library — and "Identify → Apply" is that
+//! scan with the chosen result pinning the lookup and the NFO skipped.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -219,10 +224,25 @@ impl Tmdb {
                         r#"{"results": [{"id": 603, "title": "The Matrix"}]}"#
                     };
                     ("200 OK", hit.to_owned())
+                } else if line.contains("/find/tt0113277") {
+                    (
+                        "200 OK",
+                        r#"{"movie_results": [{"id": 949}], "tv_results": []}"#.to_owned(),
+                    )
                 } else if line.contains("/movie/603?") {
                     ("200 OK", details_json("The Matrix"))
                 } else if line.contains("/movie/949?") {
                     ("200 OK", details_json("Heat"))
+                } else if line.contains("/movie/111?") {
+                    // A record with no release date (and a trailer, so no
+                    // backfill asks again on its own).
+                    (
+                        "200 OK",
+                        r#"{"title": "Nameless", "overview": "About Nameless.",
+                            "videos": {"results": [{"site": "YouTube", "type": "Trailer",
+                                "key": "kNameless", "name": "Trailer"}]}}"#
+                            .to_owned(),
+                    )
                 } else {
                     ("404 Not Found", "{}".to_owned())
                 };
@@ -1522,4 +1542,888 @@ async fn replace_all_metadata_keeps_the_row_when_every_provider_failed() {
         (Some("Kept".into()), Some(8.0), Some("Kept tagline".into()))
     );
     assert_eq!(fx.stamps(&fx.heat).await.1, stamped, "not stamped");
+}
+
+/// `POST /Items/{id}/Refresh` on a file item, as the library manager queues
+/// it (`ScanRequest::item_refresh`): the scan of the item itself with the
+/// request's options, the folders above it carried along with `None`/`None`,
+/// no pruning and only the touched items' closing passes.
+async fn refresh_item(fx: &Fixture, path: &Path, options: &MetadataRefreshOptions) -> ScanOutcome {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Items(vec![path.to_string_lossy().into_owned()]),
+            ScanRun::new(options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("item refresh")
+}
+
+/// An item's own refresh removes nothing (upstream's `RefreshSingleItem`
+/// deletes no item): with its file gone, the row — and the user data on it —
+/// stays for the library scan or a folder refresh, which do remove it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_removes_nothing() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    std::fs::remove_file(&fx.heat).expect("rm");
+    let options = item_refresh(MetadataRefreshMode::Default, false);
+    let outcome = refresh_item(&fx, &fx.heat, &options).await;
+    assert_eq!(
+        outcome,
+        ScanOutcome::default(),
+        "nothing planned, nothing removed"
+    );
+    assert!(
+        fx.stamps(&fx.heat).await.1.is_some(),
+        "the row is still there"
+    );
+
+    let folder = fx
+        .heat
+        .parent()
+        .expect("dir")
+        .to_string_lossy()
+        .into_owned();
+    let outcome = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![folder]),
+            ScanRun::new(&options, &options, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("folder refresh");
+    assert_eq!(outcome.removed, 1, "a folder refresh prunes: {outcome:?}");
+}
+
+/// A file item's "Scan for new and updated files" refresh of an unchanged
+/// item is quiet — no provider, no probe, no write — and plans nothing but
+/// that item.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_item_refresh_of_an_unchanged_item_is_quiet() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let before = edited_fields(&fx, &fx.matrix).await;
+    assert_eq!(
+        refresh_item(
+            &fx,
+            &fx.matrix,
+            &item_refresh(MetadataRefreshMode::Default, false)
+        )
+        .await,
+        ScanOutcome {
+            unchanged: 1,
+            ..ScanOutcome::default()
+        },
+        "only the item is planned"
+    );
+    assert!(fx.tmdb.take().is_empty());
+    assert!(fx.probe.take().is_empty());
+    assert!(fx.writes().await.is_empty());
+    assert_eq!(edited_fields(&fx, &fx.matrix).await, before);
+}
+
+/// A file item's "Search for missing metadata": its providers and its probe
+/// run (upstream probes inside `RefreshMetadata`, so the handler's separate
+/// re-probe is gone), the answer fills only the emptied rating, the edits
+/// stay, the item is saved and stamped — and nothing else of the library is
+/// asked about or written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_searching_for_missing_metadata_fills_gaps_keeps_edits_and_probes() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let stamped = fx.stamps(&fx.matrix).await.1;
+    let heat = fx.stamps(&fx.heat).await;
+
+    let outcome = refresh_item(
+        &fx,
+        &fx.matrix,
+        &item_refresh(MetadataRefreshMode::FullRefresh, false),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ScanOutcome {
+            updated: 1,
+            ..ScanOutcome::default()
+        }
+    );
+    let asked = fx.tmdb.take();
+    assert!(asked.iter().any(|l| l.contains("/movie/603?")), "{asked:?}");
+    assert!(
+        asked
+            .iter()
+            .all(|l| !l.contains("Heat") && !l.contains("/949")),
+        "nothing about another item: {asked:?}"
+    );
+    assert_eq!(fx.probe.take(), ["The Matrix (1999).mkv"]);
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (
+            Some("My overview".into()),
+            Some(8.0),
+            Some("My tagline".into())
+        )
+    );
+    assert_ne!(fx.stamps(&fx.matrix).await.1, stamped, "stamped");
+    assert_eq!(fx.stamps(&fx.heat).await, heat, "the sibling is untouched");
+}
+
+/// A file item's "Replace all metadata": TMDB's answer replaces the edited
+/// overview and clears the tagline nothing re-supplied — except a locked
+/// field, which keeps the user's value.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_replacing_all_metadata_replaces_but_keeps_locked_fields() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let replace = item_refresh(MetadataRefreshMode::FullRefresh, true);
+    assert_eq!(refresh_item(&fx, &fx.matrix, &replace).await.updated, 1);
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (Some("About The Matrix.".into()), Some(8.0), None)
+    );
+
+    // `MetadataField.Overview = 6`.
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (6, ?1)"#)
+        .bind(Fixture::id(&fx.matrix))
+        .execute(fx.db.writer())
+        .await
+        .expect("lock overview");
+    fx.set(&fx.matrix, "Overview", Some("My overview".into()))
+        .await;
+    fx.set(&fx.matrix, "Tagline", Some("My tagline".into()))
+        .await;
+    assert_eq!(refresh_item(&fx, &fx.matrix, &replace).await.updated, 1);
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (Some("My overview".into()), Some(8.0), None),
+        "the locked overview is kept; the rest is replaced"
+    );
+}
+
+/// A file item's "Replace all metadata" whose provider fails keeps the
+/// stored row (erasing is only safe when something replaces it) and is not
+/// stamped, so it is retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_replacing_all_keeps_the_row_nothing_answered_for() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    fx.set(&fx.heat, "Overview", Some("Kept".into())).await;
+    fx.set(&fx.heat, "Tagline", Some("Kept tagline".into()))
+        .await;
+    let stamped = fx.stamps(&fx.heat).await.1;
+    fx.tmdb.answer_heat(Answer::Fail);
+
+    refresh_item(
+        &fx,
+        &fx.heat,
+        &item_refresh(MetadataRefreshMode::FullRefresh, true),
+    )
+    .await;
+    assert_eq!(
+        edited_fields(&fx, &fx.heat).await,
+        (Some("Kept".into()), Some(8.0), Some("Kept tagline".into()))
+    );
+    assert_eq!(fx.stamps(&fx.heat).await.1, stamped, "not stamped");
+}
+
+/// A file item's refresh reads its NFO — the single-item refresh never did
+/// (it was TMDB-only): a Default refresh reads an NFO written since the last
+/// save (`BaseNfoProvider.HasChanged`) and its values replace the stored
+/// ones, with no remote provider asked; a full refresh reads it as well.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_reads_the_items_nfo() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    std::fs::write(
+        fx.matrix.with_extension("nfo"),
+        "<movie><title>The Matrix</title><plot>From the NFO.</plot><mpaa>R</mpaa></movie>",
+    )
+    .expect("nfo");
+    // The last save an hour ago: the NFO is newer by more than a minute.
+    let an_hour_ago = db_time(chrono::Utc::now() - chrono::TimeDelta::hours(1));
+    fx.set(&fx.matrix, "DateLastSaved", Some(an_hour_ago)).await;
+
+    let outcome = refresh_item(
+        &fx,
+        &fx.matrix,
+        &item_refresh(MetadataRefreshMode::Default, false),
+    )
+    .await;
+    assert_eq!(outcome.updated, 1);
+    assert!(fx.tmdb.take().is_empty(), "local metadata only");
+    let row: (Option<String>, Option<String>) =
+        sqlx::query_as(r#"SELECT "Overview", "OfficialRating" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(Fixture::id(&fx.matrix))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("row");
+    assert_eq!(row, (Some("From the NFO.".into()), Some("R".into())));
+
+    fx.set(&fx.matrix, "OfficialRating", None).await;
+    refresh_item(
+        &fx,
+        &fx.matrix,
+        &item_refresh(MetadataRefreshMode::FullRefresh, false),
+    )
+    .await;
+    let rating: Option<String> =
+        sqlx::query_scalar(r#"SELECT "OfficialRating" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(Fixture::id(&fx.matrix))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("row");
+    assert_eq!(rating.as_deref(), Some("R"), "the full refresh read it too");
+}
+
+/// The options `POST /Items/RemoteSearch/Apply/{id}` refreshes with for
+/// `result`.
+fn apply(result: ferrofin_model::providers::RemoteSearchResult) -> MetadataRefreshOptions {
+    MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        replace_all_images: true,
+        search_result: Some(result),
+        remove_old_metadata: true,
+        ..MetadataRefreshOptions::default()
+    }
+}
+
+/// The item's stored provider ids.
+async fn provider_ids(fx: &Fixture, path: &Path) -> Vec<(String, String)> {
+    sqlx::query_as(
+        r#"SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders" WHERE "ItemId" = ?1
+             ORDER BY "ProviderId""#,
+    )
+    .bind(Fixture::id(path))
+    .fetch_all(fx.db.pool())
+    .await
+    .expect("ids")
+}
+
+/// "Identify → Apply" through the scan of the item's path: the chosen TMDB
+/// id is fetched directly (no search by the item's own name, no id it
+/// carried before), the NFO beside it is not read ("Do not execute local
+/// providers if we are identifying"), the answer replaces the row and
+/// clears what it did not supply, a locked field keeps the user's value, and
+/// the item ends up carrying the chosen id.
+#[tokio::test(flavor = "multi_thread")]
+async fn identify_pins_the_chosen_id_skips_the_nfo_and_keeps_locked_fields() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    std::fs::write(
+        fx.matrix.with_extension("nfo"),
+        "<movie><title>The Matrix</title><plot>From the NFO.</plot><mpaa>R</mpaa>\
+         <tmdbid>603</tmdbid></movie>",
+    )
+    .expect("nfo");
+    // `MetadataField.Tags = 5` is not the one locked; `Overview = 6` is.
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (6, ?1)"#)
+        .bind(Fixture::id(&fx.matrix))
+        .execute(fx.db.writer())
+        .await
+        .expect("lock overview");
+
+    let chosen = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Heat".into()),
+        production_year: Some(1995),
+        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "949".to_owned())])),
+        search_provider_name: Some("TheMovieDb".into()),
+        ..Default::default()
+    };
+    let outcome = refresh_item(&fx, &fx.matrix, &apply(chosen)).await;
+    assert_eq!(outcome.updated, 1);
+    let asked = fx.tmdb.take();
+    assert!(asked.iter().any(|l| l.contains("/movie/949?")), "{asked:?}");
+    assert!(
+        asked
+            .iter()
+            .all(|l| !l.contains("/search/") && !l.contains("/movie/603")),
+        "the chosen id is fetched, never the old one or a search: {asked:?}"
+    );
+    let row: (Option<String>, Option<f64>, Option<String>, Option<String>) = sqlx::query_as(
+        r#"SELECT "Overview", "CommunityRating", "Tagline", "OfficialRating"
+             FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(Fixture::id(&fx.matrix))
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("row");
+    assert_eq!(
+        row,
+        (Some("My overview".into()), Some(8.0), None, None),
+        "locked overview kept; the rest replaced; no NFO value"
+    );
+    assert_eq!(
+        provider_ids(&fx, &fx.matrix).await,
+        [("Tmdb".to_owned(), "949".to_owned())],
+        "the chosen ids replaced the old ones with the refresh's save"
+    );
+}
+
+/// An Identify result that carries only an IMDb id (OMDb's) is resolved by
+/// TMDB through `/find` (`TmdbMovieProvider.GetMetadata`) rather than by a
+/// search on the item's name.
+#[tokio::test(flavor = "multi_thread")]
+async fn identify_with_an_imdb_id_resolves_through_tmdb_find() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let chosen = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Heat".into()),
+        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0113277".to_owned())])),
+        search_provider_name: Some("The Open Movie Database".into()),
+        ..Default::default()
+    };
+    refresh_item(&fx, &fx.matrix, &apply(chosen)).await;
+    let asked = fx.tmdb.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0113277")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await.0.as_deref(),
+        Some("About Heat.")
+    );
+}
+
+/// One of the fixture's two movies, as the other one is identified as.
+#[derive(Clone, Copy)]
+struct Title {
+    tmdb: &'static str,
+    name: &'static str,
+    year: i32,
+}
+
+const MATRIX: Title = Title {
+    tmdb: "603",
+    name: "The Matrix",
+    year: 1999,
+};
+const HEAT: Title = Title {
+    tmdb: "949",
+    name: "Heat",
+    year: 1995,
+};
+
+/// The options "Identify → Apply" refreshes with when `title` is chosen.
+fn identify_as(title: Title) -> MetadataRefreshOptions {
+    apply(ferrofin_model::providers::RemoteSearchResult {
+        name: Some(title.name.into()),
+        production_year: Some(title.year),
+        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), title.tmdb.to_owned())])),
+        search_provider_name: Some("TheMovieDb".into()),
+        ..Default::default()
+    })
+}
+
+/// A [`PriorityLane`] that, once the scan it is served by has fetched the
+/// first of the fixture's movies from TMDB, hands out one "Identify →
+/// Apply" of the *other* movie — the one the scan has read but not reached
+/// yet — as the first one, recording which it picked and how it ended.
+struct IdentifyTheOther {
+    requests: Arc<Mutex<Vec<String>>>,
+    paths: [(PathBuf, Title); 2],
+    picked: Mutex<Option<(PathBuf, Title)>>,
+    served: Mutex<Vec<Result<ScanOutcome, String>>>,
+}
+
+impl IdentifyTheOther {
+    fn new(fx: &Fixture) -> Self {
+        Self {
+            requests: Arc::clone(&fx.tmdb.requests),
+            paths: [(fx.matrix.clone(), MATRIX), (fx.heat.clone(), HEAT)],
+            picked: Mutex::new(None),
+            served: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The movie identified, and the title it was identified as.
+    fn picked(&self) -> (PathBuf, Title) {
+        self.picked
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("an Apply was served")
+    }
+}
+
+impl ferrofin_core::PriorityLane for IdentifyTheOther {
+    fn next(&self) -> Option<ferrofin_core::LaneRefresh> {
+        let mut picked = self.picked.lock().expect("lock");
+        if picked.is_some() {
+            return None;
+        }
+        let fetched = |t: Title| {
+            let details = format!("/movie/{}?", t.tmdb);
+            self.requests
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|l| l.contains(&details))
+        };
+        let [(matrix, _), (heat, _)] = &self.paths;
+        let (path, title) = if fetched(MATRIX) {
+            (heat.clone(), MATRIX)
+        } else if fetched(HEAT) {
+            (matrix.clone(), HEAT)
+        } else {
+            return None;
+        };
+        *picked = Some((path.clone(), title));
+        let none = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        };
+        Some(ferrofin_core::LaneRefresh {
+            target: ferrofin_traits::library::ScanTarget::Items(vec![
+                path.to_string_lossy().into_owned(),
+            ]),
+            options: identify_as(title),
+            ancestors: none,
+            passes: ferrofin_core::ScanPasses::Touched,
+            cancel: ferrofin_core::ScanCancel::new(),
+            key: 1,
+        })
+    }
+    fn done(
+        &self,
+        _refresh: ferrofin_core::LaneRefresh,
+        outcome: &Result<ScanOutcome, ServiceError>,
+    ) {
+        let outcome = outcome.as_ref().copied().map_err(ToString::to_string);
+        self.served.lock().expect("lock").push(outcome);
+    }
+}
+
+/// Runs a library scan with `options` that serves `lane` between its items.
+async fn scan_serving(
+    fx: &Fixture,
+    options: &MetadataRefreshOptions,
+    lane: &IdentifyTheOther,
+) -> ScanOutcome {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ferrofin_traits::library::ScanTarget::All,
+            ScanRun::new(options, options, &cancel).with_lane(lane),
+        )
+        .await
+        .expect("scan")
+}
+
+/// The identified movie carries the chosen title's id and record.
+async fn assert_identified(fx: &Fixture, lane: &IdentifyTheOther) {
+    let (path, title) = lane.picked();
+    assert_eq!(
+        provider_ids(fx, &path).await,
+        [("Tmdb".to_owned(), title.tmdb.to_owned())],
+        "{} keeps the chosen id",
+        path.display()
+    );
+    assert_eq!(
+        edited_fields(fx, &path).await.0,
+        Some(format!("About {}.", title.name)),
+        "{} keeps the chosen record",
+        path.display()
+    );
+}
+
+/// An Apply served inside a library's first scan, after that scan read the
+/// second movie as new (no row) and before it reached it: the scan reads
+/// the row the Apply wrote before going on, so it neither looks the movie
+/// up by its own name nor saves its first-scan answer over the identified
+/// one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apply_served_inside_a_first_scan_survives_the_rest_of_it() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), 0).await;
+    let lane = IdentifyTheOther::new(&fx);
+    let outcome = scan_serving(&fx, &MetadataRefreshOptions::default(), &lane).await;
+    let served = lane.served.lock().expect("lock").clone();
+    assert_eq!(served.len(), 1, "served inside the scan");
+    assert_eq!(
+        served[0].as_ref().expect("apply").created,
+        1,
+        "served before the scan reached the movie"
+    );
+    assert_eq!(outcome.created, 1, "the scan created only the other one");
+    let (path, _) = lane.picked();
+    let own_name = if path == fx.heat { "Heat" } else { "Matrix" };
+    let asked = fx.tmdb.take();
+    let searches: Vec<&String> = asked.iter().filter(|l| l.contains("/search/")).collect();
+    assert_eq!(
+        searches.len(),
+        1,
+        "one search, for the scanned movie: {asked:?}"
+    );
+    assert!(
+        !searches[0].contains(own_name),
+        "the identified movie was never searched by its own name: {asked:?}"
+    );
+    assert_identified(&fx, &lane).await;
+}
+
+/// An Apply served inside a "Replace all metadata" library scan, after that
+/// scan read the second movie's row and ids and before it reached it: the
+/// scan refreshes that movie by the ids now stored, so the identified ids
+/// and record survive it, and its old id is never fetched again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_apply_served_inside_a_replace_all_scan_survives_the_rest_of_it() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let lane = IdentifyTheOther::new(&fx);
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        ..MetadataRefreshOptions::default()
+    };
+    scan_serving(&fx, &replace_all, &lane).await;
+    assert_eq!(lane.served.lock().expect("lock").len(), 1);
+    let (_, title) = lane.picked();
+    // Its old id is the other title's, which nothing in this scan fetches
+    // but a save of what the scan read before the Apply.
+    let old = if title.tmdb == MATRIX.tmdb {
+        HEAT
+    } else {
+        MATRIX
+    };
+    let asked = fx.tmdb.take();
+    let details = format!("/movie/{}?", old.tmdb);
+    assert!(
+        asked.iter().all(|l| !l.contains(&details)),
+        "the old id is never fetched again: {asked:?}"
+    );
+    assert_identified(&fx, &lane).await;
+}
+
+/// A TMDB stand-in for one show folder that two TMDB shows could be: the
+/// search finds 100 ("Wrong Show", episodes `W1`…), 200 is "Right Show"
+/// (episodes `R1`…). Records each request line.
+fn spawn_two_shows_tmdb() -> (String, Arc<Mutex<Vec<String>>>) {
+    fn season(prefix: &str) -> String {
+        let episodes: Vec<String> = (1..=3)
+            .map(|n| {
+                format!(
+                    r#"{{"id": {n}, "episode_number": {n}, "name": "{prefix}{n}",
+                        "overview": "{prefix}{n} overview.", "air_date": "2001-01-0{n}"}}"#
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"name": "Season 1", "overview": "{prefix} season.", "episodes": [{}]}}"#,
+            episodes.join(",")
+        )
+    }
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let log = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line = req.lines().next().unwrap_or_default().to_owned();
+            log.lock().expect("lock").push(line.clone());
+            let (status, payload) = if line.contains("/credits") {
+                (
+                    "200 OK",
+                    r#"{"cast": [], "crew": [], "guest_stars": []}"#.to_owned(),
+                )
+            } else if line.contains("/search/tv") {
+                (
+                    "200 OK",
+                    r#"{"results": [{"id": 100, "name": "Wrong Show"}]}"#.to_owned(),
+                )
+            } else if line.contains("/tv/100/season/1?") {
+                ("200 OK", season("W"))
+            } else if line.contains("/tv/200/season/1?") {
+                ("200 OK", season("R"))
+            } else if line.contains("/tv/100?") {
+                (
+                    "200 OK",
+                    r#"{"name": "Wrong Show", "overview": "About Wrong."}"#.to_owned(),
+                )
+            } else if line.contains("/tv/200?") {
+                (
+                    "200 OK",
+                    r#"{"name": "Right Show", "overview": "About Right."}"#.to_owned(),
+                )
+            } else {
+                ("404 Not Found", "{}".to_owned())
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+/// A lane holding one refresh, handed out once `ready` says so.
+struct ReadyWhen {
+    ready: Box<dyn Fn() -> bool + Send + Sync>,
+    pending: Mutex<Option<ferrofin_core::LaneRefresh>>,
+    served: Mutex<Vec<Result<ScanOutcome, String>>>,
+}
+
+impl ferrofin_core::PriorityLane for ReadyWhen {
+    fn next(&self) -> Option<ferrofin_core::LaneRefresh> {
+        if (self.ready)() {
+            self.pending.lock().expect("lock").take()
+        } else {
+            None
+        }
+    }
+    fn done(
+        &self,
+        _refresh: ferrofin_core::LaneRefresh,
+        outcome: &Result<ScanOutcome, ServiceError>,
+    ) {
+        let outcome = outcome.as_ref().copied().map_err(ToString::to_string);
+        self.served.lock().expect("lock").push(outcome);
+    }
+}
+
+/// A TV library of one show folder (three episodes) over the two-shows
+/// TMDB stand-in, scanned once: `(db, scanner, show folder, requests)`.
+async fn two_shows_library(
+    tmp: &Path,
+) -> (Database, LibraryScanner, PathBuf, Arc<Mutex<Vec<String>>>) {
+    let shows = tmp.join("shows");
+    let show = shows.join("Show");
+    for n in 1..=3 {
+        let file = show.join("Season 1").join(format!("Show S01E0{n}.mkv"));
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("mkdir");
+        std::fs::write(&file, b"0123456789").expect("write");
+    }
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.join("views")).with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "Shows",
+        Some(CollectionTypeOptions::tvshows),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: shows.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("add library");
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let (base, requests) = spawn_two_shows_tmdb();
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_items(items)
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.join("metadata"),
+        )
+        .with_progress_every(0);
+    scanner.scan_all().await.expect("first scan");
+    (db, scanner, show, requests)
+}
+
+/// An Identify of a series served inside a "Replace all metadata" scan,
+/// after that scan fetched the season of the show it had matched before:
+/// the episodes it reaches afterwards take the identified show's names —
+/// the scan drops the season details it cached for the series along with
+/// its match, instead of mixing the old show's episodes in.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identified_series_episodes_never_take_the_old_shows_season() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (db, scanner, show, requests) = two_shows_library(tmp.path()).await;
+    let names = |db: Database| async move {
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+            r#"SELECT "Name" FROM "BaseItems" WHERE "Type" LIKE '%TV.Episode'
+                 ORDER BY "IndexNumber""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("episodes");
+        rows.into_iter()
+            .map(|(n,)| n.unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(db.clone()).await, ["W1", "W2", "W3"]);
+    requests.lock().expect("lock").clear();
+
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let right = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Right Show".into()),
+        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "200".to_owned())])),
+        search_provider_name: Some("TheMovieDb".into()),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&requests);
+    let lane = ReadyWhen {
+        // The scan has fetched the old show's season: it is cached now.
+        ready: Box::new(move || {
+            seen.lock()
+                .expect("lock")
+                .iter()
+                .any(|l| l.contains("/tv/100/season/1?"))
+        }),
+        pending: Mutex::new(Some(ferrofin_core::LaneRefresh {
+            target: ScanTarget::Paths(vec![show.to_string_lossy().into_owned()]),
+            options: apply(right),
+            ancestors: none,
+            passes: ferrofin_core::ScanPasses::Touched,
+            cancel: ScanCancel::new(),
+            key: 1,
+        })),
+        served: Mutex::new(Vec::new()),
+    };
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&replace_all, &replace_all, &cancel).with_lane(&lane),
+        )
+        .await
+        .expect("scan");
+    let served = lane.served.lock().expect("lock").clone();
+    assert_eq!(served.len(), 1, "served inside the scan");
+    assert!(served[0].is_ok(), "{served:?}");
+    assert_eq!(
+        names(db.clone()).await,
+        ["R1", "R2", "R3"],
+        "every episode is the identified show's: {:?}",
+        requests.lock().expect("lock")
+    );
+}
+
+/// A movie row's stored `ProductionYear`.
+async fn year(fx: &Fixture, path: &Path) -> Option<i64> {
+    sqlx::query_scalar(r#"SELECT "ProductionYear" FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(Fixture::id(path))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("row")
+}
+
+/// A movie's year the user cleared comes back from its path only on a pass
+/// that runs `BeforeMetadataRefresh` — one with providers to run (here the
+/// probe of a file that changed; TMDB fails, so it supplies no year) — and
+/// then from its folder's name, as upstream's `Movie.BeforeMetadataRefresh`
+/// derives it. A Default rescan with nothing to run writes nothing back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cleared_movie_year_refills_only_on_a_pass_that_runs_providers() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    assert_eq!(year(&fx, &fx.heat).await, Some(1999), "TMDB's release date");
+    fx.set(&fx.heat, "ProductionYear", None).await;
+
+    fx.scan().await;
+    assert_eq!(year(&fx, &fx.heat).await, None);
+    assert!(fx.writes().await.is_empty(), "nothing written back");
+
+    fx.tmdb.answer_heat(Answer::Fail);
+    touch(&fx.heat, 120);
+    fx.scan().await;
+    assert_eq!(
+        year(&fx, &fx.heat).await,
+        Some(1995),
+        "the year in the folder's name"
+    );
+}
+
+/// "Identify → Apply" with a record that has no year clears the year
+/// (`RemoveOldMetadata`); a Default rescan with nothing to run leaves it
+/// cleared, and the next pass that runs providers derives it from the
+/// folder's name again, as upstream does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identify_that_clears_the_year_holds_through_a_quiet_rescan() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    let nameless = ferrofin_model::providers::RemoteSearchResult {
+        name: Some("Nameless".into()),
+        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "111".to_owned())])),
+        search_provider_name: Some("TheMovieDb".into()),
+        ..Default::default()
+    };
+    refresh_item(&fx, &fx.matrix, &apply(nameless)).await;
+    assert_eq!(year(&fx, &fx.matrix).await, None, "the record has no year");
+    let _ = fx.writes().await;
+
+    fx.scan().await;
+    assert_eq!(year(&fx, &fx.matrix).await, None);
+    assert!(fx.writes().await.is_empty(), "nothing written back");
+
+    touch(&fx.matrix, 120);
+    fx.scan().await;
+    assert_eq!(year(&fx, &fx.matrix).await, Some(1999), "the folder's year");
+}
+
+/// A locked season with no number is renumbered from its folder on a
+/// "Replace all metadata" refresh: a locked item keeps its local providers,
+/// so `BeforeMetadataRefresh` runs for it — while nothing is read or
+/// fetched for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (db, scanner, show, _requests) = two_shows_library(tmp.path()).await;
+    let season = r#""Type" LIKE '%TV.Season'"#;
+    sqlx::query(&format!(
+        r#"UPDATE "BaseItems" SET "IsLocked" = 1, "IndexNumber" = NULL WHERE {season}"#
+    ))
+    .execute(db.writer())
+    .await
+    .expect("lock");
+    let replace_all = item_refresh(MetadataRefreshMode::FullRefresh, true);
+    let cancel = ScanCancel::new();
+    scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![show.join("Season 1").to_string_lossy().into_owned()]),
+            ScanRun::new(&replace_all, &replace_all, &cancel)
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("folder refresh");
+    let number: Option<i64> = sqlx::query_scalar(&format!(
+        r#"SELECT "IndexNumber" FROM "BaseItems" WHERE {season}"#
+    ))
+    .fetch_one(db.pool())
+    .await
+    .expect("season");
+    assert_eq!(number, Some(1));
 }

@@ -13,7 +13,10 @@
 //! `Folder` override (`Entities/Folder.cs:213-223`) decide `requiresRefresh`.
 //!
 //! Everything here is pure: the scan gathers the stored row's dates, the
-//! filesystem facts and the options, and acts on the answer. Upstream has no
+//! filesystem facts and the options, and acts on the answer. It lives here,
+//! beside [`metadata_merge`](crate::metadata_merge), so the library scan
+//! (`ferrofin-core`) and the single-item refresh
+//! ([`provider_manager`](crate::provider_manager)) decide by the one rule. Upstream has no
 //! Ferrofin-style backfill rule; the scan passes its own (kept by owner
 //! decision D2 of `PLAN_SCAN_CHANGE_DETECTION`) in as an extra trigger for
 //! the remote metadata providers only.
@@ -38,7 +41,7 @@ const XML_SAVE_TOLERANCE_MS: i64 = 0;
 /// The options one refresh runs with: `MetadataRefreshOptions` plus
 /// upstream's `ForceSave`, which the trait-level options do not carry.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct RefreshRequest<'a> {
+pub struct RefreshRequest<'a> {
     /// The refresh modes and replace flags.
     pub options: &'a MetadataRefreshOptions,
     /// `MetadataRefreshOptions.ForceSave`: save the item whatever changed.
@@ -50,7 +53,7 @@ pub(crate) struct RefreshRequest<'a> {
 /// same as a row with every date unset, as upstream's freshly created item
 /// has `DateTime.MinValue` in each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct StoredState {
+pub struct StoredState {
     /// `DateLastRefreshed`; `None` means the item was never refreshed.
     pub date_last_refreshed: Option<DateTime<Utc>>,
     /// `DateLastSaved`, which the NFO/XML change monitors compare against.
@@ -71,7 +74,7 @@ pub(crate) struct StoredState {
 /// Which prober handles the item, if any (`ProbeProvider.HasChanged`'s
 /// `item as Video` / `item is Audio` split).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbeKind {
+pub enum ProbeKind {
     /// The item is never probed (a folder, a photo, a book…).
     None,
     /// A video. `file_or_iso` is `VideoType == VideoFile || VideoType == Iso`:
@@ -86,7 +89,7 @@ pub(crate) enum ProbeKind {
 
 /// The local metadata sidecar found for the item, if any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LocalMetadataFile {
+pub struct LocalMetadataFile {
     /// The sidecar's mtime.
     pub mtime: DateTime<Utc>,
     /// Which reader it belongs to (which tolerance applies).
@@ -95,7 +98,7 @@ pub(crate) struct LocalMetadataFile {
 
 /// The local metadata reader a sidecar belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LocalMetadataFormat {
+pub enum LocalMetadataFormat {
     /// A Kodi/XBMC `.nfo` (`BaseNfoProvider`).
     Nfo,
     /// A Jellyfin `.xml` (`BaseXmlProvider`). Upstream's XML readers serve
@@ -110,7 +113,7 @@ pub(crate) enum LocalMetadataFormat {
 // Independent facts about the file, one flag each.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FileFacts {
+pub struct FileFacts {
     /// The mtime of the item's path, `None` when it has no path or the stat
     /// failed (`info.Exists` false).
     pub mtime: Option<DateTime<Utc>>,
@@ -136,7 +139,7 @@ pub(crate) struct FileFacts {
 
 /// Which remote image providers run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImageFetch {
+pub enum ImageFetch {
     /// None: only the local images are validated.
     None,
     /// The remote providers run and fill the image types still missing.
@@ -151,7 +154,7 @@ pub(crate) enum ImageFetch {
 // independent, not states of one machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ItemRefreshPlan {
+pub struct ItemRefreshPlan {
     /// `isFirstRefresh`: the item has never been refreshed.
     pub is_first_refresh: bool,
     /// `requiresRefresh`: the refresh interval elapsed, the file changed,
@@ -170,13 +173,20 @@ pub(crate) struct ItemRefreshPlan {
     /// The remote metadata providers run because upstream runs all of them
     /// (`runAllProviders`), not only because of the scan's backfill rule.
     pub run_all_providers: bool,
+    /// A locked item keeps its local and forced providers
+    /// (`CanRefreshMetadata`, `ProviderManager.cs:588-592`), and this pass
+    /// would run them (every provider runs, or one's change monitor fired):
+    /// they count towards `BeforeMetadataRefresh` (`MetadataService.cs:
+    /// 164-171`), though `RefreshWithProviders` returns on `IsLocked` before
+    /// reading any of them.
+    pub locked_local: bool,
     /// Which remote image providers run.
     pub remote_images: ImageFetch,
 }
 
 impl ItemRefreshPlan {
     /// A plan that runs nothing: no probe, no reader, no provider.
-    pub(crate) const IDLE: Self = Self {
+    pub const IDLE: Self = Self {
         is_first_refresh: false,
         requires_refresh: false,
         probe: false,
@@ -184,13 +194,14 @@ impl ItemRefreshPlan {
         local_monitor_fired: false,
         remote_metadata: false,
         run_all_providers: false,
+        locked_local: false,
         remote_images: ImageFetch::None,
     };
 }
 
 /// What a refresh pass did, as far as the save rule needs it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PassOutcome {
+pub struct PassOutcome {
     /// Something the save would persist differs from what is stored
     /// (upstream's `updateType > ItemUpdateType.None`).
     pub changed: bool,
@@ -201,7 +212,7 @@ pub(crate) struct PassOutcome {
 
 /// Whether and how the item is saved after the pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SaveDecision {
+pub struct SaveDecision {
     /// Write the item (the row and everything it owns).
     pub save: bool,
     /// Set `DateLastRefreshed` to now on the saved row.
@@ -299,7 +310,8 @@ fn local_metadata_changed(stored: &StoredState, fs: &FileFacts) -> bool {
 /// - `GetNonLocalImageProviders`: the remote image providers run on an
 ///   image full refresh or for an item never refreshed, and never for a
 ///   locked item outside an image full refresh (`CanRefreshImages`).
-pub(crate) fn plan_item_refresh(
+#[must_use]
+pub fn plan_item_refresh(
     stored: Option<&StoredState>,
     fs: &FileFacts,
     request: &RefreshRequest<'_>,
@@ -325,42 +337,49 @@ pub(crate) fn plan_item_refresh(
         mode,
         MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
     );
-    let (probe, local_metadata, local_monitor_fired, remote_metadata, run_all_providers) =
-        if mode == MetadataRefreshMode::None {
-            (false, false, false, false, false)
-        } else {
-            let run_all = options.replace_all_metadata
-                || mode == MetadataRefreshMode::FullRefresh
-                || (is_first_refresh && at_least_default)
-                || (requires_refresh && at_least_default);
-            let probe_changed = probe_changed(stored, fs);
-            let local_changed = local_metadata_changed(stored, fs);
-            let probe = fs.probe != ProbeKind::None && (run_all || probe_changed);
-            // `CanRefreshMetadata` (`ProviderManager.cs:588-592`): a locked
-            // item runs local and forced providers only — and of those,
-            // `RefreshWithProviders` returns on `item.IsLocked`
-            // (`MetadataService.cs:785-788`) after the pre-refresh ones (the
-            // forced probe) and BEFORE the local readers, so an NFO is never
-            // read for a locked item either. Its local images are validated
-            // outside this decision (`MetadataService.cs:123-143`).
-            let remote = !stored.is_locked && (run_all || (backfill && at_least_default));
-            // "If any provider reports a change, always run local ones as
-            // well" (`MetadataService.cs:689-693`): the backfill counts as a
-            // remote provider reporting a change, so the local readers run
-            // with it and the merge keeps what they supply (an NFO's overview
-            // and cast are not traded for the remote ones). Upstream would
-            // also run the custom providers (the probe) then; the backfill
-            // is Ferrofin's own trigger and asks nothing of the file, so it
-            // does not re-probe.
-            let local = !stored.is_locked && (run_all || local_changed || probe_changed || remote);
-            (
-                probe,
-                local,
-                !stored.is_locked && (local_changed || probe_changed),
-                remote,
-                run_all && !stored.is_locked,
-            )
-        };
+    let (
+        probe,
+        local_metadata,
+        local_monitor_fired,
+        remote_metadata,
+        run_all_providers,
+        locked_local,
+    ) = if mode == MetadataRefreshMode::None {
+        (false, false, false, false, false, false)
+    } else {
+        let run_all = options.replace_all_metadata
+            || mode == MetadataRefreshMode::FullRefresh
+            || (is_first_refresh && at_least_default)
+            || (requires_refresh && at_least_default);
+        let probe_changed = probe_changed(stored, fs);
+        let local_changed = local_metadata_changed(stored, fs);
+        let probe = fs.probe != ProbeKind::None && (run_all || probe_changed);
+        // `CanRefreshMetadata` (`ProviderManager.cs:588-592`): a locked
+        // item runs local and forced providers only — and of those,
+        // `RefreshWithProviders` returns on `item.IsLocked`
+        // (`MetadataService.cs:785-788`) after the pre-refresh ones (the
+        // forced probe) and BEFORE the local readers, so an NFO is never
+        // read for a locked item either. Its local images are validated
+        // outside this decision (`MetadataService.cs:123-143`).
+        let remote = !stored.is_locked && (run_all || (backfill && at_least_default));
+        // "If any provider reports a change, always run local ones as
+        // well" (`MetadataService.cs:689-693`): the backfill counts as a
+        // remote provider reporting a change, so the local readers run
+        // with it and the merge keeps what they supply (an NFO's overview
+        // and cast are not traded for the remote ones). Upstream would
+        // also run the custom providers (the probe) then; the backfill
+        // is Ferrofin's own trigger and asks nothing of the file, so it
+        // does not re-probe.
+        let local = !stored.is_locked && (run_all || local_changed || probe_changed || remote);
+        (
+            probe,
+            local,
+            !stored.is_locked && (local_changed || probe_changed),
+            remote,
+            run_all && !stored.is_locked,
+            stored.is_locked && (run_all || local_changed || probe_changed),
+        )
+    };
 
     let image_mode = options.image_refresh_mode;
     let remote_images = if !matches!(
@@ -384,6 +403,7 @@ pub(crate) fn plan_item_refresh(
         local_monitor_fired,
         remote_metadata,
         run_all_providers,
+        locked_local,
         remote_images,
     }
 }
@@ -398,7 +418,8 @@ pub(crate) fn plan_item_refresh(
 /// metadata, or on a full refresh whose only change is that stamp — without
 /// it a full refresh that found nothing would repeat the same queries
 /// forever.
-pub(crate) fn decide_save(
+#[must_use]
+pub fn decide_save(
     plan: ItemRefreshPlan,
     request: &RefreshRequest<'_>,
     pass: PassOutcome,

@@ -49,7 +49,7 @@ fn details_json(overview: &str) -> String {
 }
 
 /// A TMDB stand-in answering the movie search and details, counting the
-/// details requests.
+/// metadata details requests.
 fn spawn_tmdb(overview: &'static str) -> (String, Arc<AtomicUsize>) {
     let details = Arc::new(AtomicUsize::new(0));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -65,7 +65,11 @@ fn spawn_tmdb(overview: &'static str) -> (String, Arc<AtomicUsize>) {
             let (status, payload) = if line.contains("/search/movie") {
                 ("200 OK", SEARCH_JSON.to_owned())
             } else if line.contains("/movie/603?") {
-                counter.fetch_add(1, Ordering::SeqCst);
+                // The metadata fetch appends credits and videos; the artwork
+                // lookup by id (`images_by_id`) asks for the bare record.
+                if line.contains("append_to_response") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
                 ("200 OK", details_json(overview))
             } else {
                 ("404 Not Found", "{}".to_owned())
@@ -487,12 +491,7 @@ async fn an_artist_refresh_touches_its_albums_folders_children_and_itself_only()
                 path: Some(artist_a.to_string_lossy().into_owned()),
                 folders: vec![artist_b.to_string_lossy().into_owned()],
             },
-            ScanRun {
-                options: &replace,
-                ancestors: &none,
-                cancel: &ScanCancel::new(),
-                progress: None,
-            },
+            ScanRun::new(&replace, &none, &ScanCancel::new()),
         )
         .await
         .expect("artist refresh");

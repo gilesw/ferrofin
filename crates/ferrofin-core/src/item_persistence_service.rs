@@ -2217,6 +2217,19 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn update_run_time_ticks(&self, item_id: Uuid, ticks: i64) -> Result<bool, ServiceError> {
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2
+               WHERE "Id" = ?1 AND "RunTimeTicks" IS NOT ?2"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(ticks)
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(written.rows_affected() > 0)
+    }
+
     async fn locked_fields_for_items(
         &self,
         item_ids: &[Uuid],
@@ -2535,6 +2548,21 @@ const LOCKED_PRESERVED_COLUMNS: &[&str] = &[
     "AlbumArtists",
 ];
 
+/// The [`LOCKED_PRESERVED_COLUMNS`] a locked row's scan save may still FILL
+/// when they are empty: what upstream's `BeforeMetadataRefresh` derives
+/// from a locked item's path (its name, year, numbers and a by-date air
+/// date), and the sort keys that follow the name. A value the row holds is
+/// kept as for every other preserved column.
+const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
+    "Name",
+    "CleanName",
+    "SortName",
+    "ProductionYear",
+    "IndexNumber",
+    "ParentIndexNumber",
+    "PremiereDate",
+];
+
 /// The columns a scan save may set but never clear — see [`scan_upsert_sql`].
 const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
     "DateLastRefreshed",
@@ -2558,7 +2586,8 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 ///   could not stat, must not lose them,
 /// - every [`LOCKED_PRESERVED_COLUMNS`] entry keeps its stored value when the
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
-///   existing row, so the guard sees the pre-write lock state).
+///   existing row, so the guard sees the pre-write lock state) — an empty
+///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill.
 ///
 /// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
 /// cannot drift between the two statements; the substitutions are asserted in
@@ -2582,11 +2611,14 @@ fn scan_upsert_sql() -> &'static str {
             );
         }
         for col in LOCKED_PRESERVED_COLUMNS {
+            let kept = if LOCKED_FILLABLE_COLUMNS.contains(col) {
+                format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
+            } else {
+                r#""IsLocked" = 1"#.to_owned()
+            };
             sql = sql.replace(
                 &format!(r#""{col}" = excluded."{col}""#),
-                &format!(
-                    r#""{col}" = CASE WHEN "IsLocked" = 1 THEN "{col}" ELSE excluded."{col}" END"#
-                ),
+                &format!(r#""{col}" = CASE WHEN {kept} THEN "{col}" ELSE excluded."{col}" END"#),
             );
         }
         sql
@@ -4725,10 +4757,13 @@ mod tests {
             );
         }
         for col in super::LOCKED_PRESERVED_COLUMNS {
+            let kept = if super::LOCKED_FILLABLE_COLUMNS.contains(col) {
+                format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
+            } else {
+                r#""IsLocked" = 1"#.to_owned()
+            };
             assert!(
-                sql.contains(&format!(
-                    r#""{col}" = CASE WHEN "IsLocked" = 1 THEN "{col}""#
-                )),
+                sql.contains(&format!(r#""{col}" = CASE WHEN {kept} THEN "{col}""#)),
                 "locked guard missing for column {col}"
             );
         }

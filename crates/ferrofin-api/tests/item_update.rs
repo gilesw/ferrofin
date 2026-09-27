@@ -583,17 +583,23 @@ impl DtoService for OkDto {
 /// external-id / metadata-editor routes return data).
 struct RecordingProviders {
     queued: Arc<Mutex<Vec<Uuid>>>,
+    /// The options each queued refresh ran with.
+    options: RecordedOptions,
 }
+
+/// The options of the provider refreshes the handler queued.
+type RecordedOptions = Arc<Mutex<Vec<MetadataRefreshOptions>>>;
 
 #[async_trait]
 impl ProviderManager for RecordingProviders {
     async fn queue_refresh(
         &self,
         item_id: Uuid,
-        _options: &MetadataRefreshOptions,
+        options: &MetadataRefreshOptions,
         _priority: RefreshPriority,
     ) -> Result<(), ServiceError> {
         self.queued.lock().unwrap().push(item_id);
+        self.options.lock().unwrap().push(options.clone());
         Ok(())
     }
     async fn get_external_id_infos(
@@ -748,6 +754,16 @@ fn state(item_id: Uuid, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
 
 /// [`state`] with a caller-shaped [`OkLibrary`] (the folder-refresh tests).
 fn state_with_library(library: Arc<OkLibrary>, queued: Arc<Mutex<Vec<Uuid>>>) -> AppState {
+    state_recording_options(library, queued, RecordedOptions::default())
+}
+
+/// [`state_with_library`] recording the options of each provider refresh
+/// into `options`.
+fn state_recording_options(
+    library: Arc<OkLibrary>,
+    queued: Arc<Mutex<Vec<Uuid>>>,
+    options: RecordedOptions,
+) -> AppState {
     AppState::new(
         library,
         Arc::new(OkUsers),
@@ -758,7 +774,7 @@ fn state_with_library(library: Arc<OkLibrary>, queued: Arc<Mutex<Vec<Uuid>>>) ->
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         Arc::new(FakeConfig),
-        Arc::new(RecordingProviders { queued }),
+        Arc::new(RecordingProviders { queued, options }),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
@@ -1594,6 +1610,149 @@ async fn refresh_box_set_and_playlist_refresh_themselves() {
         .await;
         assert!(scans.is_empty(), "{kind} is not scanned");
         assert_eq!(queued, vec![id], "{kind} refreshes itself");
+    }
+}
+
+/// Posts `/Items/{id}/Refresh{query}` for the item row `root`, returning the
+/// scans it queued and the provider refreshes' item ids and options.
+async fn refresh_row(
+    root: BaseItemEntity,
+    query: &str,
+) -> (
+    Vec<(ScanTarget, MetadataRefreshOptions)>,
+    Vec<Uuid>,
+    Vec<MetadataRefreshOptions>,
+) {
+    let id = Uuid::parse_str(&root.id).expect("id");
+    let scans: RecordedScans = Arc::default();
+    let queued = Arc::new(Mutex::new(Vec::new()));
+    let options = RecordedOptions::default();
+    let router = create_router(state_recording_options(
+        Arc::new(OkLibrary {
+            item_id: id,
+            is_folder: root.is_folder,
+            top_parent_id: None,
+            refresh_scans: scans.clone(),
+            provider_ids: Arc::default(),
+            updated: Arc::default(),
+            tree: Arc::new(Tree {
+                root: Some(root),
+                ..Tree::default()
+            }),
+        }),
+        queued.clone(),
+        options.clone(),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{id}/Refresh{query}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let scans = scans.lock().unwrap().clone();
+    let queued = queued.lock().unwrap().clone();
+    let options = options.lock().unwrap().clone();
+    (scans, queued, options)
+}
+
+/// The options `ItemRefreshController` builds for a dashboard choice.
+fn controller_options(query: &str) -> MetadataRefreshOptions {
+    use ferrofin_traits::providers::MetadataRefreshMode;
+    match query {
+        SCAN_FOR_NEW => MetadataRefreshOptions::for_item_refresh(
+            MetadataRefreshMode::Default,
+            MetadataRefreshMode::Default,
+            false,
+            false,
+            false,
+        ),
+        SEARCH_MISSING => MetadataRefreshOptions::for_item_refresh(
+            MetadataRefreshMode::FullRefresh,
+            MetadataRefreshMode::FullRefresh,
+            false,
+            true,
+            true,
+        ),
+        _ => MetadataRefreshOptions::for_item_refresh(
+            MetadataRefreshMode::FullRefresh,
+            MetadataRefreshMode::FullRefresh,
+            true,
+            true,
+            false,
+        ),
+    }
+}
+
+/// Phase 5b: `POST /Items/{itemId}/Refresh` on a file item — a movie, an
+/// episode, a track, a book, a photo — is the library scan of its own path
+/// with the request's options (`ForceSave`/`RemoveOldMetadata` by the
+/// controller's rule), so it gets the scan's decision, merge, locks, probe,
+/// NFO and every provider; the provider queue is not used, and nothing else
+/// of its library is walked.
+#[tokio::test]
+async fn refresh_a_file_item_scans_its_own_path_with_the_request_options() {
+    for kind in [
+        "MediaBrowser.Controller.Entities.Movies.Movie",
+        "MediaBrowser.Controller.Entities.TV.Episode",
+        "MediaBrowser.Controller.Entities.Audio.Audio",
+        "MediaBrowser.Controller.Entities.Book",
+        "MediaBrowser.Controller.Entities.Photo",
+    ] {
+        for query in [SCAN_FOR_NEW, SEARCH_MISSING, REPLACE_ALL] {
+            let id = Uuid::from_u128(0xF11E);
+            let mut row = base_item_entity(id);
+            kind.clone_into(&mut row.type_);
+            row.is_folder = false;
+            row.path = Some("/media/lib/Some Item/file.ext".to_owned());
+            row.top_parent_id = Some(Uuid::from_u128(0x11B).to_string());
+            let (scans, queued, _) = refresh_row(row, query).await;
+            assert_eq!(
+                scans,
+                vec![(
+                    ScanTarget::Items(vec!["/media/lib/Some Item/file.ext".to_owned()]),
+                    controller_options(query)
+                )],
+                "{kind} {query}"
+            );
+            assert!(queued.is_empty(), "{kind}: the provider queue is not used");
+        }
+    }
+}
+
+/// An item with no file of its own in a library — a person, a channel item
+/// streamed from a URL, a row outside every library — refreshes through the
+/// provider queue, now with the controller's options (`ForceSave`,
+/// `RemoveOldMetadata`), where it used to drop both.
+#[tokio::test]
+async fn refresh_an_item_with_no_file_refreshes_through_the_provider_queue() {
+    let person = {
+        let mut row = base_item_entity(Uuid::from_u128(0xFE));
+        "MediaBrowser.Controller.Entities.Person".clone_into(&mut row.type_);
+        row.is_folder = false;
+        row.path = Some("/config/metadata/People/A/Actor".to_owned());
+        row.top_parent_id = None;
+        row
+    };
+    let streamed = {
+        let mut row = base_item_entity(Uuid::from_u128(0xFF));
+        row.is_folder = false;
+        row.path = Some("http://tuner.local/stream/7".to_owned());
+        row.top_parent_id = Some(Uuid::from_u128(0x11B).to_string());
+        row
+    };
+    for row in [person, streamed] {
+        let id = Uuid::parse_str(&row.id).expect("id");
+        let (scans, queued, options) = refresh_row(row, REPLACE_ALL).await;
+        assert!(scans.is_empty());
+        assert_eq!(queued, vec![id]);
+        assert_eq!(options, vec![controller_options(REPLACE_ALL)]);
+        assert!(options[0].force_save && options[0].remove_old_metadata);
     }
 }
 

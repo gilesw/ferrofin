@@ -64,8 +64,15 @@ pub enum ScanTarget {
     Library(Uuid),
     /// The items at or under these filesystem paths — a folder's subtree
     /// (`Folder.ValidateChildren` on a series, season, album…), or the
-    /// changed paths the library monitor reports.
+    /// changed paths the library monitor reports. Rows under the paths whose
+    /// files are gone are removed.
     Paths(Vec<String>),
+    /// The file items at these paths refreshing themselves
+    /// (`ProviderManager.RefreshSingleItem`, a non-folder's `RefreshItem`):
+    /// a movie's, an episode's, a track's refresh, or an Identify of one. A
+    /// file that is gone is never removed by it — upstream's item refresh
+    /// deletes nothing — and it runs no library-wide closing pass.
+    Items(Vec<String>),
     /// `ProviderManager.RefreshArtist`: the CHILDREN of `folders` — the
     /// artist folders the artist's credited albums sit under — and the
     /// artist itself (its own row, when it has a folder at `path`). The items
@@ -853,12 +860,15 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await
     }
 
-    /// Queues a scan of `target` whose items refresh with `options` — the
-    /// scan half of a folder's `POST /Items/{itemId}/Refresh`
+    /// Queues a scan of `target` whose items refresh with `options` — how
+    /// `POST /Items/{itemId}/Refresh` refreshes anything with a path
     /// (`ProviderManager.RefreshItem`: a CollectionFolder refreshes its
     /// physical folders, any other folder validates its own children, both
-    /// with the request's options). The folders above a path-scoped target
-    /// are not refreshed (their refresh modes are `None`), as upstream never
+    /// with the request's options, and a file item refreshes itself through
+    /// the same metadata service — here the scan of its one path, with the
+    /// scan's refresh decision, merge, probe, local readers and every
+    /// metadata provider). The folders above a path-scoped target are not
+    /// refreshed (their refresh modes are `None`), as upstream never
     /// refreshes a folder's ancestors. The other scan entry points refresh
     /// with the `MetadataRefreshOptions` constructor defaults.
     ///
@@ -878,6 +888,39 @@ pub trait LibraryManager: Send + Sync {
         let _ = (target, options);
         Err(ServiceError::backend(
             "queue_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
+    /// [`queue_refresh_scan`](Self::queue_refresh_scan), returning only once
+    /// the refresh has run — the refresh `POST /Items/RemoteSearch/Apply/{id}`
+    /// awaits (`ProviderManager.RefreshFullItem`). It goes into the scan
+    /// queue's priority lane: ahead of every queued scan, and — while a scan
+    /// runs — served inside that scan between two of its items, so it waits
+    /// about one item, never a whole library scan. Returns `Ok(false)` when
+    /// it was stopped before it finished (the server is shutting down).
+    ///
+    /// With `options.search_result` set, the items the scan covers are looked
+    /// up by that chosen result (`MetadataService.ApplySearchResult`): their
+    /// local readers are skipped and the result's provider ids, name and year
+    /// pin the remote lookup, the fetcher it came from first. The item's own
+    /// ids become the result's (`item.SetProviderIds`, the controller's half
+    /// upstream) with the refresh's save of the item, so a refresh that fails
+    /// leaves no half-applied ids.
+    ///
+    /// The default refuses, as [`queue_refresh_scan`](Self::queue_refresh_scan)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager with no scanner, or the scan
+    /// failed.
+    async fn run_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (target, options);
+        Err(ServiceError::backend(
+            "run_refresh_scan needs a library scanner, which this library manager has none of",
         ))
     }
 
@@ -1549,13 +1592,6 @@ pub trait MediaSourceManager: Send + Sync {
 
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
-
-    /// Re-probes a leaf item's file (ffprobe) and rewrites its media streams and
-    /// duration/size — the media-info half of a metadata refresh. Used to correct
-    /// stale probe data (e.g. Dolby Vision fields added after the item was first
-    /// scanned) without a full library rescan. A folder/non-media/missing-path
-    /// item, or one with no encoder wired, is a successful no-op.
-    async fn refresh_media_streams(&self, item_id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_media_source_manager(_: &dyn MediaSourceManager) {}

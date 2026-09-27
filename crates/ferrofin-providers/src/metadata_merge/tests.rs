@@ -13,7 +13,12 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use rstest::rstest;
 
-use super::{MetadataResult, is_valid_provider_id, merge_data, merge_provider_ids};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+use super::{
+    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data,
+    merge_provider_ids, merge_refresh, set_provider_ids, settle_sort_name,
+};
 
 /// The stored `Type` name for `kind`.
 fn type_name(kind: BaseItemKind) -> String {
@@ -484,6 +489,43 @@ fn provider_ids_never_keep_an_invalid_id() {
         merge_provider_ids(&ids(&[("tmdb", "12")]), &ids(&[("Tmdb", "11")]), true),
         ids(&[("Tmdb", "12")])
     );
+}
+
+/// `ProviderIdsExtensionsTests.TrySetProviderId_SurroundingWhitespace_Trimmed`.
+#[rstest]
+#[case("Imdb", " tt0113375 ")]
+#[case(" Imdb", "tt0113375")]
+fn set_provider_ids_trims_the_name_and_value(#[case] name: &str, #[case] value: &str) {
+    assert_eq!(
+        set_provider_ids([(name, value)]),
+        ids(&[("Imdb", "tt0113375")])
+    );
+}
+
+/// `SetProviderIds_ReplacesAll`, `SetProviderIds_ForeignId_Dropped` and
+/// `TrySetProviderId_ForeignId_False`: the set is exactly the valid pairs
+/// given (what the item had is not kept), a foreign or blank id is dropped;
+/// and `TrySetProviderId`'s guards — a name holding `=` is dropped, a known
+/// provider takes its canonical spelling, a later pair for the same name
+/// replaces an earlier one.
+#[test]
+fn set_provider_ids_keeps_only_the_valid_pairs_given() {
+    assert_eq!(
+        set_provider_ids([("Tmdb", "nm0000123"), ("Imdb", "tt0113375"), ("Tvdb", "")]),
+        ids(&[("Imdb", "tt0113375")])
+    );
+    assert_eq!(
+        set_provider_ids([
+            ("a=b", "1"),
+            ("tmdb", "11"),
+            ("TMDB", "12"),
+            ("  ", "x"),
+            ("SomePlugin", "  "),
+            ("SomePlugin", "p1"),
+        ]),
+        ids(&[("Tmdb", "12"), ("SomePlugin", "p1")])
+    );
+    assert!(set_provider_ids([]).is_empty());
 }
 
 /// `ProviderIdsExtensionsTests.IsValidProviderId_ChecksKnownFormats`
@@ -1082,4 +1124,246 @@ fn replace_all_clears_unlocked_fields_the_providers_left_empty_but_not_locked_on
     assert_eq!(saved.overview.as_deref(), Some("My overview"));
     assert_eq!(saved.genres.as_deref(), Some("Drama"));
     assert_eq!(saved.tagline, None, "unlocked and not returned: cleared");
+}
+
+/// `RefreshWithProviders`' two switches (`MetadataService.cs:895-917`) for
+/// the dashboard's three choices, an Identify, and the passes where nothing
+/// answered or every remote provider failed — the one rule both the scan and
+/// the single-item refresh merge by.
+// A table of eight cases, one per line before rustfmt spreads them out.
+#[allow(clippy::too_many_lines)]
+#[test]
+fn refresh_merge_follows_refresh_with_providers() {
+    use MetadataRefreshMode::{Default, FullRefresh, ValidationOnly};
+    // (case, mode, replace all, remove old, any answered, failed, remote
+    // answered) → (keep existing, replace)
+    let cases = [
+        // "Scan for new and updated files": replace, the stored values fill.
+        (
+            "scan", Default, false, false, true, false, false, true, true,
+        ),
+        // "Search for missing metadata": fill only.
+        (
+            "search missing",
+            FullRefresh,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+        ),
+        // "Replace all metadata" / Identify (`RemoveOldMetadata`): replace and
+        // clear.
+        (
+            "replace all",
+            FullRefresh,
+            true,
+            true,
+            true,
+            false,
+            true,
+            false,
+            true,
+        ),
+        // …where nothing answered: nothing is erased.
+        (
+            "nothing answered",
+            FullRefresh,
+            true,
+            true,
+            false,
+            false,
+            false,
+            true,
+            true,
+        ),
+        // …where a provider failed and no remote one answered: kept.
+        (
+            "all failed",
+            FullRefresh,
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+            true,
+        ),
+        // …where one failed but another answered: cleared.
+        (
+            "partly failed",
+            FullRefresh,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+        ),
+        // Replace all without `RemoveOldMetadata`: the stored values fill.
+        (
+            "replace keeping",
+            FullRefresh,
+            true,
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+        ),
+        // `ValidationOnly`: no replace.
+        (
+            "validation only",
+            ValidationOnly,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+        ),
+    ];
+    for (case, mode, replace_all, remove_old, any, failed, remote, keep_existing, replace) in cases
+    {
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            image_refresh_mode: mode,
+            replace_all_metadata: replace_all,
+            remove_old_metadata: remove_old,
+            ..MetadataRefreshOptions::default()
+        };
+        let answers = RefreshAnswers {
+            any,
+            failed,
+            remote,
+            local_locked: false,
+        };
+        assert_eq!(
+            RefreshMerge::of(&options, answers),
+            RefreshMerge {
+                keep_existing,
+                replace
+            },
+            "{case}"
+        );
+        // An NFO's `<lockdata>` (`isLocalLocked`) always replaces.
+        let local_locked = RefreshAnswers {
+            local_locked: true,
+            ..answers
+        };
+        assert!(RefreshMerge::of(&options, local_locked).replace, "{case}");
+    }
+}
+
+/// [`merge_refresh`] is the two calls in order: under "Search for missing
+/// metadata" a stored value stays and a gap is filled; under an Identify's
+/// replace a value no provider returned is cleared — never a locked one.
+#[test]
+fn merge_refresh_runs_both_calls_by_the_rule() {
+    let stored = MetadataResult::of(BaseItemEntity {
+        overview: Some("Mine".into()),
+        tagline: Some("My tagline".into()),
+        ..item(BaseItemKind::BoxSet)
+    });
+    let answer = || {
+        MetadataResult::of(BaseItemEntity {
+            name: Some("Provider".into()),
+            overview: Some("Theirs".into()),
+            community_rating: Some(7.0),
+            ..item(BaseItemKind::BoxSet)
+        })
+    };
+    let fill = merge_refresh(
+        &stored,
+        answer(),
+        &[],
+        RefreshMerge {
+            keep_existing: true,
+            replace: false,
+        },
+    );
+    assert_eq!(fill.item.overview.as_deref(), Some("Mine"));
+    assert_eq!(fill.item.community_rating, Some(7.0));
+    let cleared = merge_refresh(
+        &stored,
+        answer(),
+        &[MetadataField::Overview],
+        RefreshMerge {
+            keep_existing: false,
+            replace: true,
+        },
+    );
+    assert_eq!(cleared.item.overview.as_deref(), Some("Mine"), "locked");
+    assert_eq!(cleared.item.tagline, None, "not returned: cleared");
+    assert_eq!(cleared.item.name.as_deref(), Some("Provider"));
+}
+
+/// The sort key a refresh settles, by kind: a forced one wins, an episode, a
+/// season and a track sort by number, a person by its name verbatim
+/// (`Person.EnableAlphaNumericSorting => false`), anything else by the
+/// alphanumeric pipeline.
+#[test]
+fn settle_sort_name_follows_create_sort_name_per_kind() {
+    let settled = |mut row: BaseItemEntity| {
+        settle_sort_name(&mut row);
+        row.sort_name
+    };
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("The Matrix Collection".into()),
+            ..item(BaseItemKind::BoxSet)
+        })
+        .as_deref(),
+        Some("matrix collection")
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("The Rock".into()),
+            ..item(BaseItemKind::Person)
+        })
+        .as_deref(),
+        Some("The Rock")
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("Pilot".into()),
+            parent_index_number: Some(1),
+            index_number: Some(2),
+            ..item(BaseItemKind::Episode)
+        })
+        .as_deref(),
+        Some("001 - 0002 - Pilot")
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("Season 3".into()),
+            index_number: Some(3),
+            ..item(BaseItemKind::Season)
+        })
+        .as_deref(),
+        Some("0003")
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("Song".into()),
+            index_number: Some(4),
+            ..item(BaseItemKind::Audio)
+        })
+        .as_deref(),
+        Some("0004 - Song")
+    );
+    assert_eq!(
+        settled(BaseItemEntity {
+            name: Some("Anything".into()),
+            forced_sort_name: Some("The Zed".into()),
+            ..item(BaseItemKind::Movie)
+        })
+        .as_deref(),
+        Some("zed")
+    );
 }

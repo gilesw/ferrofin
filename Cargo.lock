@@ -1174,6 +1174,7 @@ dependencies = [
  "ferrofin-providers",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
  "image",
  "libc",
  "notify",

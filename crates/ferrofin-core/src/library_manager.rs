@@ -45,7 +45,7 @@ use ferrofin_traits::persistence::{
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
-use crate::library_scan::{ScanCancel, ScanRun};
+use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
 
 /// The placeholder item row seeded by the initial migration, which every real
@@ -114,17 +114,25 @@ struct ScanRequest {
     ancestors: MetadataRefreshOptions,
     /// The `library_scan` span's `trigger` (`api`, `schedule`, `watcher`, …).
     trigger: &'static str,
+    /// Its closing passes: the whole library's for library validation, only
+    /// the touched items' for a refresh over the API.
+    passes: ScanPasses,
+    /// It waits in the priority lane: an item refresh a caller is waiting
+    /// for, which runs ahead of every queued scan and inside a running one.
+    priority: bool,
 }
 
 impl ScanRequest {
     /// A request refreshing with the `MetadataRefreshOptions` constructor
-    /// defaults — every trigger but a folder refresh.
+    /// defaults — every trigger but a refresh over the API.
     fn defaults(trigger: &'static str, scope: ScanTarget) -> Self {
         Self {
             scope,
             options: MetadataRefreshOptions::default(),
             ancestors: MetadataRefreshOptions::default(),
             trigger,
+            passes: ScanPasses::Library,
+            priority: false,
         }
     }
 
@@ -140,12 +148,29 @@ impl ScanRequest {
             },
             // A request over the API (`LOGGING.md`'s trigger vocabulary).
             trigger: "api",
+            // `RefreshItem` runs no post-scan task.
+            passes: ScanPasses::Touched,
+            priority: false,
+        }
+    }
+
+    /// An item refresh a caller waits on or expects promptly — a file
+    /// item's `POST /Items/{itemId}/Refresh`, an Identify's Apply, the
+    /// refresh after a subtitle or lyric change: upstream's provider refresh
+    /// queue, which runs alongside library validation, not behind it.
+    fn item_refresh(scope: ScanTarget, options: MetadataRefreshOptions) -> Self {
+        Self {
+            priority: true,
+            ..Self::folder_refresh(scope, options)
         }
     }
 
     /// Whether two requests refresh alike, so that one may cover the other.
     fn refreshes_like(&self, other: &Self) -> bool {
-        self.options == other.options && self.ancestors == other.ancestors
+        self.options == other.options
+            && self.ancestors == other.ancestors
+            && self.passes == other.passes
+            && self.priority == other.priority
     }
 }
 
@@ -190,6 +215,17 @@ struct PendingScan {
     waiters: Waiters,
 }
 
+/// A priority-lane refresh a running scan is serving.
+#[derive(Debug)]
+struct ServingRefresh {
+    /// What it runs (back to the lane if the worker dies under it).
+    request: ScanRequest,
+    /// Who waits for it.
+    waiters: Waiters,
+    /// Stops it.
+    cancel: ScanCancel,
+}
+
 /// The scan being run.
 #[derive(Debug)]
 struct RunningScan {
@@ -223,6 +259,13 @@ struct ScanQueue {
     running: Option<RunningScan>,
     /// The requests waiting their turn, in the order they run.
     pending: VecDeque<PendingScan>,
+    /// The priority lane: item refreshes that run ahead of `pending` and,
+    /// while a scan runs, inside it ([`PriorityLane`]).
+    lane: VecDeque<PendingScan>,
+    /// The lane refreshes a running scan is serving, by key.
+    serving: HashMap<u64, ServingRefresh>,
+    /// The key of the next lane refresh served.
+    next_lane_key: u64,
     /// The next ticket to hand a waiting caller.
     next_ticket: u64,
     /// How the scans of the tickets not yet collected by their callers
@@ -242,6 +285,8 @@ impl std::fmt::Debug for ScanQueue {
             .field("closed", &self.closed)
             .field("running", &self.running)
             .field("pending", &self.pending)
+            .field("lane", &self.lane)
+            .field("serving", &self.serving)
             .field("finished", &self.finished)
             .finish_non_exhaustive()
     }
@@ -273,6 +318,18 @@ impl ScanQueue {
             self.next_ticket += 1;
             ticket
         });
+        // The priority lane keeps its own order; an identical refresh
+        // already waiting there runs once for both.
+        if request.priority {
+            if let Some(pending) = self.lane.iter_mut().find(|p| p.request == request) {
+                pending.waiters.add(ticket);
+            } else {
+                let mut waiters = Waiters::default();
+                waiters.add(ticket);
+                self.lane.push_back(PendingScan { request, waiters });
+            }
+            return ticket;
+        }
         // A queued scan that already covers this request: a full scan covers
         // anything, a library or artist scan an identical one.
         let covers = |queued: &ScanTarget| match (queued, &request.scope) {
@@ -326,7 +383,7 @@ impl ScanQueue {
                     self.pending.push_back(PendingScan { request, waiters });
                 }
             }
-            ScanTarget::Library(_) | ScanTarget::Artist { .. } => {
+            ScanTarget::Library(_) | ScanTarget::Artist { .. } | ScanTarget::Items(_) => {
                 self.pending.push_back(PendingScan { request, waiters });
             }
         }
@@ -342,10 +399,19 @@ impl ScanQueue {
     fn withdraw(&mut self, ticket: u64) {
         self.finished.remove(&ticket);
         self.sinks.remove(&ticket);
-        for pending in &mut self.pending {
+        for pending in self.pending.iter_mut().chain(self.lane.iter_mut()) {
             pending.waiters.tickets.retain(|t| *t != ticket);
         }
         self.pending.retain(|pending| !pending.waiters.is_empty());
+        self.lane.retain(|pending| !pending.waiters.is_empty());
+        for serving in self.serving.values_mut() {
+            if serving.waiters.tickets.contains(&ticket) {
+                serving.waiters.tickets.retain(|t| *t != ticket);
+                if serving.waiters.is_empty() {
+                    serving.cancel.cancel();
+                }
+            }
+        }
         if let Some(running) = &mut self.running
             && running.waiters.tickets.contains(&ticket)
         {
@@ -364,6 +430,33 @@ impl ScanQueue {
                 self.finished.insert(ticket, result.clone());
             }
         }
+    }
+
+    /// Settles as failed every lane refresh still marked as being served —
+    /// the scan serving it ended without handing it back (it panicked or was
+    /// aborted), and nobody else will.
+    fn fail_serving(&mut self) {
+        let lost: Vec<ServingRefresh> = self.serving.drain().map(|(_, s)| s).collect();
+        for refresh in lost {
+            refresh.cancel.cancel();
+            for ticket in refresh.waiters.tickets {
+                self.sinks.remove(&ticket);
+                self.finished.insert(
+                    ticket,
+                    ScanResult::Failed(
+                        "the scan serving this item refresh ended before it finished".to_owned(),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Whether `ticket`'s request is still waiting its turn.
+    fn is_queued(&self, ticket: u64) -> bool {
+        self.pending
+            .iter()
+            .chain(self.lane.iter())
+            .any(|p| p.waiters.tickets.contains(&ticket))
     }
 
     /// Reports `percent` to the running scan's waiting callers.
@@ -419,6 +512,7 @@ fn scope_label(scope: &ScanTarget) -> &'static str {
         ScanTarget::All => "all",
         ScanTarget::Library(_) => "library",
         ScanTarget::Paths(_) => "paths",
+        ScanTarget::Items(_) => "items",
         ScanTarget::Artist { .. } => "artist",
     }
 }
@@ -456,13 +550,19 @@ impl ScanWorker {
         loop {
             let next = {
                 let mut queue = lock_queue(&self.queue);
-                if let Some(pending) = queue.pending.pop_front() {
+                // The priority lane runs ahead of every queued scan.
+                let next = match queue.lane.pop_front() {
+                    Some(pending) => Some(pending),
+                    None => queue.pending.pop_front(),
+                };
+                if let Some(pending) = next {
                     let cancel = ScanCancel::new();
+                    let waited = !pending.waiters.tickets.is_empty();
                     queue.running = Some(RunningScan {
                         waiters: pending.waiters,
                         cancel: cancel.clone(),
                     });
-                    Some((pending.request, cancel))
+                    Some((pending.request, cancel, waited))
                 } else {
                     // Standing down under the same lock that a new request
                     // checks, so it is never left queued with no worker.
@@ -471,7 +571,7 @@ impl ScanWorker {
                     None
                 }
             };
-            let Some((request, cancel)) = next else {
+            let Some((request, cancel, waited)) = next else {
                 release.done = true;
                 self.progress.send_modify(|n| *n = n.wrapping_add(1));
                 break;
@@ -484,13 +584,19 @@ impl ScanWorker {
             let task = self.spawn_scan(&request, &cancel, &span);
             release.request = Some(request.clone());
             release.scan_task = Some(task.abort_handle());
-            let (result, pass) = Self::finish(task, &request, span).await;
+            let (result, pass) = Self::finish(task, &request, span, waited).await;
             release.request = None;
             release.scan_task = None;
             if let Some(pass) = pass {
                 total += pass;
             }
-            lock_queue(&self.queue).finish_running(&result);
+            {
+                let mut queue = lock_queue(&self.queue);
+                queue.finish_running(&result);
+                // A scan that ends normally has handed every refresh it
+                // served back; one that panicked has not.
+                queue.fail_serving();
+            }
             self.progress.send_modify(|n| *n = n.wrapping_add(1));
         }
         let elapsed_ms = started.elapsed().as_millis();
@@ -528,6 +634,10 @@ impl ScanWorker {
     ) -> tokio::task::JoinHandle<Result<crate::library_scan::ScanOutcome, ServiceError>> {
         let runner = Arc::clone(&self.runner);
         let queue = Arc::clone(&self.queue);
+        let lane = QueueLane {
+            queue: Arc::clone(&self.queue),
+            progress: Arc::clone(&self.progress),
+        };
         let request = request.clone();
         let cancel = cancel.clone();
         tokio::spawn(
@@ -536,12 +646,10 @@ impl ScanWorker {
                 runner
                     .run(
                         &request.scope,
-                        ScanRun {
-                            options: &request.options,
-                            ancestors: &request.ancestors,
-                            cancel: &cancel,
-                            progress: Some(&report),
-                        },
+                        ScanRun::new(&request.options, &request.ancestors, &cancel)
+                            .with_progress(&report)
+                            .with_passes(request.passes)
+                            .with_lane(&lane),
                     )
                     .await
             }
@@ -550,11 +658,13 @@ impl ScanWorker {
     }
 
     /// Waits for one scan's task and logs how it ended, inside `span` (only
-    /// while polled: the span never stays entered on a parked thread).
+    /// while polled: the span never stays entered on a parked thread). A
+    /// failure a caller waits for (`waited`) is that caller's to report.
     async fn finish(
         task: tokio::task::JoinHandle<Result<crate::library_scan::ScanOutcome, ServiceError>>,
         request: &ScanRequest,
         span: tracing::Span,
+        waited: bool,
     ) -> (ScanResult, Option<crate::library_scan::ScanOutcome>) {
         let ended = task.instrument(span.clone()).await;
         let _entered = span.enter();
@@ -583,9 +693,15 @@ impl ScanWorker {
                 );
                 (ScanResult::Completed, Some(pass))
             }
-            // Logged exactly once, here, at the scan's top level.
+            // Logged exactly once, at the outermost layer: here, unless a
+            // caller waits for the scan and reports its failure itself (an
+            // Identify refresh that ran as the worker's own pass).
             Ok(Err(err)) => {
-                tracing::error!(%err, "library scan failed");
+                if waited {
+                    tracing::debug!(%err, "library scan failed; its caller reports it");
+                } else {
+                    tracing::error!(%err, "library scan failed");
+                }
                 (ScanResult::Failed(err.to_string()), None)
             }
             // The panic itself is reported by the panic hook.
@@ -598,6 +714,81 @@ impl ScanWorker {
             }
             Err(_) => (ScanResult::Stopped, None),
         }
+    }
+}
+
+/// The scan queue's priority lane, as the running scan serves it.
+struct QueueLane {
+    queue: Arc<Mutex<ScanQueue>>,
+    progress: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl PriorityLane for QueueLane {
+    fn next(&self) -> Option<LaneRefresh> {
+        let mut queue = lock_queue(&self.queue);
+        if queue.closed {
+            return None;
+        }
+        let pending = queue.lane.pop_front()?;
+        let key = queue.next_lane_key;
+        queue.next_lane_key += 1;
+        let cancel = ScanCancel::new();
+        let refresh = LaneRefresh {
+            target: pending.request.scope.clone(),
+            options: pending.request.options.clone(),
+            ancestors: pending.request.ancestors.clone(),
+            passes: pending.request.passes,
+            cancel: cancel.clone(),
+            key,
+        };
+        queue.serving.insert(
+            key,
+            ServingRefresh {
+                request: pending.request,
+                waiters: pending.waiters,
+                cancel,
+            },
+        );
+        Some(refresh)
+    }
+
+    fn done(
+        &self,
+        refresh: LaneRefresh,
+        outcome: &Result<crate::library_scan::ScanOutcome, ServiceError>,
+    ) {
+        let result = match outcome {
+            Ok(pass) if pass.stopped => ScanResult::Stopped,
+            Ok(pass) => {
+                tracing::info!(
+                    scope = scope_label(&refresh.target),
+                    created = pass.created,
+                    updated = pass.updated,
+                    unchanged = pass.unchanged,
+                    removed = pass.removed,
+                    "item refresh served inside the running scan"
+                );
+                ScanResult::Completed
+            }
+            Err(err) => ScanResult::Failed(err.to_string()),
+        };
+        let mut queue = lock_queue(&self.queue);
+        let waited = queue.serving.remove(&refresh.key).is_some_and(|serving| {
+            let waited = !serving.waiters.tickets.is_empty();
+            for ticket in serving.waiters.tickets {
+                queue.sinks.remove(&ticket);
+                queue.finished.insert(ticket, result.clone());
+            }
+            waited
+        });
+        drop(queue);
+        // Logged once, at the outermost layer: a caller waiting for the
+        // refresh (Identify → Apply) reports its failure itself; a queued
+        // one's is reported here.
+        if let (ScanResult::Failed(err), false) = (&result, waited) {
+            tracing::error!(%err, scope = scope_label(&refresh.target), "item refresh failed");
+        }
+        self.progress.send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 
@@ -630,9 +821,26 @@ impl Drop for WorkerRelease {
         if let (Some(running), Some(request)) = (queue.running.take(), self.request.take()) {
             running.cancel.cancel();
             if !queue.closed {
-                queue.pending.push_front(PendingScan {
+                let pending = PendingScan {
                     request,
                     waiters: running.waiters,
+                };
+                if pending.request.priority {
+                    queue.lane.push_front(pending);
+                } else {
+                    queue.pending.push_front(pending);
+                }
+            }
+        }
+        // The lane refreshes the aborted scan was serving go back to the
+        // head of the lane for their waiters.
+        let serving: Vec<ServingRefresh> = queue.serving.drain().map(|(_, s)| s).collect();
+        for refresh in serving {
+            refresh.cancel.cancel();
+            if !queue.closed {
+                queue.lane.push_front(PendingScan {
+                    request: refresh.request,
+                    waiters: refresh.waiters,
                 });
             }
         }
@@ -1468,8 +1676,32 @@ impl LibraryManager for FerrofinLibraryManager {
                 "queue_refresh_scan needs a library scanner, which this library manager has none of",
             ));
         }
-        self.spawn_scan(ScanRequest::folder_refresh(target, options.clone()));
+        // A file item's own refresh waits in the priority lane; a folder's
+        // validation — as large as a whole library — queues like a scan.
+        let request = if matches!(target, ScanTarget::Items(_)) {
+            ScanRequest::item_refresh(target, options.clone())
+        } else {
+            ScanRequest::folder_refresh(target, options.clone())
+        };
+        self.spawn_scan(request);
         Ok(())
+    }
+
+    async fn run_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        if self.scanner.is_none() {
+            return Err(ServiceError::backend(
+                "run_refresh_scan needs a library scanner, which this library manager has none of",
+            ));
+        }
+        // Through the priority lane: it runs ahead of every queued scan, and
+        // inside a running one between two of its items, so the caller waits
+        // for about one item plus its own refresh — never a library scan.
+        self.run_scan(ScanRequest::item_refresh(target, options.clone()), None)
+            .await
     }
 
     async fn run_library_scan(
@@ -1486,11 +1718,20 @@ impl LibraryManager for FerrofinLibraryManager {
         {
             let mut queue = lock_queue(&self.scan_queue);
             queue.closed = true;
-            let dropped: Vec<u64> = queue
+            let mut dropped: Vec<u64> = queue
                 .pending
                 .drain(..)
                 .flat_map(|pending| pending.waiters.tickets)
                 .collect();
+            dropped.extend(
+                queue
+                    .lane
+                    .drain(..)
+                    .flat_map(|pending| pending.waiters.tickets),
+            );
+            for serving in queue.serving.values() {
+                serving.cancel.cancel();
+            }
             for ticket in dropped {
                 queue.sinks.remove(&ticket);
                 queue.finished.insert(ticket, ScanResult::Stopped);
@@ -1605,7 +1846,9 @@ impl FerrofinLibraryManager {
     /// caller shares it; running, it stops cooperatively once nobody else
     /// wants it, with the item in progress written whole or not at all. Only
     /// then does the next queued scan start, so a refresh's replacement task
-    /// waits at most one item for the cancelled scan to end.
+    /// waits for the cancelled scan to end: at most one item — plus, when
+    /// the scan is serving a priority-lane item refresh at that moment, the
+    /// rest of that refresh (it is not the cancelled caller's to stop).
     async fn run_scan(
         &self,
         request: ScanRequest,
@@ -1625,19 +1868,30 @@ impl FerrofinLibraryManager {
             ticket,
         };
         loop {
-            let (result, restart) = {
+            let (result, restart, lost) = {
                 let mut queue = lock_queue(&self.scan_queue);
                 let result = queue.finished.remove(&ticket);
                 // A worker that went away before it drained the queue (its
-                // task dropped) is replaced, so this request still runs.
-                let restart = result.is_none() && !queue.worker && !queue.closed;
+                // task dropped) is replaced, so this request still runs —
+                // only while the request is still queued: with no worker, a
+                // request neither queued nor settled is gone, and starting
+                // workers for it would only drain an empty queue over and
+                // over.
+                let orphaned = result.is_none() && !queue.worker && !queue.closed;
+                let queued = queue.is_queued(ticket);
+                let restart = orphaned && queued;
                 queue.worker |= restart;
-                (result, restart)
+                (result, restart, orphaned && !queued)
             };
             match result {
                 Some(ScanResult::Completed) => return Ok(true),
                 Some(ScanResult::Stopped) => return Ok(false),
                 Some(ScanResult::Failed(message)) => return Err(ServiceError::backend(message)),
+                None if lost => {
+                    return Err(ServiceError::backend(
+                        "the scan request was lost before it ran".to_owned(),
+                    ));
+                }
                 None => {}
             }
             if restart && let Some(runner) = &self.scanner {
@@ -1653,7 +1907,11 @@ impl FerrofinLibraryManager {
     #[cfg(test)]
     fn scan_idle(&self) -> bool {
         let queue = lock_queue(&self.scan_queue);
-        !queue.worker && queue.running.is_none() && queue.pending.is_empty()
+        !queue.worker
+            && queue.running.is_none()
+            && queue.pending.is_empty()
+            && queue.lane.is_empty()
+            && queue.serving.is_empty()
     }
 }
 
@@ -1748,6 +2006,13 @@ mod tests {
         gate: tokio::sync::Semaphore,
         panic_next: std::sync::atomic::AtomicBool,
         fail_next: std::sync::atomic::AtomicBool,
+        /// Serve the priority lane between two items, as the scanner does.
+        serves_lane: std::sync::atomic::AtomicBool,
+        /// The lane refreshes served inside a run: `(run index, target)`.
+        served: Mutex<Vec<(usize, ScanTarget)>>,
+        /// The next lane refresh taken panics the run serving it (before
+        /// handing it back).
+        panic_serving: std::sync::atomic::AtomicBool,
     }
 
     impl GatedRunner {
@@ -1760,7 +2025,14 @@ mod tests {
                 gate: tokio::sync::Semaphore::new(0),
                 panic_next: std::sync::atomic::AtomicBool::new(false),
                 fail_next: std::sync::atomic::AtomicBool::new(false),
+                serves_lane: std::sync::atomic::AtomicBool::new(true),
+                served: Mutex::new(Vec::new()),
+                panic_serving: std::sync::atomic::AtomicBool::new(false),
             })
+        }
+
+        fn served(&self) -> Vec<(usize, ScanTarget)> {
+            self.served.lock().expect("served").clone()
         }
 
         fn runs(&self) -> Vec<Run> {
@@ -1804,6 +2076,25 @@ mod tests {
             };
             self.started.send_modify(|s| *s += 1);
             for item in 1..=Self::ITEMS {
+                // Between two items: the lane's refreshes run inline.
+                if let Some(lane) = run
+                    .lane
+                    .filter(|_| self.serves_lane.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    while let Some(refresh) = lane.next() {
+                        assert!(
+                            !self
+                                .panic_serving
+                                .swap(false, std::sync::atomic::Ordering::SeqCst),
+                            "a served refresh panicked"
+                        );
+                        self.served
+                            .lock()
+                            .expect("served")
+                            .push((index, refresh.target.clone()));
+                        lane.done(refresh, &Ok(crate::library_scan::ScanOutcome::default()));
+                    }
+                }
                 if run.cancel.is_cancelled() {
                     self.runs.lock().expect("runs")[index].stopped = true;
                     return Ok(crate::library_scan::ScanOutcome {
@@ -2112,6 +2403,165 @@ mod tests {
             ]
         );
         until_idle(&mgr).await;
+    }
+
+    /// The Identify refresh (`run_refresh_scan`) goes into the priority lane:
+    /// with a scan running, that scan serves it between two of its items, so
+    /// the caller waits about one item — not for the scan — and the scan
+    /// then goes on. Without a scanner it refuses rather than pretending.
+    #[tokio::test]
+    async fn an_identify_is_served_inside_the_running_scan() {
+        let db = test_db().await;
+        assert!(
+            manager(&db)
+                .run_refresh_scan(ScanTarget::All, &replace_all())
+                .await
+                .is_err(),
+            "no scanner: refused"
+        );
+        let runner = GatedRunner::new();
+        let mgr = Arc::new(manager(&db).with_scan_runner(runner.clone()));
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let item = ScanTarget::Items(vec!["/media/movies/Heat (1995)/Heat (1995).mkv".into()]);
+        let waiting = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            let item = item.clone();
+            async move { mgr.run_refresh_scan(item, &replace_all()).await }
+        });
+        // Not queued behind the running scan: waiting in the lane.
+        for _ in 0..500 {
+            if !lock_queue(&mgr.scan_queue).lane.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!waiting.is_finished());
+        // The running scan finishes one item and serves the lane.
+        runner.release(1);
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("returned without waiting for the scan")
+            .expect("task")
+            .expect("refresh");
+        assert!(ran);
+        assert_eq!(runner.served(), vec![(0, item)]);
+        let runs = runner.runs();
+        assert_eq!(runs.len(), 1, "no scan of its own");
+        assert_eq!(runs[0].items, 1, "the scan is still running");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(runner.runs()[0].items, GatedRunner::ITEMS);
+    }
+
+    /// A scan that panics while it serves a lane refresh (past the scanner's
+    /// own guard) cannot strand the refresh's waiter: the worker settles it
+    /// as failed, the waiter gets the error, and no worker is started for a
+    /// request that no longer exists (it used to restart workers over an
+    /// empty queue in a hot loop).
+    #[tokio::test]
+    async fn a_refresh_lost_with_a_panicking_scan_fails_its_waiter() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = Arc::new(manager(&db).with_scan_runner(runner.clone()));
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let waiting = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move {
+                mgr.run_refresh_scan(ScanTarget::Items(vec!["/m/a.mkv".into()]), &replace_all())
+                    .await
+            }
+        });
+        for _ in 0..500 {
+            if !lock_queue(&mgr.scan_queue).lane.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        runner
+            .panic_serving
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(1);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("the waiter was not stranded")
+            .expect("task")
+            .expect_err("its refresh was lost");
+        assert!(
+            err.to_string().contains("ended before it finished"),
+            "{err}"
+        );
+        until_idle(&mgr).await;
+        // No worker churn: nothing more runs, and the queue stays quiet.
+        let progress = *mgr.scan_progress.borrow();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*mgr.scan_progress.borrow(), progress, "no worker restarted");
+        assert_eq!(runner.runs().len(), 1);
+        // And the queue still works.
+        runner.release(GatedRunner::ITEMS);
+        mgr.run_refresh_scan(ScanTarget::Items(vec!["/m/b.mkv".into()]), &replace_all())
+            .await
+            .expect("the next refresh runs");
+    }
+
+    /// With no scan to serve it, a file item's refresh runs ahead of every
+    /// queued scan (the lane first), and lane refreshes keep their order.
+    #[tokio::test]
+    async fn item_refreshes_run_ahead_of_queued_scans_in_order() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        runner
+            .serves_lane
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let library = Uuid::from_u128(0xA);
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        mgr.queue_refresh_scan(ScanTarget::Library(library), &replace_all())
+            .await
+            .expect("folder refresh");
+        let first = ScanTarget::Items(vec!["/m/a.mkv".into()]);
+        let second = ScanTarget::Items(vec!["/m/b.mkv".into()]);
+        for item in [&first, &second] {
+            mgr.queue_refresh_scan(item.clone(), &replace_all())
+                .await
+                .expect("item refresh");
+        }
+        runner.release(4 * GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        let scopes: Vec<ScanTarget> = runner.runs().into_iter().map(|r| r.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![ScanTarget::All, first, second, ScanTarget::Library(library)]
+        );
+    }
+
+    /// A running scan serves every waiting lane refresh at its next item
+    /// boundary, in the order they were queued.
+    #[tokio::test]
+    async fn a_running_scan_serves_the_lane_in_order() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let targets: Vec<ScanTarget> = ["/m/a.mkv", "/m/b.mkv", "/m/c.mkv"]
+            .iter()
+            .map(|p| ScanTarget::Items(vec![(*p).to_owned()]))
+            .collect();
+        for target in &targets {
+            mgr.queue_refresh_scan(target.clone(), &replace_all())
+                .await
+                .expect("item refresh");
+        }
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.served(),
+            targets.into_iter().map(|t| (0, t)).collect::<Vec<_>>()
+        );
+        assert_eq!(runner.runs().len(), 1);
     }
 
     /// A scan that panics must not wedge scanning either: it is contained in
@@ -2434,6 +2884,8 @@ mod tests {
             options,
             ancestors: MetadataRefreshOptions::default(),
             trigger: "test",
+            passes: ScanPasses::Library,
+            priority: false,
         }
     }
 

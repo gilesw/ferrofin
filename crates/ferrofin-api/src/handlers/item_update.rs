@@ -7,8 +7,9 @@
 //! - `POST /Items/{itemId}/ContentType` — sets (or clears) the configured
 //!   content-type override for the item's folder in the server configuration.
 //! - `POST /Items/{itemId}/Refresh` — queues a metadata/image refresh for the
-//!   item at high priority; a folder's refresh is a scan of its subtree with
-//!   the request's options.
+//!   item at high priority: a folder's refresh is a scan of its subtree, a
+//!   file item's a scan of its own path, both with the request's options; an
+//!   item with no file of its own refreshes through the provider manager.
 //! - `GET /Items/{itemId}/MetadataEditor` — the reference data (parental ratings,
 //!   countries, cultures, external-id descriptors, content-type options) a client
 //!   needs to render the item's metadata editor.
@@ -37,6 +38,8 @@ use ferrofin_model::entities::MetadataField;
 use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+
+use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -720,9 +723,11 @@ struct RefreshQuery {
 /// `ProviderManager.RefreshItem` and `RefreshArtist`
 /// (`ProviderManager.cs:1211-1290`).
 struct RefreshRoute {
-    /// The folders validated with the request's options, as a scan.
+    /// The folders validated, or the file refreshed, with the request's
+    /// options, as a scan.
     scan: Option<ScanTarget>,
-    /// The item's own refresh (the provider queue, as a leaf's).
+    /// The item's own refresh through the provider manager (an item with no
+    /// file of its own).
     item: bool,
 }
 
@@ -744,49 +749,65 @@ impl RefreshRoute {
     }
 }
 
-/// Routes an item's refresh. A CollectionFolder refreshes its physical
-/// folders (`RefreshCollectionFolderChildren`), the root every library, a
-/// music artist as [`artist_refresh_route`] says, and any other folder
-/// validates its own children — its subtree, not its whole library — which
-/// the scan refreshes along with the folder itself.
-///
-/// The item refreshes itself, as a leaf does, when upstream validates no
-/// children for it: a box set's members and a playlist's entries are
-/// linked, not physical (`BoxSet.GetNonCachedChildren` returns none,
-/// `Playlist.ValidateChildrenInternal` is a no-op), a view's folder holds
-/// none, and a folder with no path of its own — a virtual season, whose
-/// episodes sit in the series folder — is not `IsFileProtocol`, so
-/// `ValidateChildrenInternal2` validates and refreshes no child
-/// (`Folder.cs:430-436,780-812`).
+/// Routes an item's refresh. A music artist refreshes as
+/// [`artist_refresh_route`] says; everything else as
+/// [`refresh_scan_target`] says, and the item refreshes itself through the
+/// provider manager when no scan covers it.
 async fn refresh_route(
     state: &AppState,
     item: &BaseItemEntity,
     item_id: Uuid,
 ) -> Result<RefreshRoute, ApiError> {
-    let kind = BaseItemKind::from_stored_type_name(&item.type_);
-    if kind == Some(BaseItemKind::MusicArtist) {
+    if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::MusicArtist) {
         return artist_refresh_route(state, item, item_id).await;
     }
+    Ok(match refresh_scan_target(item, item_id) {
+        Some(target) => RefreshRoute::scan(target),
+        None => RefreshRoute::item_only(),
+    })
+}
+
+/// The scan an item's refresh is (`ProviderManager.RefreshItem`), if any. A
+/// CollectionFolder refreshes its physical folders
+/// (`RefreshCollectionFolderChildren`), the root every library, and any
+/// other folder validates its own children — its subtree, not its whole
+/// library — which the scan refreshes along with the folder itself.
+///
+/// A file item (a movie, an episode, a track, a book, a photo, a video…)
+/// refreshes itself (`RefreshSingleItem`) through the same metadata service
+/// the scan runs: here the scan of its one path, so it gets the scan's
+/// refresh decision, merge, field locks, probe, NFO and every metadata
+/// provider, and nothing else of its library is walked.
+///
+/// No scan covers an item upstream validates no children for and that has
+/// no file of its own: a box set's members and a playlist's entries are
+/// linked, not physical (`BoxSet.GetNonCachedChildren` returns none,
+/// `Playlist.ValidateChildrenInternal` is a no-op), a view's folder holds
+/// none, a folder with no path of its own — a virtual season, whose episodes
+/// sit in the series folder — is not `IsFileProtocol`, so
+/// `ValidateChildrenInternal2` validates and refreshes no child
+/// (`Folder.cs:430-436,780-812`), and a person, genre, studio or channel
+/// item has no file. Those refresh through the provider manager.
+pub(crate) fn refresh_scan_target(item: &BaseItemEntity, item_id: Uuid) -> Option<ScanTarget> {
     if !item.is_folder {
-        return Ok(RefreshRoute::item_only());
+        return refresh_scan_path(item).map(|path| ScanTarget::Items(vec![path]));
     }
-    Ok(match kind {
-        Some(BaseItemKind::CollectionFolder) => RefreshRoute::scan(ScanTarget::Library(item_id)),
-        Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder) => {
-            RefreshRoute::scan(ScanTarget::All)
-        }
+    match BaseItemKind::from_stored_type_name(&item.type_) {
+        Some(BaseItemKind::CollectionFolder) => Some(ScanTarget::Library(item_id)),
+        Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder) => Some(ScanTarget::All),
         Some(
             BaseItemKind::BoxSet
             | BaseItemKind::Playlist
             | BaseItemKind::ManualPlaylistsFolder
             | BaseItemKind::PlaylistsFolder
             | BaseItemKind::UserView,
-        ) => RefreshRoute::item_only(),
-        _ => match item.path.clone().filter(|p| !p.is_empty()) {
-            Some(path) => RefreshRoute::scan(ScanTarget::Paths(vec![path])),
-            None => RefreshRoute::item_only(),
-        },
-    })
+        ) => None,
+        _ => item
+            .path
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(|path| ScanTarget::Paths(vec![path])),
+    }
 }
 
 /// `ProviderManager.RefreshArtist` (`ProviderManager.cs:1258-1290`): the
@@ -937,65 +958,42 @@ async fn refresh_item(
         .image_refresh_mode
         .map_or(MetadataRefreshMode::None, MetadataRefreshMode::from);
 
+    // Every refresh runs with the request's options: both modes (`None`
+    // when omitted, `ItemRefreshController.cs:64-65`), the replace flags,
+    // `ForceSave` and `RemoveOldMetadata` as the controller sets them
+    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
+    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    let options = MetadataRefreshOptions::for_item_refresh(
+        metadata_refresh_mode,
+        image_refresh_mode,
+        query.replace_all_metadata.unwrap_or(false),
+        query.replace_all_images.unwrap_or(false),
+        query.regenerate_trickplay.unwrap_or(false),
+    );
     // Refreshing a folder (a library's CollectionFolder, a series, a season,
     // an album…) means "validate its children" — `folder.ValidateChildren(…,
     // options)` — so it drives the filesystem scan over that folder's subtree,
-    // and every item in it refreshes with the request's options: both modes
-    // (`None` when omitted, `ItemRefreshController.cs:64-65`), the replace
-    // flags, `ForceSave` and `RemoveOldMetadata` as the controller sets them
-    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
-    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    // and every item in it refreshes with those options. A file item's
+    // refresh is the scan of its own path: the scan's refresh decision and
+    // merge, with the probe (upstream probes inside `RefreshMetadata`, so a
+    // "Search for missing metadata" re-probes the file and a Default refresh
+    // of an unchanged one does not), the NFO and every metadata provider.
     let route = refresh_route(&state, &item, item_id).await?;
     if let Some(target) = route.scan {
-        let options = MetadataRefreshOptions::for_item_refresh(
-            metadata_refresh_mode,
-            image_refresh_mode,
-            query.replace_all_metadata.unwrap_or(false),
-            query.replace_all_images.unwrap_or(false),
-            query.regenerate_trickplay.unwrap_or(false),
-        );
         state.library.queue_refresh_scan(target, &options).await?;
     }
     if !route.item {
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    // Leaf-item metadata/image refresh goes to the provider queue: the enqueue
-    // spawns a background TMDB refresh (movies/series by title; seasons/episodes
-    // via their parent series) and this request 204s immediately, like the C#
-    // queued refresh. Kinds with no provider (music) no-op faithfully. A box
-    // set, a playlist, a view, a virtual season and a by-name artist refresh
-    // here too (see `refresh_route`).
-    //
-    // TODO(parity, open work item — PLAN_SCAN_CHANGE_DETECTION Phase 5b): this
-    // path still refreshes through `provider_manager`'s own appliers, so it
-    // keeps `RemoveOldMetadata` and `ForceSave` off where
-    // `ItemRefreshController` sets them (`MetadataRefreshOptions::
-    // for_item_refresh`). Phase 5b routes it through the scan's refresh
-    // decision and merge, and switches it to those options.
-    let options = MetadataRefreshOptions {
-        metadata_refresh_mode,
-        image_refresh_mode,
-        replace_all_metadata: query.replace_all_metadata.unwrap_or(false),
-        replace_all_images: query.replace_all_images.unwrap_or(false),
-        search_result: None,
-        remove_old_metadata: false,
-        force_save: false,
-        regenerate_trickplay: query.regenerate_trickplay.unwrap_or(false),
-    };
+    // An item with no file of its own — a box set, a playlist, a view, a
+    // virtual season, a person, a by-name artist — refreshes through the
+    // provider queue: the enqueue spawns the refresh and this request 204s
+    // immediately, like the C# queued refresh.
     state
         .providers
         .queue_refresh(item_id, &options, RefreshPriority::High)
         .await?;
-    // Re-probe the file so a metadata refresh also corrects stale media info
-    // (duration, codecs, HDR/Dolby-Vision fields added since the first scan).
-    // This is the media-info half of the C# refresh; best-effort, so a probe
-    // failure doesn't fail the request.
-    if !matches!(metadata_refresh_mode, MetadataRefreshMode::None)
-        && let Err(e) = state.media_sources.refresh_media_streams(item_id).await
-    {
-        tracing::warn!(%item_id, error = %e, "media re-probe during refresh failed");
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
