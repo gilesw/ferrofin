@@ -517,6 +517,13 @@ async fn serve_once(
 }
 
 /// Stops lifetime-owned services and scheduled runs before closing their database.
+///
+/// The library scan runs on its own worker, detached from every task: it is
+/// stopped explicitly — the running scan cancelled, the queued ones dropped,
+/// new ones refused — and awaited (at most one item's writes), so a restart
+/// never cuts a scan mid-item with the pool closing under it, and a backup
+/// restore (applied by the next lifetime, after this one's teardown) never
+/// races a scan writing into the tree it replaces.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
@@ -524,6 +531,7 @@ async fn tear_down_host(
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
     cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    wired.state.library.shutdown_scans().await;
     stop_background_tasks(wired.background).await;
 }
 

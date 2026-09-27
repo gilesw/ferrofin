@@ -96,9 +96,23 @@ fn first_run_delay(task_key: &str) -> chrono::TimeDelta {
 pub struct TaskProgress {
     /// The current percentage, stored as `f64` bits.
     percent: Arc<AtomicU64>,
+    /// Set by [`stopped`](Self::stopped).
+    stopped: Arc<AtomicBool>,
 }
 
 impl TaskProgress {
+    /// Marks the run as stopped before its work finished, so it is recorded
+    /// [`Cancelled`](TaskCompletionStatus::Cancelled) rather than
+    /// `Completed` — upstream's `ExecuteAsync` throwing
+    /// `OperationCanceledException` (`ScheduledTaskWorker.ExecuteInternal`).
+    pub fn stopped(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    fn was_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
     /// Reports the task's completion percentage (clamped to `0.0..=100.0`).
     pub fn report(&self, percent: f64) {
         self.percent
@@ -716,7 +730,7 @@ impl FerrofinTaskManager {
         let (task, progress) = self.claim(key)?;
         let start = Utc::now();
         let outcome = task.execute(&progress).await;
-        self.finish(key, &task, start, &outcome);
+        self.finish(key, &task, start, &outcome, &progress);
         outcome
     }
 
@@ -764,7 +778,11 @@ impl FerrofinTaskManager {
                 tracing::info!("scheduled task started");
                 let outcome = task.execute(&progress).await;
                 let elapsed_ms = started.elapsed().as_millis();
-                let result = if outcome.is_ok() { "completed" } else { "failed" };
+                let result = match &outcome {
+                    Ok(()) if progress.was_stopped() => "cancelled",
+                    Ok(()) => "completed",
+                    Err(_) => "failed",
+                };
                 tracing::Span::current().record("outcome", result);
                 match &outcome {
                     Ok(()) => tracing::info!(elapsed_ms, outcome = result, "scheduled task finished"),
@@ -773,7 +791,7 @@ impl FerrofinTaskManager {
                         tracing::error!(elapsed_ms, outcome = result, error = %e, "scheduled task failed");
                     }
                 }
-                this.finish(&key_owned, &task, start, &outcome);
+                this.finish(&key_owned, &task, start, &outcome, &progress);
             }
             .instrument(span),
         );
@@ -815,8 +833,10 @@ impl FerrofinTaskManager {
         task: &Arc<dyn ScheduledTask>,
         start: chrono::DateTime<Utc>,
         outcome: &Result<(), ServiceError>,
+        progress: &TaskProgress,
     ) {
         let (status, error_message) = match outcome {
+            Ok(()) if progress.was_stopped() => (TaskCompletionStatus::Cancelled, None),
             Ok(()) => (TaskCompletionStatus::Completed, None),
             Err(e) => (TaskCompletionStatus::Failed, Some(e.to_string())),
         };
@@ -1178,7 +1198,7 @@ impl ScheduledTask for RefreshLibraryTask {
             ..TaskTriggerInfo::default()
         }]
     }
-    async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // AWAITS the scan, it does not queue it. Upstream's task body is
         // `await ValidateMediaLibraryInternal(progress, ct)`
         // (v10.11.8 `RefreshMediaLibraryTask.ExecuteAsync`:57-64), so the task
@@ -1187,8 +1207,20 @@ impl ScheduledTask for RefreshLibraryTask {
         // dashboard showed "Scan Media Library" idle while it ran, and
         // `LastExecutionResult.EndTimeUtc` advanced before a single item had
         // been re-read. `run_library_scan` tags the run `schedule` so its own
-        // root trace still records the origin.
-        self.library.run_library_scan().await
+        // root trace still records the origin. The scan's progress is the
+        // task's (the dashboard's "Scan Media Library" bar), and a scan that
+        // failed fails the task.
+        let sink = progress.clone();
+        let finished = self
+            .library
+            .run_library_scan(Some(Arc::new(move |percent| sink.report(percent))))
+            .await?;
+        // Stopped (the host shutting down) or refused (already shut down):
+        // cancelled, not completed.
+        if !finished {
+            progress.stopped();
+        }
+        Ok(())
     }
 }
 

@@ -390,3 +390,138 @@ async fn a_rescan_drops_a_stored_provider_id_of_the_wrong_shape() {
         .unwrap_or_default();
     assert_eq!(ids, [("Imdb".to_owned(), "tt0133093".to_owned())]);
 }
+
+/// "Replace all metadata" erases only what something re-supplies: upstream
+/// merges nothing at all when no provider answered
+/// (`if (refreshResult.UpdateType > ItemUpdateType.None)`,
+/// `MetadataService.cs:895-897`). A series with its fetchers off (here, none
+/// wired), no NFO and nothing to probe keeps its whole row.
+#[tokio::test]
+async fn a_replace_that_nothing_answers_leaves_the_row_untouched() {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let series = media.join("Show");
+    let season = series.join("Season 01");
+    std::fs::create_dir_all(&season).expect("mkdir");
+    std::fs::write(season.join("Show S01E01.mkv"), b"").expect("write");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows).await;
+    let scanner = fx.scanner();
+    scanner.scan_all().await.expect("first scan");
+
+    let mut row = fx.row(BaseItemKind::Series, &series).await;
+    row.overview = Some("A show.".into());
+    row.genres = Some("Drama".into());
+    row.studios = Some("HBO".into());
+    row.tags = Some("mine".into());
+    row.community_rating = Some(8.5);
+    row.production_year = Some(2001);
+    fx.persistence
+        .save_items(std::slice::from_ref(&row))
+        .await
+        .expect("edit");
+    let before = fx.row(BaseItemKind::Series, &series).await;
+
+    let replace = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::FullRefresh,
+        MetadataRefreshMode::FullRefresh,
+        true,
+        false,
+        false,
+    );
+    scanner.scan_with(None, &replace).await.expect("replace");
+    let after = fx.row(BaseItemKind::Series, &series).await;
+    assert_eq!(after.overview, before.overview);
+    assert_eq!(after.genres, before.genres);
+    assert_eq!(after.studios, before.studios);
+    assert_eq!(after.tags, before.tags);
+    assert_eq!(after.community_rating, before.community_rating);
+    assert_eq!(after.production_year, before.production_year);
+    assert_eq!(after.name, before.name);
+}
+
+/// `ProviderManager.RefreshArtist` on artist A, whose one credited album is
+/// filed under artist B: B's folder validates its CHILDREN — the album and
+/// its track refresh with the request's options — and A refreshes itself;
+/// B itself and A's own albums (not credited, not under B) are not touched.
+#[tokio::test]
+async fn an_artist_refresh_touches_its_albums_folders_children_and_itself_only() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("music");
+    let artist_a = media.join("Artist A");
+    let artist_b = media.join("Artist B");
+    let own_album = artist_a.join("Album A1");
+    let duets = artist_b.join("Duets");
+    for (album, track) in [(&own_album, "01 - a.mp3"), (&duets, "01 - d.mp3")] {
+        std::fs::create_dir_all(album).expect("mkdir");
+        std::fs::write(album.join(track), b"").expect("write");
+    }
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::music).await;
+    let scanner = fx.scanner();
+    scanner.scan_all().await.expect("first scan");
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateLastSaved" = '2000-01-01 00:00:00.0000000'"#)
+        .execute(fx.db.writer())
+        .await
+        .expect("age every row");
+
+    let replace = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::FullRefresh,
+        MetadataRefreshMode::FullRefresh,
+        true,
+        false,
+        false,
+    );
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let a_id = derive_item_id(BaseItemKind::MusicArtist, &artist_a.to_string_lossy()).expect("id");
+    scanner
+        .scan_target(
+            &ScanTarget::Artist {
+                id: a_id,
+                path: Some(artist_a.to_string_lossy().into_owned()),
+                folders: vec![artist_b.to_string_lossy().into_owned()],
+            },
+            ScanRun {
+                options: &replace,
+                ancestors: &none,
+                cancel: &ScanCancel::new(),
+                progress: None,
+            },
+        )
+        .await
+        .expect("artist refresh");
+
+    let saved = |kind, path: &Path| {
+        let fx = &fx;
+        let path = path.to_path_buf();
+        async move {
+            fx.raw_dates(kind, &path).await.0.as_deref() != Some("2000-01-01 00:00:00.0000000")
+        }
+    };
+    assert!(
+        saved(BaseItemKind::MusicArtist, &artist_a).await,
+        "A refreshed itself"
+    );
+    assert!(
+        saved(BaseItemKind::MusicAlbum, &duets).await,
+        "B's child album"
+    );
+    assert!(
+        saved(BaseItemKind::Audio, &duets.join("01 - d.mp3")).await,
+        "and its track"
+    );
+    assert!(
+        !saved(BaseItemKind::MusicArtist, &artist_b).await,
+        "B itself is not refreshed"
+    );
+    assert!(
+        !saved(BaseItemKind::MusicAlbum, &own_album).await,
+        "A's own album is not under a validated folder"
+    );
+}

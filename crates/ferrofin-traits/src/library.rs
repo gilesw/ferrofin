@@ -47,6 +47,38 @@ use crate::options::{
     DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery, ItemImageInfo,
 };
 use crate::persistence::ItemWithCounts;
+use crate::providers::MetadataRefreshOptions;
+
+/// Where a scan reports how far it got, in percent (0–100) — the
+/// `IProgress<double>` a scheduled task hands its work.
+pub type ScanProgressSink = std::sync::Arc<dyn Fn(f64) + Send + Sync>;
+
+/// What a queued refresh scan covers — the item-less stand-in for the
+/// `Folder` a C# refresh validates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanTarget {
+    /// Every library (`RootFolder.ValidateChildren`).
+    All,
+    /// One library, by its CollectionFolder id
+    /// (`ProviderManager.RefreshCollectionFolderChildren`).
+    Library(Uuid),
+    /// The items at or under these filesystem paths — a folder's subtree
+    /// (`Folder.ValidateChildren` on a series, season, album…), or the
+    /// changed paths the library monitor reports.
+    Paths(Vec<String>),
+    /// `ProviderManager.RefreshArtist`: the CHILDREN of `folders` — the
+    /// artist folders the artist's credited albums sit under — and the
+    /// artist itself (its own row, when it has a folder at `path`). The items
+    /// of `folders` themselves, other artists, are not refreshed.
+    Artist {
+        /// The artist's id.
+        id: Uuid,
+        /// The artist's own folder, when it is folder-backed.
+        path: Option<String>,
+        /// The artist folders whose children are validated.
+        folders: Vec<String>,
+    },
+}
 
 /// A search match: an item id paired with a relevance score.
 ///
@@ -821,6 +853,34 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await
     }
 
+    /// Queues a scan of `target` whose items refresh with `options` — the
+    /// scan half of a folder's `POST /Items/{itemId}/Refresh`
+    /// (`ProviderManager.RefreshItem`: a CollectionFolder refreshes its
+    /// physical folders, any other folder validates its own children, both
+    /// with the request's options). The folders above a path-scoped target
+    /// are not refreshed (their refresh modes are `None`), as upstream never
+    /// refreshes a folder's ancestors. The other scan entry points refresh
+    /// with the `MetadataRefreshOptions` constructor defaults.
+    ///
+    /// The default refuses: a manager without a scanner cannot honour the
+    /// options, and widening the request into a default full scan would
+    /// silently do something else.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager with no scanner, or whatever
+    /// queueing the scan surfaces.
+    async fn queue_refresh_scan(
+        &self,
+        target: ScanTarget,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (target, options);
+        Err(ServiceError::backend(
+            "queue_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
     /// Runs a full library scan and returns only when it has FINISHED.
     ///
     /// The scheduled-task entry point, and the one place the difference from
@@ -832,11 +892,38 @@ pub trait LibraryManager: Send + Sync {
     /// itself finished in 0 ms with the scan still writing — which is what the
     /// dashboard, and anything that waits on the task, would then believe.
     ///
+    /// `progress`, when given, receives the scan's progress as it runs
+    /// (upstream's `IProgress<double>`: the items take 0–96 %, the closing
+    /// passes 96–100 %).
+    ///
+    /// Returns `Ok(true)` once the scan ran to its end, and `Ok(false)` when
+    /// it was stopped before it finished or refused because scanning has
+    /// shut down — upstream's `OperationCanceledException`, which the task
+    /// records as `Cancelled`.
+    ///
     /// Defaults to the queueing form so implementations with no scanner need no
     /// change; the real manager overrides it.
-    async fn run_library_scan(&self) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
+    ///
+    /// # Errors
+    ///
+    /// The scan failed (or panicked), so the task records `Failed`.
+    async fn run_library_scan(
+        &self,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        let _ = progress;
+        self.queue_library_scan().await.map(|()| true)
     }
+
+    /// Stops scanning for good, as the host tears down: cancels the running
+    /// scan (it stops before its next item, the one in progress written
+    /// whole), drops the queued ones, refuses new ones, and returns once no
+    /// scan is running — before the database it writes to is closed or a
+    /// backup restore replaces its tree.
+    ///
+    /// A manager with no scanner runs no scan, so the default has nothing to
+    /// stop.
+    async fn shutdown_scans(&self) {}
 }
 
 fn _assert_object_safe_library_manager(_: &dyn LibraryManager) {}

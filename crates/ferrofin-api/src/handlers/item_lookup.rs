@@ -319,6 +319,7 @@ async fn apply_search_criteria(
         replace_all_images: query.replace_all_images,
         search_result: Some(search_result),
         remove_old_metadata: true,
+        ..MetadataRefreshOptions::default()
     };
     state.providers.refresh_full_item(item_id, &options).await?;
 

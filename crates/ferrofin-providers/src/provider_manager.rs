@@ -1417,6 +1417,8 @@ impl LocalProviderManager {
             replace_all_images: options.replace_all_images,
             search_result: options.search_result.clone(),
             remove_old_metadata: options.remove_old_metadata,
+            force_save: options.force_save,
+            regenerate_trickplay: options.regenerate_trickplay,
         }
     }
 
@@ -5809,6 +5811,7 @@ mod tests {
             replace_all_images: false,
             search_result: None,
             remove_old_metadata: false,
+            ..MetadataRefreshOptions::default()
         }
     }
 
@@ -7457,6 +7460,7 @@ mod tests {
                 ..RemoteSearchResult::default()
             }),
             remove_old_metadata: true,
+            ..MetadataRefreshOptions::default()
         };
         mgr.refresh_full_item(item_id, &options)
             .await
@@ -7621,6 +7625,7 @@ mod tests {
                 ..RemoteSearchResult::default()
             }),
             remove_old_metadata: true,
+            ..MetadataRefreshOptions::default()
         };
         mgr.refresh_full_item(item_id, &options)
             .await

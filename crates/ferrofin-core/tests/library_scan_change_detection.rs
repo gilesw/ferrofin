@@ -19,6 +19,11 @@
 //! quiet rescan, a provider pass replaces only the fields outside the item's
 //! `LockedFields`, and `LockData` refuses the remote providers while a new
 //! local poster is still discovered.
+//!
+//! And the Phase 5 refresh modes a folder refresh scans with (the dashboard's
+//! three choices, `ValidationOnly`, `None`): which providers run, how their
+//! answer merges onto a stored row carrying an edited and an empty field, and
+//! what is stamped and saved.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -44,6 +49,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamRepository};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 /// An ffprobe stand-in recording each probed path: a video file has a video
 /// and an audio stream, a `.srt` one subtitle stream.
@@ -318,6 +324,10 @@ impl Fixture {
 
     async fn scan(&self) -> ScanOutcome {
         self.scanner.scan_all().await.expect("scan")
+    }
+
+    async fn scan_with(&self, options: &MetadataRefreshOptions) -> ScanOutcome {
+        self.scanner.scan_with(None, options).await.expect("scan")
     }
 
     fn id(path: &Path) -> String {
@@ -1343,4 +1353,173 @@ async fn an_nfo_lockdata_locks_the_item_and_its_lockedfields_join_the_set() {
     assert_eq!(heat_locked, 0, "no <lockdata>: not locked");
     let _ = fx.writes().await;
     assert_eq!(fx.scan().await.unchanged, 2, "and a rescan is quiet");
+}
+
+/// A movie row's stored `(Overview, CommunityRating, Tagline)`.
+async fn edited_fields(fx: &Fixture, path: &Path) -> (Option<String>, Option<f64>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT "Overview", "CommunityRating", "Tagline" FROM "BaseItems" WHERE "Id" = ?1"#,
+    )
+    .bind(Fixture::id(path))
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("row")
+}
+
+/// The Matrix after its first scan, then edited: the overview rewritten, the
+/// rating emptied, and a tagline added that no provider supplies. The
+/// refresh stamp is moved back an hour so a new one shows.
+async fn edited_matrix(tmp: &Path) -> Fixture {
+    let fx = scanned_once(tmp, 0).await;
+    fx.set(&fx.matrix, "Overview", Some("My overview".into()))
+        .await;
+    fx.set(&fx.matrix, "CommunityRating", None).await;
+    fx.set(&fx.matrix, "Tagline", Some("My tagline".into()))
+        .await;
+    let an_hour_ago = db_time(chrono::Utc::now() - chrono::TimeDelta::hours(1));
+    fx.set(&fx.matrix, "DateLastRefreshed", Some(an_hour_ago.clone()))
+        .await;
+    fx.set(&fx.heat, "DateLastRefreshed", Some(an_hour_ago))
+        .await;
+    fx
+}
+
+/// The options `POST /Items/{id}/Refresh` builds for a mode pair.
+fn item_refresh(mode: MetadataRefreshMode, replace_all: bool) -> MetadataRefreshOptions {
+    MetadataRefreshOptions::for_item_refresh(mode, mode, replace_all, false, false)
+}
+
+/// "Scan for new and updated files" (`Default`/`Default`), `ValidationOnly`
+/// and `None` run no provider for an unchanged item: nothing is asked,
+/// nothing written, the edits stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn default_validation_only_and_none_ask_no_provider() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let before = edited_fields(&fx, &fx.matrix).await;
+    for mode in [
+        MetadataRefreshMode::Default,
+        MetadataRefreshMode::ValidationOnly,
+        MetadataRefreshMode::None,
+    ] {
+        assert_eq!(
+            fx.scan_with(&item_refresh(mode, false)).await,
+            ScanOutcome {
+                unchanged: 2,
+                ..ScanOutcome::default()
+            },
+            "{mode:?}"
+        );
+        assert!(fx.tmdb.take().is_empty(), "{mode:?}: no provider request");
+        assert!(fx.probe.take().is_empty(), "{mode:?}: no probe");
+        assert!(fx.writes().await.is_empty(), "{mode:?}: nothing written");
+        assert_eq!(edited_fields(&fx, &fx.matrix).await, before, "{mode:?}");
+    }
+}
+
+/// "Search for missing metadata" (`FullRefresh`, no replace): every provider
+/// runs for every item, the answer only fills what is empty — the edited
+/// overview and the tagline stay, the emptied rating is filled — and every
+/// item is saved (`ForceSave`) with a new `DateLastRefreshed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_for_missing_metadata_fills_gaps_and_keeps_edits() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let stamped = fx.stamps(&fx.matrix).await.1;
+
+    let outcome = fx
+        .scan_with(&item_refresh(MetadataRefreshMode::FullRefresh, false))
+        .await;
+    assert_eq!(
+        outcome,
+        ScanOutcome {
+            updated: 2,
+            ..ScanOutcome::default()
+        },
+        "ForceSave saves every item"
+    );
+    let asked = fx.tmdb.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/movie/603?"))
+            && asked.iter().any(|l| l.contains("/movie/949?")),
+        "every provider runs for every item: {asked:?}"
+    );
+    assert_eq!(
+        fx.probe.take(),
+        ["Heat (1995).mkv", "The Matrix (1999).mkv"],
+        "the probe runs too"
+    );
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (
+            Some("My overview".into()),
+            Some(8.0),
+            Some("My tagline".into())
+        )
+    );
+    assert_ne!(
+        fx.stamps(&fx.matrix).await.1,
+        stamped,
+        "DateLastRefreshed is stamped"
+    );
+}
+
+/// "Replace all metadata" (`FullRefresh` + `ReplaceAllMetadata` +
+/// `RemoveOldMetadata`): the answer replaces the row — the edited overview
+/// and the emptied rating take TMDB's values — and what no provider
+/// re-supplied (the tagline) is cleared. A locked field keeps its value.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_all_metadata_replaces_and_clears_but_keeps_locked_fields() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = edited_matrix(tmp.path()).await;
+    let replace = item_refresh(MetadataRefreshMode::FullRefresh, true);
+
+    assert_eq!(fx.scan_with(&replace).await.updated, 2);
+    assert!(!fx.tmdb.take().is_empty());
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (Some("About The Matrix.".into()), Some(8.0), None)
+    );
+
+    // Lock the Overview field (`MetadataField.Overview = 6`) and edit again.
+    sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (6, ?1)"#)
+        .bind(Fixture::id(&fx.matrix))
+        .execute(fx.db.writer())
+        .await
+        .expect("lock overview");
+    fx.set(&fx.matrix, "Overview", Some("My overview".into()))
+        .await;
+    fx.set(&fx.matrix, "CommunityRating", Some("5".into()))
+        .await;
+    fx.set(&fx.matrix, "Tagline", Some("My tagline".into()))
+        .await;
+    assert_eq!(fx.scan_with(&replace).await.updated, 2);
+    assert_eq!(
+        edited_fields(&fx, &fx.matrix).await,
+        (Some("My overview".into()), Some(8.0), None),
+        "the locked overview is kept; the rest is replaced"
+    );
+}
+
+/// "Replace all metadata" erases only when something replaces the old
+/// values: when every remote provider failed with no answer, the stored row
+/// is kept (`MetadataService.cs:897-906`), and the failed pass is not
+/// stamped, so it is retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_all_metadata_keeps_the_row_when_every_provider_failed() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = scanned_once(tmp.path(), 0).await;
+    fx.set(&fx.heat, "Overview", Some("Kept".into())).await;
+    fx.set(&fx.heat, "Tagline", Some("Kept tagline".into()))
+        .await;
+    let stamped = fx.stamps(&fx.heat).await.1;
+    fx.tmdb.answer_heat(Answer::Fail);
+
+    fx.scan_with(&item_refresh(MetadataRefreshMode::FullRefresh, true))
+        .await;
+    assert_eq!(
+        edited_fields(&fx, &fx.heat).await,
+        (Some("Kept".into()), Some(8.0), Some("Kept tagline".into()))
+    );
+    assert_eq!(fx.stamps(&fx.heat).await.1, stamped, "not stamped");
 }
