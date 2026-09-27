@@ -1006,8 +1006,10 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
 }
 
 /// A new episode in an existing season: it is created, its season (whose
-/// directory mtime moved) is refreshed, and its series and sibling are left
-/// alone.
+/// directory mtime moved) is refreshed, and its sibling is left alone. The
+/// series is written only for the date of its newest episode
+/// (`UpdateDateLastMediaAdded`, which upstream's refresh of the series
+/// saves), and so its `DateLastSaved` moves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -1055,7 +1057,11 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
             ..ScanOutcome::default()
         }
     );
-    assert_eq!(saved(tv.join("Show"), BaseItemKind::Series).await, before.0);
+    assert_ne!(
+        saved(tv.join("Show"), BaseItemKind::Series).await,
+        before.0,
+        "its DateLastMediaAdded moved"
+    );
     assert_eq!(saved(sibling, BaseItemKind::Episode).await, before.1);
     assert_ne!(saved(season, BaseItemKind::Season).await, before.2);
 }

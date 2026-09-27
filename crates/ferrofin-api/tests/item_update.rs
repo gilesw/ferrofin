@@ -1481,7 +1481,9 @@ async fn refresh_virtual_season_refreshes_only_itself() {
 /// folders its credited albums sit under are scanned with the request's
 /// options, an album with no artist folder above it is not (its artist is
 /// the by-name one, whose validation is a no-op upstream), and the artist
-/// refreshes itself.
+/// refreshes itself — in the same scan (`path: None`), whose music pass runs
+/// its MusicBrainz/TheAudioDB providers, never beside it through the
+/// provider queue.
 #[tokio::test]
 async fn refresh_by_name_artist_scans_its_albums_artist_folders_and_refreshes_itself() {
     let artist_id = Uuid::from_u128(0xA1);
@@ -1528,11 +1530,29 @@ async fn refresh_by_name_artist_scans_its_albums_artist_folders_and_refreshes_it
         scans[0].1.metadata_refresh_mode,
         MetadataRefreshMode::FullRefresh
     );
-    assert_eq!(
-        queued,
-        vec![artist_id],
-        "the by-name artist refreshes itself"
+    assert!(
+        queued.is_empty(),
+        "the scan refreshes the by-name artist itself: {queued:?}"
     );
+
+    // With no credited album under an artist folder there is nothing to
+    // validate: the scan target is the artist alone.
+    let by_name = folder_row(
+        artist_id,
+        artist_kind,
+        Some("/config/metadata/artists/Various"),
+        None,
+    );
+    let (scans, queued) = refresh_folder(by_name, Vec::new(), SEARCH_MISSING).await;
+    assert_eq!(
+        scans.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+        vec![ScanTarget::Artist {
+            id: artist_id,
+            path: None,
+            folders: Vec::new(),
+        }]
+    );
+    assert!(queued.is_empty(), "{queued:?}");
 }
 
 /// A folder-backed artist refreshes itself in the scan, and only the artist

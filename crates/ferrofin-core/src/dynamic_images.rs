@@ -51,8 +51,13 @@
 //!   (`FullRefresh` / `ReplaceAllMetadata`, [`DynamicImageProviders::refresh_item`]
 //!   with `force`).
 //!
-//! The pass runs at the end of every library scan over every supported row
-//! ([`DynamicImageProviders::refresh_all`]). Upstream's `GenresValidator`
+//! The pass runs at the end of every library validation that was not
+//! cancelled — a rescan that changed nothing included, since a genre or a
+//! playlist the metadata editor or `POST /Playlists` created is no scan
+//! change — over every supported row, each gated by the rule above
+//! ([`DynamicImageProviders::refresh_all_between`], which serves the scan's
+//! item-refresh lane between two rows). An item or folder refresh runs
+//! none of it. Upstream's `GenresValidator`
 //! only refreshes genres it is seeing for the first time, so a genre whose
 //! movies gained posters *after* it was created stays blank there until a
 //! manual refresh; Ferrofin re-evaluates the (cheap) `HasChanged` gate each

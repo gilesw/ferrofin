@@ -282,12 +282,13 @@ fn default_true() -> bool {
 /// it has run (`RefreshFullItem` is awaited).
 ///
 /// The refresh is `ProviderManager.RefreshItem`'s: an item with a path — a
-/// movie, a series and its whole subtree, an album — refreshes through the
-/// library scan of that path, whose metadata service skips the local readers
-/// (the NFO) when identifying and pins every fetcher (TMDB, TVDB, OMDb) to
-/// the chosen ids, the fetcher the result came from first; an item with no
-/// file of its own (a box set, a person, a by-name artist) through the
-/// provider manager.
+/// movie, a series and its whole subtree, an album, an artist folder —
+/// refreshes through the library scan of that path, whose metadata service
+/// skips the local readers (the NFO) when identifying and pins every fetcher
+/// (TMDB, TVDB, OMDb, MusicBrainz, TheAudioDB) to the chosen ids, the
+/// fetcher the result came from first; an artist known only by name through
+/// the scanner's own refresh of it; any other item with no file of its own
+/// (a box set, a person) through the provider manager.
 #[utoipa::path(
     post,
     path = "/Items/RemoteSearch/Apply/{itemId}",
@@ -335,7 +336,23 @@ async fn apply_search_criteria(
         remove_old_metadata: true,
         ..MetadataRefreshOptions::default()
     };
-    match crate::handlers::item_update::refresh_scan_target(&item, item_id) {
+    // An artist known only by name has no folder of its own: the scanner
+    // refreshes it as `RefreshFullItem` → `RefreshItem` does — itself, with
+    // the chosen ids — in the scan queue's priority lane (its by-name folder
+    // validation is a no-op upstream).
+    let by_name_artist = BaseItemKind::from_stored_type_name(&item.type_)
+        == Some(BaseItemKind::MusicArtist)
+        && item.top_parent_id.as_deref().is_none_or(str::is_empty);
+    let target = if by_name_artist {
+        Some(ferrofin_traits::library::ScanTarget::Artist {
+            id: item_id,
+            path: None,
+            folders: Vec::new(),
+        })
+    } else {
+        crate::handlers::item_update::refresh_scan_target(&item, item_id)
+    };
+    match target {
         Some(target) => {
             if !crate::handlers::scan_reaches(&state, &target).await? {
                 tracing::warn!(

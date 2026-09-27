@@ -50,6 +50,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   child's own field locks honoured. A locked item still has its local artwork validated
   (a new `poster.jpg` is found). See [docs/UPGRADING.md](docs/UPGRADING.md) for items
   locked by earlier versions
+- Fetcher choices follow Jellyfin's gate for every kind, in scans and single-item refreshes:
+  a kind a library saved no fetcher choices for, and an item in no library (an artist known
+  only by name), now uses the server-wide metadata options — their disabled fetchers and
+  their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
+  artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ## [1.0.0] - 2026-09-05
 

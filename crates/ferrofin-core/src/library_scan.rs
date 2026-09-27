@@ -73,6 +73,7 @@ use crate::refresh_plan::{
     FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
     ProbeKind, RefreshRequest, StoredState,
 };
+use music::{MusicKind, MusicRefresh};
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
 /// its seasons/episodes reuse that match (and its per-season episode stills).
@@ -490,21 +491,25 @@ async fn fetch_image_files(
 /// `LibraryOptions`. The advertised names in [`fetcher_names`] are the
 /// currency: a saved `TypeOptions` entry for an item kind is authoritative
 /// (a fetcher is enabled iff listed, ranked by its position in the order
-/// list), while a library with no entry for the kind enables everything in
-/// the default chain order. A default policy (no library resolved) is
-/// fully permissive — exactly the pre-gating behavior.
+/// list), while a library with no entry for the kind — or an item in no
+/// library — is gated by the server-wide `MetadataOptions` for the kind
+/// ([`global`](Self::global)), as upstream's `IsMetadataFetcherEnabled`
+/// falls back to them. A default policy (no library, no server-wide options)
+/// is fully permissive — exactly the pre-gating behavior.
 #[derive(Clone, Copy, Default)]
 struct FetcherPolicy<'a> {
     options: Option<&'a LibraryOptionsModel>,
+    /// The server-wide per-kind `MetadataOptions`
+    /// (`ServerConfiguration.MetadataOptions`), the answer for a kind the
+    /// library saved no `TypeOptions` entry for.
+    global: Option<&'a [ferrofin_model::configuration::MetadataOptions]>,
 }
 
 impl<'a> FetcherPolicy<'a> {
-    fn type_entry(self, kind: &str) -> Option<&'a ferrofin_model::configuration::TypeOptions> {
-        self.options?.type_options.iter().find(|t| {
-            t.type_
-                .as_deref()
-                .is_some_and(|t| t.eq_ignore_ascii_case(kind))
-        })
+    /// The server-wide options for `kind`
+    /// (`GetMetadataOptionsForType`), if the configuration names any.
+    fn global_for(self, kind: &str) -> Option<&'a ferrofin_model::configuration::MetadataOptions> {
+        ferrofin_providers::library_options::global_metadata_options(self.global?, kind)
     }
 
     /// Whether the library enabled metadata fetcher `name` for `kind`.
@@ -513,7 +518,12 @@ impl<'a> FetcherPolicy<'a> {
     /// `ferrofin-providers` answer this question with one implementation —
     /// C# has exactly one (`BaseItemManager.IsMetadataFetcherEnabled`).
     fn metadata_enabled(self, kind: &str, name: &str) -> bool {
-        ferrofin_providers::library_options::metadata_fetcher_enabled(self.options, kind, name)
+        ferrofin_providers::library_options::metadata_fetcher_enabled(
+            self.options,
+            self.global_for(kind),
+            kind,
+            name,
+        )
     }
 
     /// The fetcher's admin-order position for `kind` (lower = higher
@@ -522,17 +532,29 @@ impl<'a> FetcherPolicy<'a> {
     ///
     /// Delegates to the shared order for the same reason
     /// [`metadata_enabled`](Self::metadata_enabled) does: C# has one
-    /// `GetConfiguredOrder`, and the remote-search path in `ferrofin-providers`
-    /// ranks its fetchers with it too.
+    /// `GetConfiguredOrder`. A library that saved no `TypeOptions` entry for
+    /// the kind — or an item in no library — ranks by the server-wide order
+    /// (`typeOptions?.MetadataFetcherOrder ??
+    /// globalMetadataOptions.MetadataFetcherOrder`, `ProviderManager.cs:525`).
     fn metadata_rank(self, kind: &str, name: &str) -> usize {
-        ferrofin_providers::library_options::metadata_fetcher_rank(self.options, kind, name)
+        ferrofin_providers::library_options::metadata_fetcher_rank(
+            self.options,
+            self.global_for(kind),
+            kind,
+            name,
+        )
     }
 
     /// Whether the library enabled image fetcher `name` for `kind`.
     ///
     /// Delegates to the shared gate — see [`Self::metadata_enabled`].
     fn image_enabled(self, kind: &str, name: &str) -> bool {
-        ferrofin_providers::library_options::image_fetcher_enabled(self.options, kind, name)
+        ferrofin_providers::library_options::image_fetcher_enabled(
+            self.options,
+            self.global_for(kind),
+            kind,
+            name,
+        )
     }
 
     /// The library's preferred metadata language, lowercased. Jellyfin's own
@@ -557,14 +579,15 @@ impl<'a> FetcherPolicy<'a> {
             .to_lowercase()
     }
 
-    /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order.
+    /// [`metadata_rank`](Self::metadata_rank) for the image-fetcher order,
+    /// with the same server-wide fallback (`ProviderManager.cs:405-406`).
     fn image_rank(self, kind: &str, name: &str) -> usize {
-        self.type_entry(kind).map_or(usize::MAX, |t| {
-            t.image_fetcher_order
-                .iter()
-                .position(|f| f.eq_ignore_ascii_case(name))
-                .unwrap_or(usize::MAX)
-        })
+        ferrofin_providers::library_options::image_fetcher_rank(
+            self.options,
+            self.global_for(kind),
+            kind,
+            name,
+        )
     }
 
     /// Whether the flat local-reader list still enables `name` (`Nfo`).
@@ -578,8 +601,12 @@ impl<'a> FetcherPolicy<'a> {
 }
 
 /// Indexes each library's [`FetcherPolicy`] by its collection-folder id —
-/// the id every [`Planned`] item carries as its first ancestor.
-fn fetcher_policies(folders: &[VirtualFolderInfo]) -> HashMap<Uuid, FetcherPolicy<'_>> {
+/// the id every [`Planned`] item carries as its first ancestor — each with
+/// the server-wide options `global` as its fallback.
+fn fetcher_policies<'a>(
+    folders: &'a [VirtualFolderInfo],
+    global: Option<&'a [ferrofin_model::configuration::MetadataOptions]>,
+) -> HashMap<Uuid, FetcherPolicy<'a>> {
     folders
         .iter()
         .filter_map(|f| {
@@ -588,30 +615,11 @@ fn fetcher_policies(folders: &[VirtualFolderInfo]) -> HashMap<Uuid, FetcherPolic
                 id,
                 FetcherPolicy {
                     options: f.library_options.as_ref(),
+                    global,
                 },
             ))
         })
         .collect()
-}
-
-/// Resolves a stored row's fetcher policy from its `TopParentId` (the
-/// collection folder every scanned entity carries), over `policies` built
-/// from every configured library. A row naming a library that is not
-/// configured any more is `None` — skipped, never given another library's
-/// checkboxes or the permissive default. A row in no library at all (a
-/// by-name artist) takes the defaults, as upstream's `GetLibraryOptions`
-/// gives an item outside every library (`new LibraryOptions()`).
-fn policy_of<'a>(
-    policies: &HashMap<Uuid, FetcherPolicy<'a>>,
-    top_parent_id: Option<&str>,
-) -> Option<FetcherPolicy<'a>> {
-    match top_parent_id.map(str::trim).filter(|t| !t.is_empty()) {
-        None => Some(FetcherPolicy::default()),
-        Some(top) => Uuid::parse_str(top)
-            .ok()
-            .and_then(|id| policies.get(&id))
-            .copied(),
-    }
 }
 
 /// The `MediaStreamInfos.StreamType` discriminant for an embedded image
@@ -646,6 +654,57 @@ fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
         .iter()
         .map(|ext| dir.join(format!("{stem}.{ext}")))
         .find(|p| p.exists())
+}
+
+/// What one studio's thumb lookup came to ([`studio_thumb`]).
+enum StudioThumb {
+    /// The thumb is on disk at this path (found there, or just written).
+    Found(PathBuf),
+    /// The repository has no thumb for the studio: an answer.
+    Answered,
+    /// The thumb download failed (`None`) or could not be written: a
+    /// failure, retried by the next validation.
+    Failed(Option<ServiceError>),
+    /// The repository's manifest request failed: every studio after this
+    /// one would ask for it again.
+    RepositoryDown,
+}
+
+/// `StudiosImageProvider` for one studio named `name` whose art folder is
+/// `dir`: a thumb already in the folder, else the repository's, downloaded
+/// there.
+async fn studio_thumb(
+    studios: &ferrofin_providers::StudiosClient,
+    dir: &Path,
+    name: &str,
+) -> StudioThumb {
+    use ferrofin_providers::rate_limit::count_request_failures;
+    let stem = image_type_file_stem(ImageType::Thumb);
+    if let Some(existing) = existing_art_file(dir, stem) {
+        return StudioThumb::Found(existing);
+    }
+    let (url, failures) = count_request_failures(studios.thumb_url(name)).await;
+    if failures > 0 {
+        return StudioThumb::RepositoryDown;
+    }
+    let Some(url) = url else {
+        return StudioThumb::Answered;
+    };
+    let (bytes, failures) = count_request_failures(studios.download(&url)).await;
+    let Some(bytes) = bytes else {
+        return if failures == 0 {
+            StudioThumb::Answered
+        } else {
+            StudioThumb::Failed(None)
+        };
+    };
+    let dest = dir.join(format!("{stem}.jpg"));
+    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&dest, &bytes)) {
+        Ok(()) => StudioThumb::Found(dest),
+        Err(err) => StudioThumb::Failed(Some(ServiceError::backend(format!(
+            "write studio thumb: {err}"
+        )))),
+    }
 }
 
 /// Parses an art-dir file back to its [`ImageType`] — the inverse of the
@@ -1169,9 +1228,10 @@ pub enum ScanPasses {
     /// scheduled scan, `POST /Library/Refresh`, a library change, the
     /// library monitor and the webhooks).
     Library,
-    /// Only what is scoped to the items this scan touched: their album
-    /// covers and the cumulative runtime of the albums and artists among
-    /// them. An item or folder refresh over the API: upstream's
+    /// Only what is scoped to the items this scan touched: the music
+    /// refresh of the albums and artists among them, their album covers, and
+    /// the children-derived columns of the folders it planned.
+    /// An item or folder refresh over the API: upstream's
     /// `ProviderManager.RefreshItem` runs no post-scan task, so a refresh of
     /// one movie never enriches every album in the database.
     Touched,
@@ -1209,9 +1269,138 @@ pub struct LaneRefresh {
     pub key: u64,
 }
 
-/// The ids a scan planned, collected for the scan that served it from its
-/// [`PriorityLane`].
-type TouchedIds = std::sync::Mutex<Vec<Uuid>>;
+/// The ids a scan planned, each with how far it refreshed them, collected
+/// for the scan that served it from its [`PriorityLane`].
+type TouchedIds = std::sync::Mutex<Vec<(Uuid, RefreshReach)>>;
+
+/// How far one refresh of an item went — enough to tell whether a refresh a
+/// scan served from its lane did at least what that scan decided for the
+/// item ([`ScanWork::served`]).
+// One flag per option that widens a refresh; they are independent.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RefreshReach {
+    /// The metadata mode, ranked `None` < `ValidationOnly` < `Default` <
+    /// `FullRefresh`.
+    metadata: u8,
+    /// The image mode, ranked the same way.
+    images: u8,
+    /// `ReplaceAllMetadata`.
+    replace_metadata: bool,
+    /// `ReplaceAllImages`.
+    replace_images: bool,
+    /// An "Identify → Apply": the user's choice, which a scan's earlier
+    /// decision must never undo.
+    identify: bool,
+}
+
+impl RefreshReach {
+    /// The reach of a refresh with `options`.
+    fn of(options: &MetadataRefreshOptions) -> Self {
+        let rank = |mode: MetadataRefreshMode| match mode {
+            MetadataRefreshMode::None => 0,
+            MetadataRefreshMode::ValidationOnly => 1,
+            MetadataRefreshMode::Default => 2,
+            MetadataRefreshMode::FullRefresh => 3,
+        };
+        Self {
+            metadata: rank(options.metadata_refresh_mode),
+            images: rank(options.image_refresh_mode),
+            replace_metadata: options.replace_all_metadata,
+            replace_images: options.replace_all_images,
+            identify: options.search_result.is_some(),
+        }
+    }
+
+    /// Whether a refresh this far did everything one `other` far would.
+    ///
+    /// An Identify covers any scan. It matters in one case: an Identify runs
+    /// with both modes `FullRefresh` and `ReplaceAllMetadata`, and replaces
+    /// images only when the user ticked it (`ItemLookupController.cs:268-278`), so a
+    /// "Replace all images" scan outranks an Identify that did not. Without
+    /// the flag that scan would refresh the album again by its own, earlier
+    /// decision — no chosen result, the tracks' ids (`SetProviderIdFromSongs`)
+    /// — and undo the user's choice.
+    fn covers(self, other: Self) -> bool {
+        self.identify
+            || (self.metadata >= other.metadata
+                && self.images >= other.images
+                && (self.replace_metadata || !other.replace_metadata)
+                && (self.replace_images || !other.replace_images))
+    }
+
+    /// The farther of two refreshes, field by field.
+    fn max(self, other: Self) -> Self {
+        Self {
+            metadata: self.metadata.max(other.metadata),
+            images: self.images.max(other.images),
+            replace_metadata: self.replace_metadata || other.replace_metadata,
+            replace_images: self.replace_images || other.replace_images,
+            identify: self.identify || other.identify,
+        }
+    }
+}
+
+/// The items lane refreshes served, each with the farthest refresh one of
+/// them gave it.
+type Served = HashMap<Uuid, RefreshReach>;
+
+/// Records `touched` in `served`.
+fn note_served(served: &mut Served, touched: &[(Uuid, RefreshReach)]) {
+    for (id, reach) in touched {
+        let entry = served.entry(*id).or_default();
+        *entry = entry.max(*reach);
+    }
+}
+
+/// The items a closing pass skipped because reading or writing one of them
+/// failed — so one unreadable row never stops the pass for every item after
+/// it — and those it refreshed treating every field as locked because their
+/// field locks could not be read. Reported once per pass
+/// ([`report`](Self::report)): the per-item detail is `debug!`, as its
+/// volume scales with the library.
+#[derive(Debug, Default)]
+struct SkippedItems {
+    /// How many items were skipped.
+    count: usize,
+    /// How many items' field locks could not be read.
+    locks_unread: usize,
+    /// The first item of either, and why.
+    first: Option<(Uuid, String)>,
+}
+
+impl SkippedItems {
+    /// Records that `id` was skipped over `err`.
+    fn note(&mut self, id: Uuid, err: &ServiceError) {
+        tracing::debug!(item_id = %id, %err, "closing pass skipped an item");
+        self.count += 1;
+        self.first.get_or_insert_with(|| (id, err.to_string()));
+    }
+
+    /// Records that `id`'s field locks could not be read over `err`, so its
+    /// refresh treated every field as locked.
+    fn note_locks_unread(&mut self, id: Uuid, err: &ServiceError) {
+        tracing::debug!(item_id = %id, %err, "field locks unreadable; every field kept");
+        self.locks_unread += 1;
+        self.first.get_or_insert_with(|| (id, err.to_string()));
+    }
+
+    /// One warning naming how many items `pass` skipped or refreshed without
+    /// their field locks, and the first, when there were any; the skipped
+    /// ones are retried by the next validation.
+    fn report(&self, pass: &'static str) {
+        if let Some((id, err)) = &self.first {
+            tracing::warn!(
+                pass,
+                skipped = self.count,
+                locks_unread = self.locks_unread,
+                item_id = %id,
+                error = %err,
+                "closing pass could not read or write some items; the next scan retries the skipped ones"
+            );
+        }
+    }
+}
 
 /// How one scan runs ([`LibraryScanner::scan_target`]).
 #[derive(Clone, Copy)]
@@ -1358,6 +1547,9 @@ struct RefreshContext<'a> {
     now: DateTime<Utc>,
     /// Per-library fetcher policies (and library options).
     policies: &'a HashMap<Uuid, FetcherPolicy<'a>>,
+    /// The fetcher policy of an item in no configured library: the
+    /// server-wide options only.
+    outside: FetcherPolicy<'a>,
     /// The ids of the locked items.
     locked: &'a std::collections::HashSet<Uuid>,
     /// The external subtitle/audio resolvers, for the sidecar change check.
@@ -1389,11 +1581,41 @@ impl<'a> RefreshContext<'a> {
             scope: None,
             now: Utc::now(),
             policies: &NO_POLICIES,
+            outside: FetcherPolicy::default(),
             locked: &NO_LOCKS,
             externals: None,
             superseded: std::collections::HashSet::new(),
             cancel: run.cancel,
         }
+    }
+
+    /// `item`'s library's fetcher policy.
+    fn policy_for(&self, item: &Planned) -> FetcherPolicy<'a> {
+        policy_for(item, self.policies, self.outside)
+    }
+
+    /// The chosen Identify result, when this refresh identifies `item`: the
+    /// item at the refresh's own path takes the result's ids as its own (the
+    /// controller's `item.SetProviderIds(searchResult.ProviderIds)`). A
+    /// season or an episode never does — `ApplySearchResult` hands them the
+    /// result as their series' (`MetadataService.cs:272-293`).
+    fn identified(&self, item: &Planned) -> Option<&'a RemoteSearchResult> {
+        let request = *self.request_for(item);
+        let series_child = matches!(
+            item_type_lookup::kind_from_type_name(&item.entity.type_),
+            Some(BaseItemKind::Episode | BaseItemKind::Season)
+        );
+        request.options.search_result.as_ref().filter(|_| {
+            !series_child
+                && self.scope.is_some_and(|scope| {
+                    item.entity.path.as_deref().is_some_and(|path| {
+                        scope
+                            .roots
+                            .iter()
+                            .any(|root| root.trim_end_matches('/') == path.trim_end_matches('/'))
+                    })
+                })
+        })
     }
 
     /// The options `item` refreshes with: the scan's, unless a path-scoped
@@ -1493,6 +1715,15 @@ struct ItemPass<'a> {
     locked: bool,
     /// Its library's fetcher policy.
     policy: FetcherPolicy<'a>,
+    /// The music pass completes its refresh after the walk ([`music`]): its
+    /// remote providers or its children-derived metadata. What made the
+    /// refresh due is left for that pass to write with it, as upstream's
+    /// one `SaveInternal` does (`MetadataService.cs:244-255`), so a scan
+    /// stopped between the two leaves it due: the `DateLastRefreshed` stamp
+    /// (a first refresh stays first; owner decision D1 — a provider that
+    /// fails leaves it unstamped) and the new `DateModified` (a changed
+    /// folder stays changed, D3).
+    music_pending: bool,
 }
 
 /// The scan-wide state [`LibraryScanner::scan_item`] reads and updates.
@@ -1711,6 +1942,56 @@ impl PlanCtx<'_> {
 /// an equal share of the last 4 % of a scan's progress.
 const POST_SCAN_PASSES: u32 = 9;
 
+/// How long each closing pass of one library validation took, logged once
+/// at its end.
+#[derive(Debug, Default)]
+struct PassTimings {
+    music: std::time::Duration,
+    album_covers: std::time::Duration,
+    years: std::time::Duration,
+    artists: std::time::Duration,
+    aggregates: std::time::Duration,
+    by_name_paths: std::time::Duration,
+    studios: std::time::Duration,
+    library_images: std::time::Duration,
+    dynamic_images: std::time::Duration,
+}
+
+impl PassTimings {
+    /// One `info!` per scan with every pass's milliseconds.
+    fn log(&self, albums_and_artists: usize) {
+        let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            albums_and_artists,
+            music_ms = ms(self.music),
+            album_covers_ms = ms(self.album_covers),
+            years_ms = ms(self.years),
+            artists_ms = ms(self.artists),
+            aggregates_ms = ms(self.aggregates),
+            by_name_paths_ms = ms(self.by_name_paths),
+            studios_ms = ms(self.studios),
+            library_images_ms = ms(self.library_images),
+            dynamic_images_ms = ms(self.dynamic_images),
+            "post-scan passes complete"
+        );
+    }
+}
+
+/// The children whose runtime an album sums: `AlbumMetadataService.
+/// GetChildrenForMetadataUpdates` is `GetRecursiveChildren(i => i is Audio)`
+/// (`AlbumMetadataService.cs:58-59`), an `AudioBook` being an `Audio`.
+const ALBUM_RUNTIME_CHILDREN: &[BaseItemKind] = &[BaseItemKind::Audio, BaseItemKind::AudioBook];
+
+/// The children whose runtime a folder artist sums: `ArtistMetadataService.
+/// GetChildrenForMetadataUpdates` is `GetRecursiveChildren(i => i is
+/// IHasArtist && !i.IsFolder)` (`ArtistMetadataService.cs:43-53`) — the
+/// audio (an `AudioBook` included) and the music videos below it.
+const ARTIST_RUNTIME_CHILDREN: &[BaseItemKind] = &[
+    BaseItemKind::Audio,
+    BaseItemKind::AudioBook,
+    BaseItemKind::MusicVideo,
+];
+
 /// Default scan-progress cadence: emit an `info!` every this-many items so
 /// info-level volume stays O(items/N), not O(items). Overridable via the
 /// `FERROFIN_SCAN_PROGRESS_EVERY` bootstrap knob.
@@ -1751,6 +2032,39 @@ impl std::ops::AddAssign for ScanOutcome {
         self.unchanged += other.unchanged;
         self.removed += other.removed;
         self.stopped |= other.stopped;
+    }
+}
+
+/// What one scan's walk leaves for its closing passes.
+struct ScanWork<'r> {
+    /// The albums and artists the walk refreshed, with its decision for each
+    /// ([`music`]).
+    music: Vec<MusicRefresh<'r>>,
+    /// The items a lane refresh served during or after the walk touched
+    /// once the walk had decided them, with how far it refreshed them
+    /// ([`serve_lane`](LibraryScanner::serve_lane)): what the walk decided
+    /// for them is stale.
+    served: Served,
+    /// The fetcher policy of an item in no library (a by-name artist).
+    outside: FetcherPolicy<'r>,
+}
+
+impl ScanWork<'_> {
+    /// Records the ids a lane refresh touched that the walk already decided
+    /// (an album or artist it queued a music refresh for). The closing
+    /// passes leave such an item to that refresh when it went at least as
+    /// far as this scan's ([`RefreshReach::covers`]) — an Identify always
+    /// does — and otherwise still refresh it as this scan decided: a
+    /// Default refresh served inside a "Replace all metadata" scan does not
+    /// spare the item the replacement. An item the walk has yet to reach
+    /// is read again before it is decided, so its decision is current.
+    fn served(&mut self, touched: &[(Uuid, RefreshReach)]) {
+        let decided: Vec<(Uuid, RefreshReach)> = touched
+            .iter()
+            .filter(|(id, _)| self.music.iter().any(|m| m.id == *id))
+            .copied()
+            .collect();
+        note_served(&mut self.served, &decided);
     }
 }
 
@@ -1959,13 +2273,15 @@ pub struct LibraryScanner {
     /// images. Keys off the ids persisted during this scan.
     fanart: Option<Arc<ferrofin_providers::FanartClient>>,
     /// Optional MusicBrainz client — resolves `MusicBrainz*` ids for music items
-    /// in the post-scan enrichment pass. Paired with [`item_repository`](Self::item_repository).
+    /// in the music pass ([`music`]), under each album's and artist's own
+    /// refresh decision. Paired with [`item_repository`](Self::item_repository).
     musicbrainz: Option<Arc<ferrofin_providers::MusicBrainzClient>>,
-    /// Optional AudioDb client — artist bio/genre + album artwork by MusicBrainz
-    /// id, in the post-scan music-enrichment pass.
+    /// Optional AudioDb client — album/artist description, genre and artwork
+    /// by MusicBrainz id, in the music pass ([`music`]).
     audiodb: Option<Arc<ferrofin_providers::AudioDbClient>>,
-    /// Item repository for the post-scan music-enrichment pass (querying the
-    /// MusicAlbum/MusicArtist rows + tracks it created). Absent → no music pass.
+    /// Item repository for the music pass (reading the album and artist rows
+    /// and their tracks) and the other closing passes. Absent → no music
+    /// pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
     /// The `Year` by-name provisioner for the post-scan year pass (one `Year`
     /// row per distinct scanned `ProductionYear`, so `/Years` lists every
@@ -2018,7 +2334,18 @@ pub struct LibraryScanner {
     /// image rows store, for the local image validation's existence check.
     /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// Reads the server-wide per-kind `MetadataOptions`
+    /// (`ServerConfiguration.MetadataOptions`), live: the fetcher gate for a
+    /// kind a library saved no `TypeOptions` entry for, and for an item in no
+    /// library (a by-name artist). `None` (unit tests) gates nothing
+    /// server-wide.
+    metadata_options: Option<ServerMetadataOptions>,
 }
+
+/// A live reader of the server-wide `MetadataOptions`
+/// ([`LibraryScanner::with_metadata_options`]).
+type ServerMetadataOptions =
+    Arc<dyn Fn() -> Vec<ferrofin_model::configuration::MetadataOptions> + Send + Sync>;
 
 impl std::fmt::Debug for LibraryScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2064,7 +2391,35 @@ impl LibraryScanner {
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            metadata_options: None,
         }
+    }
+
+    /// Attaches the reader of the server-wide per-kind `MetadataOptions`, so
+    /// a kind a library saved no `TypeOptions` entry for — and an item in no
+    /// library, a by-name artist — is gated by the server's
+    /// `DisabledMetadataFetchers`/`DisabledImageFetchers`, as upstream's
+    /// `IsMetadataFetcherEnabled` falls back to them. Read once per scan, so
+    /// a changed setting applies from the next scan without a restart.
+    #[must_use]
+    pub fn with_metadata_options(
+        mut self,
+        options: impl Fn() -> Vec<ferrofin_model::configuration::MetadataOptions>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.metadata_options = Some(Arc::new(options));
+        self
+    }
+
+    /// The server-wide per-kind `MetadataOptions` as configured now (none
+    /// without a reader).
+    fn server_metadata_options(&self) -> Vec<ferrofin_model::configuration::MetadataOptions> {
+        self.metadata_options
+            .as_ref()
+            .map(|read| read())
+            .unwrap_or_default()
     }
 
     /// Overrides how many ffprobe processes the scan keeps in flight
@@ -2204,10 +2559,10 @@ impl LibraryScanner {
         self
     }
 
-    /// Attaches the MusicBrainz client + the item repository the post-scan
-    /// music-enrichment pass needs, so music items get their `MusicBrainz*` ids
-    /// resolved (and, once wired, AudioDb/fanart artwork). Both are required for
-    /// the pass to run.
+    /// Attaches the MusicBrainz client + the item repository the music pass
+    /// ([`music`]) needs, so a new or changed album or artist gets its
+    /// `MusicBrainz*` ids and data resolved. Both are required for the pass
+    /// to run.
     #[must_use]
     pub fn with_music(
         mut self,
@@ -2435,7 +2790,18 @@ impl LibraryScanner {
                     also: Some(*id),
                     prune: true,
                 };
-                self.scan_scoped(scope, path.as_deref(), run).await
+                let mut outcome = if path.is_some() || !folders.is_empty() {
+                    self.scan_scoped(scope, path.as_deref(), run).await?
+                } else {
+                    ScanOutcome::default()
+                };
+                // An artist known only by name is no folder the scan plans:
+                // its own `RefreshMetadata` runs here, after its albums'
+                // folders.
+                if path.is_none() && !outcome.stopped && !run.cancel.is_cancelled() {
+                    outcome += Box::pin(self.refresh_by_name_artist(*id, run)).await?;
+                }
+                Ok(outcome)
             }
         }
     }
@@ -2458,6 +2824,16 @@ impl LibraryScanner {
     /// items they planned, which the caller must not act on with what it
     /// read of them before.
     async fn serve_lane(&self, run: ScanRun<'_>) -> Vec<Uuid> {
+        Box::pin(self.serve_lane_reach(run))
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// [`serve_lane`](Self::serve_lane), with how far the refreshes it served
+    /// refreshed each id.
+    async fn serve_lane_reach(&self, run: ScanRun<'_>) -> Vec<(Uuid, RefreshReach)> {
         let Some(lane) = run.lane else {
             return Vec::new();
         };
@@ -2698,7 +3074,11 @@ impl LibraryScanner {
             touched
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(planned.iter().map(|p| p.id));
+                .extend(planned.iter().map(|p| {
+                    let covered = scope.is_none_or(|scope| scope.covers(p));
+                    let options = if covered { run.options } else { run.ancestors };
+                    (p.id, RefreshReach::of(options))
+                }));
         }
         log_scan_planned(planned.len(), folders.len(), options);
         // Per-library progress accounting for the `RefreshProgress` pushes: how
@@ -2728,10 +3108,17 @@ impl LibraryScanner {
         // "Image fetchers" checkboxes REAL: a fetcher the admin unchecked
         // never runs for that library's items, and the saved order picks
         // the authority when fetchers compete.
-        let fetcher_policies = fetcher_policies(folders);
+        // Read once per scan: the server-wide options gate a kind a library
+        // saved no checkboxes for, and an item in no library.
+        let server_options = self.server_metadata_options();
+        let fetcher_policies = fetcher_policies(folders, Some(&server_options));
         let refresh = RefreshContext {
             scope,
             policies: &fetcher_policies,
+            outside: FetcherPolicy {
+                options: None,
+                global: Some(&server_options),
+            },
             locked: &locked_items,
             externals: self.external_probe_seam(),
             superseded: superseded_copies(&planned),
@@ -2743,9 +3130,17 @@ impl LibraryScanner {
         // stored-row window. The loop itself keeps plan order.
         let mut probes = self.probe_pipeline(&planned);
         let mut reported = 0;
+        // What the closing passes take from the walk: the albums and artists
+        // whose music refresh it decided, and those a lane refresh served
+        // since.
+        let mut work = ScanWork {
+            music: Vec::new(),
+            served: Served::new(),
+            outside: refresh.outside,
+        };
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
-            Box::pin(self.serve_lane_between_items(
+            let touched = Box::pin(self.serve_lane_between_items(
                 run,
                 scanned,
                 &mut stored_rows,
@@ -2754,6 +3149,7 @@ impl LibraryScanner {
                 &mut series_keys,
             ))
             .await;
+            work.served(&touched);
             tracing::debug!(item = %item.id, "scanning item");
             self.log_scan_progress(scanned, planned.len());
             // Boxed: the read is awaited inside the loop, and inlining its
@@ -2786,25 +3182,40 @@ impl LibraryScanner {
             // none.
             let stored = stored_rows.get(item.id);
             let is_new = matches!(stored, Stored::New);
+            // A row that cannot be decoded runs nothing (its file facts
+            // only), so no music refresh either: its read would fail there.
+            let undecodable = matches!(stored, Stored::Undecodable);
             if is_new && self.events.is_some() {
                 items_added.push(item);
             }
+            let plan = stored_rows
+                .plan(scanned)
+                .unwrap_or_else(|| self.plan_item(&refresh, None, item, None));
+            // A locked item's metadata and cast are user-owned: no NFO or
+            // remote provider runs for it (`RefreshWithProviders` returns on
+            // `IsLocked`), and its people are left alone. The scan-upsert's
+            // `IsLocked` guard backstops the metadata columns; file-derived
+            // facts (the probe) still update, and its local images are still
+            // validated and discovered.
+            let locked = locked_items.contains(&item.id);
+            let policy = refresh.policy_for(item);
+            // An album or artist whose refresh the music pass completes
+            // after the walk leaves it the triggers of that refresh.
+            let music = MusicKind::of_planned(&item.entity);
+            let request = *refresh.request_for(item);
+            let music_pending = music.is_some_and(|kind| {
+                music::full_refresh(&plan, &request)
+                    || self.music_fetch(kind, &plan, policy, locked).any()
+            });
             let pass = ItemPass {
                 index: scanned,
                 item,
                 stored,
                 links: stored_rows.links(item.id),
-                plan: stored_rows
-                    .plan(scanned)
-                    .unwrap_or_else(|| self.plan_item(&refresh, None, item, None)),
-                // A locked item's metadata and cast are user-owned: no NFO
-                // or remote provider runs for it (`RefreshWithProviders`
-                // returns on `IsLocked`), and its people are left alone. The
-                // scan-upsert's `IsLocked` guard backstops the metadata
-                // columns; file-derived facts (the probe) still update, and
-                // its local images are still validated and discovered.
-                locked: locked_items.contains(&item.id),
-                policy: policy_for(item, &fetcher_policies),
+                plan,
+                locked,
+                policy,
+                music_pending,
             };
             let mut state = ItemState {
                 art_cache: &mut art_cache,
@@ -2816,7 +3227,42 @@ impl LibraryScanner {
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
-            match Box::pin(self.scan_item(pass, &mut state)).await? {
+            let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
+            if let (Some(kind), false) =
+                (music, undecodable || matches!(saved, ItemSaved::Cancelled))
+            {
+                work.music.push(MusicRefresh {
+                    id: item.id,
+                    kind,
+                    plan,
+                    request,
+                    identified: refresh.identified(item),
+                    policy,
+                    // `isFullRefresh || updateType > None`: the walk saved it.
+                    //
+                    // TODO(parity, open work item — NOT an accepted
+                    // divergence): the `updateType > None` half lives only
+                    // in this scan's memory. The full-refresh half survives
+                    // a cancel between the walk and the music pass (the
+                    // walk leaves the stamp and `DateModified` for the
+                    // music pass, `music_pending`), but an album the walk
+                    // saved for another reason (a new local image, a moved
+                    // parent) loses its children-derived tags if the scan
+                    // stops before the music pass; upstream derives them in
+                    // the same `RefreshMetadata` as that save. Un-defer path:
+                    // persist the owed derivation with the walk's save (a
+                    // Ferrofin-namespaced pending-refresh row keyed by the
+                    // item, cleared by the music pass's save and selected by
+                    // the next validation's music pass), and test it with a
+                    // scan cancelled after the walk.
+                    aggregate: music::full_refresh(&plan, &request)
+                        || matches!(saved, ItemSaved::Saved),
+                    owns_stamp: music_pending,
+                    owns_save: false,
+                    date_modified: item.entity.date_modified,
+                });
+            }
+            match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
                 ItemSaved::Saved if is_new => outcome.created += 1,
                 ItemSaved::Saved => outcome.updated += 1,
@@ -2846,7 +3292,8 @@ impl LibraryScanner {
             return Ok(stop.await);
         }
         probes.abort();
-        Box::pin(self.serve_lane(run)).await;
+        let touched = Box::pin(self.serve_lane_reach(run)).await;
+        work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted)).await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
@@ -2855,8 +3302,12 @@ impl LibraryScanner {
         // images) run once per scan, and inlining their state kept the scan
         // future at clippy's `large_futures` ceiling.
         outcome.stopped = !match run.passes {
-            ScanPasses::Library => Box::pin(self.post_scan_passes(folders, &art_cache, run)).await,
-            ScanPasses::Touched => Box::pin(self.touched_passes(&planned, &art_cache, run)).await,
+            ScanPasses::Library => {
+                Box::pin(self.post_scan_passes(folders, &planned, &art_cache, &work, run)).await
+            }
+            ScanPasses::Touched => {
+                Box::pin(self.touched_passes(&planned, &art_cache, &work, run)).await
+            }
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
         if !outcome.stopped {
@@ -2889,7 +3340,8 @@ impl LibraryScanner {
     /// now, and what they touched is read again before this scan acts on it
     /// — the stored rows from item `scanned` on (the window restarts there),
     /// and the ids, series keys and image rows this scan cached for them
-    /// ([`reread_touched`](Self::reread_touched)).
+    /// ([`reread_touched`](Self::reread_touched)). Returns the ids they
+    /// touched.
     async fn serve_lane_between_items(
         &self,
         run: ScanRun<'_>,
@@ -2898,18 +3350,20 @@ impl LibraryScanner {
         probes: &mut ProbePipeline<'_>,
         cache: &mut ArtworkCache,
         series_keys: &mut HashMap<Uuid, String>,
-    ) {
-        let touched = Box::pin(self.serve_lane(run)).await;
+    ) -> Vec<(Uuid, RefreshReach)> {
+        let touched = Box::pin(self.serve_lane_reach(run)).await;
         if touched.is_empty() {
-            return;
+            return touched;
         }
-        probes.forget(&touched.iter().copied().collect());
+        let ids: Vec<Uuid> = touched.iter().map(|(id, _)| *id).collect();
+        probes.forget(&ids.iter().copied().collect());
         *stored_rows = StoredRows {
             start: scanned,
             end: scanned,
             ..StoredRows::default()
         };
-        Box::pin(self.reread_touched(&touched, cache, series_keys)).await;
+        Box::pin(self.reread_touched(&ids, cache, series_keys)).await;
+        touched
     }
 
     /// After a lane refresh touched the items `touched`: what this scan
@@ -3005,35 +3459,24 @@ impl LibraryScanner {
     }
 
     /// The closing passes of an item or folder refresh ([`ScanPasses::Touched`]):
-    /// the album covers this pass gathered, and the cumulative runtime of
-    /// the albums and artists it touched — never a pass over the whole
-    /// database.
+    /// the music refresh of the albums and artists it refreshed, the album
+    /// covers this pass gathered, and the children-derived columns of the
+    /// folders it planned — never a pass over the whole database.
     async fn touched_passes(
         &self,
         planned: &[Planned],
         art_cache: &ArtworkCache,
+        work: &ScanWork<'_>,
         run: ScanRun<'_>,
     ) -> bool {
         if run.cancel.is_cancelled() {
             return false;
         }
+        let mut served = work.served.clone();
+        self.refresh_music(&work.music, run, &mut served).await;
         self.finish_album_artwork(art_cache, run).await;
-        let folders: Vec<Uuid> = planned
-            .iter()
-            .filter(|p| {
-                matches!(
-                    item_type_lookup::kind_from_type_name(&p.entity.type_),
-                    Some(BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
-                )
-            })
-            .map(|p| p.id)
-            .collect();
-        if !folders.is_empty()
-            && let Err(err) = self
-                .update_cumulative_run_time_ticks(Some(&folders), run)
-                .await
-        {
-            tracing::warn!(%err, "cumulative run time ticks pass failed");
+        if let Err(err) = self.update_folder_aggregates(planned, run).await {
+            tracing::warn!(%err, "folder aggregates pass failed");
         }
         run.report(100.0);
         !run.cancel.is_cancelled()
@@ -3128,6 +3571,7 @@ impl LibraryScanner {
             plan,
             locked,
             policy,
+            music_pending,
         } = pass;
         if matches!(stored, Stored::Undecodable) {
             // Only the file facts are written, and only when they moved;
@@ -3230,17 +3674,7 @@ impl LibraryScanner {
         // `item.SetProviderIds(searchResult.ProviderIds)`), written with its
         // save: a refresh that stops or fails before it saves the item
         // leaves its ids as they were.
-        let identified = search.filter(|_| {
-            !series_child
-                && state.refresh.scope.is_some_and(|scope| {
-                    item.entity.path.as_deref().is_some_and(|path| {
-                        scope
-                            .roots
-                            .iter()
-                            .any(|root| root.trim_end_matches('/') == path.trim_end_matches('/'))
-                    })
-                })
-        });
+        let identified = state.refresh.identified(item);
         // Then enrich from TMDB (overview/tagline/genres/studios/ratings +
         // cast/crew) to fill any gaps the NFO left, so a bare file with no NFO
         // shows the same detail page Jellyfin does — when the plan runs the
@@ -3382,6 +3816,11 @@ impl LibraryScanner {
             },
         );
         self.apply_parental_rating_score(&mut entity);
+        // The folder's new mtime is written with the music pass's save, not
+        // this one (see `ItemPass::music_pending`).
+        if music_pending && let Some(row) = stored_row {
+            entity.date_modified = row.date_modified;
+        }
         // A series' presentation key depends on the ids just settled;
         // its children take the settled key (see `sync_series_key`).
         let moved_series_key = self.sync_series_key(
@@ -3517,7 +3956,7 @@ impl LibraryScanner {
         // the scan start would give every item of a scan the same
         // `DateLastSaved`, and so the same Etag.
         let now = Utc::now();
-        if decision.stamp_refreshed {
+        if decision.stamp_refreshed && !music_pending {
             entity.date_last_refreshed = Some(now);
         }
         // A new item's first refresh saves it right after creating it
@@ -4074,13 +4513,39 @@ impl LibraryScanner {
         }
     }
 
-    /// The best-effort enrichment passes that run once the item walk is done.
-    /// Each is independent and logs its own failure — none may fail the scan.
-    /// Returns whether they all ran (`false`: the scan was cancelled first).
+    /// The best-effort closing passes of a library validation
+    /// (`LibraryManager.RunPostScanTasks` and the folder metadata upstream
+    /// derives inside each refresh). Each is independent and logs its own
+    /// failure — none may fail the scan. Returns whether they all ran
+    /// (`false`: the scan was cancelled first).
+    ///
+    /// Every pass runs on every validation that was not cancelled, as
+    /// upstream's validators do, each doing only the work its own persisted
+    /// selection names — so what a cancelled scan, a failed pass or a write
+    /// outside the scanner (the metadata editor, a new playlist) left undone
+    /// is picked up by the next validation, and an unchanged library costs
+    /// each pass one cheap read:
+    ///
+    /// | pass | selection | upstream |
+    /// |---|---|---|
+    /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it | `MetadataService.RefreshMetadata` |
+    /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
+    /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
+    /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
+    /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
+    /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
+    /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
+    /// | library tiles | their own 7-day staleness (`HasChangedByDate`) | `CollectionFolderImageProvider` |
+    /// | dynamic images | per item: no generated Primary yet, or its file changed (`HasChangedByDate`) | `BaseDynamicImageProvider.HasChanged` |
+    // One straight sequence of the closing passes, each timed; a helper per
+    // pass would only scatter the table above.
+    #[allow(clippy::too_many_lines)]
     async fn post_scan_passes(
         &self,
         folders: &[VirtualFolderInfo],
+        planned: &[Planned],
         art_cache: &ArtworkCache,
+        work: &ScanWork<'_>,
         run: ScanRun<'_>,
     ) -> bool {
         // `RunPostScanTasks` takes the scan's token: a cancelled scan stops
@@ -4091,77 +4556,83 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             return false;
         }
-        // The music pass honors the same per-library fetcher checkboxes as
-        // the item walk — resolved per row via its `TopParentId`, over every
-        // library: it walks every album and artist in the database, and a
-        // row whose library is not this scan's still takes its own library's
-        // checkboxes (a row in no library is skipped).
-        let all_folders = match self.virtual_folders.get_virtual_folders().await {
-            Ok(all) => all,
-            Err(err) => {
-                tracing::warn!(%err, "could not list the libraries for the music pass");
-                folders.to_vec()
-            }
-        };
-        let policies = fetcher_policies(&all_folders);
-        // Music enrichment: resolve MusicBrainz ids (and, once wired,
-        // AudioDb/fanart artwork) for the MusicAlbum/MusicArtist rows created
-        // above.
-        if let Err(err) = self.enrich_music(&policies, run).await {
-            tracing::warn!(%err, "music enrichment pass failed");
-        }
+        let mut timings = PassTimings::default();
+        let mut served = work.served.clone();
+        let started = std::time::Instant::now();
+        // Music: each album's and artist's providers as the walk decided.
+        self.refresh_music(&work.music, run, &mut served).await;
+        timings.music = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
+        let started = std::time::Instant::now();
         self.finish_album_artwork(art_cache, run).await;
+        timings.album_covers = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // One `Year` item per distinct ProductionYear now in the library
         // (Jellyfin creates them lazily from `/Years`; doing it here keeps
         // that read write-free and lists every year on first request).
+        let started = std::time::Instant::now();
         if let Err(err) = self.materialize_years().await {
             tracing::warn!(%err, "year pass failed");
         }
+        timings.years = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        // Retire the parentless `MusicArtist` rows a PREVIOUS scan left behind
-        // (before `MusicArtistResolver` was ported) now that the same artist is
-        // resolved from its directory — otherwise /Artists lists each one twice.
+        // The artists validator (`ArtistsValidator`): retire the parentless
+        // `MusicArtist` rows a folder-resolved artist of the same name
+        // supersedes (otherwise /Artists lists each one twice), then refresh
+        // every by-name artist never refreshed.
+        let started = std::time::Instant::now();
         if let Err(err) = self.retire_accessed_by_name_artists().await {
             tracing::warn!(%err, "by-name artist retirement pass failed");
         }
+        if let Err(err) = self
+            .refresh_by_name_artists(run, work.outside, &mut served)
+            .await
+        {
+            tracing::warn!(%err, "by-name artist pass failed");
+        }
+        timings.artists = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        // Cumulative runtime for the folder kinds that support it, once every
-        // track has been probed — an album/artist reports the summed runtime of
-        // its children, which is a stored column, not a per-request rollup.
-        if let Err(err) = self.update_cumulative_run_time_ticks(None, run).await {
-            tracing::warn!(%err, "cumulative run time ticks pass failed");
+        // The children-derived columns of every folder the scan planned:
+        // cumulative runtime (albums, artists) and last media added
+        // (series).
+        let started = std::time::Instant::now();
+        if let Err(err) = self.update_folder_aggregates(planned, run).await {
+            tracing::warn!(%err, "folder aggregates pass failed");
         }
+        timings.aggregates = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // The metadata `Path` of the by-name rows the item-values step wrote
         // (`{metadata}/Genre/Action`, …). Jellyfin's `CreateItemByName` sets it
         // at insert time; here the row is a by-product of `save_item_values`,
-        // which has no notion of the metadata root, so it is filled once here.
+        // which has no notion of the metadata root, so it is filled here.
+        let started = std::time::Instant::now();
         if let Some(store) = &self.by_name
             && let Err(err) = store.backfill_paths().await
         {
             tracing::warn!(%err, "by-name path backfill failed");
         }
+        timings.by_name_paths = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
         // Studio thumbs from the artwork repository for the by-name Studio
-        // rows the item-values step materialized, so the TV Networks /
-        // Studios tabs carry artwork.
+        // rows never refreshed, so the TV Networks / Studios tabs carry
+        // artwork.
+        let started = std::time::Instant::now();
         if let Err(err) = self.enrich_studio_images(run).await {
             tracing::warn!(%err, "studio image pass failed");
         }
+        timings.studios = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -4170,9 +4641,11 @@ impl LibraryScanner {
         // CollectionFolderImageProvider), so it has to run after the passes
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
+        let started = std::time::Instant::now();
         if let Err(err) = self.refresh_library_images(folders).await {
             tracing::warn!(%err, "library image pass failed");
         }
+        timings.library_images = started.elapsed();
         if !self.between_passes(run, &mut done).await {
             return false;
         }
@@ -4180,6 +4653,7 @@ impl LibraryScanner {
         // `BaseDynamicImageProvider` family, run by the by-name validators at
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
+        let started = std::time::Instant::now();
         if let (Some(items), Some(processor), Some(meta_root)) = (
             &self.item_repository,
             &self.image_processor,
@@ -4201,6 +4675,8 @@ impl LibraryScanner {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
         }
+        timings.dynamic_images = started.elapsed();
+        timings.log(work.music.len());
         // Every pass ran: a cancellation landing now skipped nothing.
         self.between_passes(run, &mut done).await;
         true
@@ -4238,29 +4714,11 @@ impl LibraryScanner {
     /// cascades with it. Its user data is lost, which is the honest cost: the
     /// row it was keyed to no longer exists.
     async fn retire_accessed_by_name_artists(&self) -> Result<(), ServiceError> {
-        let Some(items) = &self.item_repository else {
-            return Ok(());
-        };
-        let artists = items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::MusicArtist],
-                ..InternalItemsQuery::default()
-            })
-            .await?;
         // A row counts as folder-backed when it carries a TopParentId — that is
         // exactly what `scope_to_user_libraries` (`AddUserToQuery`) requires and
-        // what the resolver now sets.
-        let resolved: std::collections::HashSet<String> = artists
-            .iter()
-            .filter(|a| a.top_parent_id.as_ref().is_some_and(|t| !t.is_empty()))
-            .filter_map(|a| a.clean_name.clone())
-            .collect();
-        let stale: Vec<Uuid> = artists
-            .iter()
-            .filter(|a| a.top_parent_id.as_ref().is_none_or(String::is_empty))
-            .filter(|a| a.clean_name.as_ref().is_some_and(|c| resolved.contains(c)))
-            .filter_map(|a| Uuid::parse_str(&a.id).ok())
-            .collect();
+        // what the resolver now sets. Selected in one read, so an unchanged
+        // library pays for no row.
+        let stale = self.persistence.superseded_by_name_artists().await?;
         if stale.is_empty() {
             return Ok(());
         }
@@ -4271,13 +4729,54 @@ impl LibraryScanner {
         self.persistence.delete_items(&stale).await
     }
 
+    /// The children-derived columns of every folder this scan planned: the
+    /// cumulative runtime of the music albums and artists, and the
+    /// last-media date of the series, each read in one aggregate query per
+    /// 500 folders and written only where it moved.
+    ///
+    /// Upstream derives the last-media date in every refresh of the series
+    /// (`UpdateMetadataFromChildren` runs it outside its `isFullRefresh ||
+    /// updateType > None` gate, `MetadataService.cs:404-455`), and so every
+    /// scan: so does this, and a date a cancelled scan or a failed pass left
+    /// stale is derived again by the next one. The cumulative runtime is
+    /// derived only past that gate upstream (`:451-454`); deriving it on
+    /// every validation too is a deliberate, harmless divergence — the value
+    /// is the one upstream would write at the folder's next full refresh,
+    /// and it keeps an album's runtime right after a track is re-probed in
+    /// place, which no folder refresh follows.
+    async fn update_folder_aggregates(
+        &self,
+        planned: &[Planned],
+        run: ScanRun<'_>,
+    ) -> Result<(), ServiceError> {
+        let (mut albums, mut artists, mut series) = (Vec::new(), Vec::new(), Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        for item in planned.iter().filter(|p| seen.insert(p.id)) {
+            match item_type_lookup::kind_from_type_name(&item.entity.type_) {
+                Some(BaseItemKind::MusicAlbum) => albums.push(item.id),
+                Some(BaseItemKind::MusicArtist) => artists.push(item.id),
+                Some(BaseItemKind::Series) => series.push(item.id),
+                _ => {}
+            }
+        }
+        self.update_cumulative_run_time_ticks(&albums, ALBUM_RUNTIME_CHILDREN, run)
+            .await?;
+        self.update_cumulative_run_time_ticks(&artists, ARTIST_RUNTIME_CHILDREN, run)
+            .await?;
+        self.update_last_media_added(&series, run).await
+    }
+
     /// Port of `MetadataService.UpdateCumulativeRunTimeTicks`
-    /// (`MediaBrowser.Providers/Manager/MetadataService.cs:451`): a folder whose
-    /// `SupportsCumulativeRunTimeTicks` is true stores the summed runtime of its
-    /// **non-folder recursive children** in its own `RunTimeTicks` column —
-    /// `foreach (child) if (!child.IsFolder) ticks += child.RunTimeTicks ?? 0;`,
-    /// written even when the sum is zero (`Folder.cs:97` makes it false by
-    /// default; `MusicAlbum.cs:54` and `MusicArtist.cs:39` override it to true).
+    /// (`MediaBrowser.Providers/Manager/MetadataService.cs:485-503`) over
+    /// `folders`: a folder whose `SupportsCumulativeRunTimeTicks` is true
+    /// stores the summed runtime of its **non-folder recursive children** of
+    /// `child_kinds` in its own `RunTimeTicks` column — `foreach (child) if
+    /// (!child.IsFolder) ticks += child.RunTimeTicks ?? 0;`, written even when
+    /// the sum is zero (`Folder.cs:113` makes it false by default;
+    /// `MusicAlbum.cs:54` and `MusicArtist.cs:39` override it to true). The
+    /// children are the service's `GetChildrenForMetadataUpdates`: an album's
+    /// `Audio` ([`ALBUM_RUNTIME_CHILDREN`]), a folder artist's `IHasArtist`
+    /// ([`ARTIST_RUNTIME_CHILDREN`]).
     ///
     /// That column is what `DtoService` emits as both `RunTimeTicks`
     /// (`DtoService.cs:1111`, ungated) and `CumulativeRunTimeTicks`
@@ -4287,7 +4786,10 @@ impl LibraryScanner {
     /// The children come from the base
     /// `MetadataService.GetChildrenForMetadataUpdates` — `GetRecursiveChildren()`
     /// over the item hierarchy — which, now that `MusicArtistResolver` is
-    /// ported, is the artist's albums and their tracks.
+    /// ported, is the artist's albums and their tracks: the `AncestorIds`
+    /// closure, summed in one aggregate read
+    /// ([`folder_run_time_sums`](ItemPersistenceService::folder_run_time_sums))
+    /// instead of a read per folder.
     ///
     /// A real 10.11.8 stores `0` on a first-scanned artist. That is a race, not
     /// the intended value: its own `DateLastRefreshed` shows the artist
@@ -4302,60 +4804,74 @@ impl LibraryScanner {
     /// scan pass — an open work item, not a skipped one.
     async fn update_cumulative_run_time_ticks(
         &self,
-        only: Option<&[Uuid]>,
+        folders: &[Uuid],
+        child_kinds: &[BaseItemKind],
         run: ScanRun<'_>,
     ) -> Result<(), ServiceError> {
-        let Some(items) = &self.item_repository else {
+        if folders.is_empty() {
             return Ok(());
-        };
+        }
+        let sums = self
+            .persistence
+            .folder_run_time_sums(folders, child_kinds)
+            .await?;
         let mut touched = std::collections::HashSet::new();
-        for kind in [BaseItemKind::MusicArtist, BaseItemKind::MusicAlbum] {
-            let folders = match only {
-                None => {
-                    items
-                        .get_item_list(&InternalItemsQuery {
-                            include_item_types: vec![kind],
-                            ..InternalItemsQuery::default()
-                        })
-                        .await?
-                }
-                Some(ids) => items
-                    .retrieve_items(ids)
-                    .await?
-                    .into_iter()
-                    .filter(|row| item_type_lookup::kind_from_type_name(&row.type_) == Some(kind))
-                    .collect(),
+        for id in folders {
+            let Some(sum) = sums.get(id) else {
+                continue;
             };
-            for folder in folders {
-                // Between two folders: the lane's refreshes run. A folder one
-                // of them refreshed has had its own runtime pass (and may be
-                // gone); the rest are written by their runtime column alone,
-                // so nothing else the refresh wrote is put back.
-                touched.extend(Box::pin(self.serve_lane(run)).await);
-                let Ok(id) = Uuid::parse_str(&folder.id) else {
-                    continue;
-                };
-                if touched.contains(&id) {
-                    continue;
-                }
-                let children = items
-                    .get_item_list(&InternalItemsQuery {
-                        ancestor_ids: vec![id],
-                        recursive: true,
-                        ..InternalItemsQuery::default()
-                    })
-                    .await?;
-                let ticks: i64 = children
-                    .iter()
-                    .filter(|child| !child.is_folder)
-                    .map(|child| child.run_time_ticks.unwrap_or(0))
-                    .sum();
-                // `if (!folder.RunTimeTicks.HasValue || folder.RunTimeTicks.Value != ticks)`
-                if folder.run_time_ticks == Some(ticks) {
-                    continue;
-                }
-                self.persistence.update_run_time_ticks(id, ticks).await?;
+            let ticks = sum.aggregate.unwrap_or(0);
+            // `if (!folder.RunTimeTicks.HasValue || folder.RunTimeTicks.Value != ticks)`
+            if sum.stored == Some(ticks) {
+                continue;
             }
+            // Before a write: the lane's refreshes run. A folder one of them
+            // refreshed has had its own runtime pass (and may be gone); the
+            // rest are written by their runtime column alone, so nothing
+            // else the refresh wrote is put back.
+            touched.extend(Box::pin(self.serve_lane(run)).await);
+            if touched.contains(id) {
+                continue;
+            }
+            self.persistence.update_run_time_ticks(*id, ticks).await?;
+        }
+        Ok(())
+    }
+
+    /// Port of `MetadataService.UpdateDateLastMediaAdded`
+    /// (`MetadataService.cs:509-541`) over `folders`, the series (the one
+    /// kind whose `SupportsDateLastMediaAdded` is true, `Series.cs:45`;
+    /// `Folder.cs:116` makes it false, `Season.cs:34` too): the latest
+    /// `DateCreated` of its non-folder, non-virtual descendants — the one
+    /// column behind a folder's "Date added" sort (`DateLastContentAdded`).
+    /// A series with no such episode gets upstream's `DateTime.MinValue`,
+    /// which its mapper stores as `NULL` (`BaseItemMapper.cs:418`) and reads
+    /// back as `MinValue` (`:234`, as the DTO does here): `NULL` is stored.
+    /// Written by that column alone, and only when it moved.
+    async fn update_last_media_added(
+        &self,
+        folders: &[Uuid],
+        run: ScanRun<'_>,
+    ) -> Result<(), ServiceError> {
+        if folders.is_empty() {
+            return Ok(());
+        }
+        let dates = self.persistence.folder_last_media_added(folders).await?;
+        let mut touched = std::collections::HashSet::new();
+        for id in folders {
+            let Some(date) = dates.get(id) else {
+                continue;
+            };
+            if date.stored == date.aggregate {
+                continue;
+            }
+            touched.extend(Box::pin(self.serve_lane(run)).await);
+            if touched.contains(id) {
+                continue;
+            }
+            self.persistence
+                .update_date_last_media_added(*id, date.aggregate)
+                .await?;
         }
         Ok(())
     }
@@ -4495,7 +5011,9 @@ impl LibraryScanner {
     /// "deleted".
     ///
     /// Returns the deleted item ids per library, feeding the scan-end
-    /// `LibraryChanged` push.
+    /// `LibraryChanged` push. The children-derived columns of the folders
+    /// they leave behind are derived again by the folder aggregate pass,
+    /// which covers every folder the scan planned.
     async fn prune_deleted(
         &self,
         folders: &[VirtualFolderInfo],
@@ -4641,520 +5159,6 @@ impl LibraryScanner {
             })
     }
 
-    /// The post-scan music-enrichment pass. Resolves each `MusicAlbum`'s and
-    /// `MusicArtist`'s `MusicBrainz*` ids: preferring the ids embedded in the
-    /// tracks' tags (persisted during the main loop), else querying MusicBrainz
-    /// by name. Also aggregates album-artist/year from an album's tracks onto the
-    /// album row. No-op unless both the item repository and MusicBrainz client
-    /// are wired.
-    async fn enrich_music(
-        &self,
-        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
-        run: ScanRun<'_>,
-    ) -> Result<(), ServiceError> {
-        let cancel = run.cancel;
-        let (Some(items), Some(mb)) = (&self.item_repository, &self.musicbrainz) else {
-            return Ok(());
-        };
-
-        // Pre-fetch the embedded MusicBrainz ids by track (persisted from tags),
-        // so each album/artist can adopt its tracks' ids without a per-item read.
-        let by_provider = |key: &'static str| async move {
-            items
-                .get_items_with_provider_id(key)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<HashMap<Uuid, String>>()
-        };
-        let track_album = by_provider("MusicBrainzAlbum").await;
-        let track_rg = by_provider("MusicBrainzReleaseGroup").await;
-        let track_albumartist = by_provider("MusicBrainzAlbumArtist").await;
-
-        // Map album-artist name → its embedded MusicBrainzAlbumArtist id, and
-        // gather each album's aggregate from its tracks, in one pass over Audio.
-        let audio = items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::Audio],
-                recursive: true,
-                ..Default::default()
-            })
-            .await?;
-        let mut artist_mbid: HashMap<String, String> = HashMap::new();
-        for track in &audio {
-            let Ok(tid) = Uuid::parse_str(&track.id) else {
-                continue;
-            };
-            if let Some(mbid) = track_albumartist.get(&tid) {
-                for name in split_pipe(track.album_artists.as_deref()) {
-                    artist_mbid.entry(name).or_insert_with(|| mbid.clone());
-                }
-            }
-        }
-
-        Box::pin(self.enrich_albums(
-            items.as_ref(),
-            mb.as_ref(),
-            &track_album,
-            &track_rg,
-            &artist_mbid,
-            policies,
-            run,
-        ))
-        .await?;
-        if cancel.is_cancelled() {
-            return Ok(());
-        }
-        Box::pin(self.enrich_artists(items.as_ref(), mb.as_ref(), &artist_mbid, policies, run))
-            .await?;
-        Ok(())
-    }
-
-    /// Downloads music artwork (AudioDb/fanart) into `{meta}/library/{id}` and
-    /// persists the rows, deduped one-file-per-type. No-op without a download
-    /// client + metadata dir. Best-effort.
-    async fn persist_music_images(
-        &self,
-        item_id: Uuid,
-        images: Vec<ferrofin_providers::TmdbImage>,
-    ) {
-        if images.is_empty() {
-            return;
-        }
-        let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
-            return;
-        };
-        let id = item_id.to_string();
-        let mut remote: Vec<RemoteImage> = Vec::new();
-        append_fanart(&mut remote, images);
-        let mut infos = download_images(
-            tmdb,
-            &meta_root.join(&id),
-            &id,
-            dedup_images_by_type(remote),
-        )
-        .await;
-        // No adoption here: the post-scan music pass runs outside the item walk
-        // and so has no `ArtworkCache`. Re-probing a handful of album/artist
-        // covers is not the scan's cost centre; the adoption belongs here too
-        // once the passes share the walk's cache.
-        self.fill_image_metadata(&mut infos).await;
-        if !infos.is_empty()
-            && let Err(err) = self.persistence.save_item_images(item_id, &infos).await
-        {
-            tracing::warn!(%err, item = %id, "failed to persist music artwork");
-        }
-    }
-
-    /// Resolves and persists each `MusicAlbum`'s `MusicBrainzAlbum` +
-    /// `MusicBrainzReleaseGroup` ids, aggregating album-artist/year from its
-    /// tracks first (so a folder-named album gains its artist + release ids).
-    // Same seams as `enrich_one_album`, plus the scan's cancel token.
-    #[allow(clippy::too_many_arguments)]
-    async fn enrich_albums(
-        &self,
-        items: &dyn ItemRepository,
-        mb: &ferrofin_providers::MusicBrainzClient,
-        track_album: &HashMap<Uuid, String>,
-        track_rg: &HashMap<Uuid, String>,
-        artist_mbid: &HashMap<String, String>,
-        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
-        run: ScanRun<'_>,
-    ) -> Result<(), ServiceError> {
-        let albums = items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::MusicAlbum],
-                recursive: true,
-                ..Default::default()
-            })
-            .await?;
-        // What the lane's refreshes touched meanwhile: its rows here are
-        // stale, so it is left for the next scan rather than saved over.
-        let mut touched: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for album in albums {
-            // Between two albums: each album's enrichment is written whole,
-            // and the lane's item refreshes run.
-            if run.cancel.is_cancelled() {
-                return Ok(());
-            }
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            if parse_id(&album.id).is_some_and(|id| touched.contains(&id)) {
-                continue;
-            }
-            // A row of a library no longer configured: skipped.
-            let Some(policy) = policy_of(policies, album.top_parent_id.as_deref()) else {
-                continue;
-            };
-            self.enrich_one_album(
-                &album,
-                items,
-                mb,
-                track_album,
-                track_rg,
-                artist_mbid,
-                policy,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// Enriches one `MusicAlbum`: aggregate album-artist/year from its tracks,
-    /// resolve + persist its MusicBrainz ids, then AudioDb metadata + AudioDb/
-    /// fanart artwork.
-    // The per-track id maps + the library policy are each one seam; a
-    // params struct would only rename the coupling.
-    #[allow(clippy::too_many_arguments)]
-    async fn enrich_one_album(
-        &self,
-        album: &BaseItemEntity,
-        items: &dyn ItemRepository,
-        mb: &ferrofin_providers::MusicBrainzClient,
-        track_album: &HashMap<Uuid, String>,
-        track_rg: &HashMap<Uuid, String>,
-        artist_mbid: &HashMap<String, String>,
-        policy: FetcherPolicy<'_>,
-    ) -> Result<(), ServiceError> {
-        let Ok(album_uuid) = Uuid::parse_str(&album.id) else {
-            return Ok(());
-        };
-        {
-            // C# `AlbumMetadataService.GetChildrenForMetadataUpdates` is
-            // `item.GetRecursiveChildren(i => i is Audio)` — recursive, so a
-            // multi-disc album (`Album/Disc 1/*.flac`) still aggregates.
-            let tracks = items
-                .get_item_list(&InternalItemsQuery {
-                    parent_id: album_uuid,
-                    include_item_types: vec![BaseItemKind::Audio],
-                    recursive: true,
-                    ..Default::default()
-                })
-                .await?;
-
-            // `UpdateGenres`/`UpdateStudios` skip a field the album locked.
-            let locked_fields = match self
-                .persistence
-                .locked_fields_for_items(&[album_uuid])
-                .await
-            {
-                Ok(mut map) => map.remove(&album_uuid).unwrap_or_default(),
-                Err(err) => {
-                    tracing::warn!(%err, item_id = %album_uuid, "failed to read the album's locked fields");
-                    ALL_LOCKABLE_FIELDS.to_vec()
-                }
-            };
-            let (mut updated, changed) = apply_album_child_metadata(album, &tracks, &locked_fields);
-            if changed {
-                self.persistence
-                    .save_items(std::slice::from_ref(&updated))
-                    .await?;
-                let values = item_values_of(&updated);
-                if !values.is_empty() {
-                    self.persistence
-                        .save_item_values(album_uuid, &values)
-                        .await?;
-                }
-            }
-            // MusicBrainz, AudioDb and fanart are remote providers:
-            // `CanRefreshMetadata` / `CanRefreshImages` refuse them all for a
-            // locked item (`ProviderManager.cs:438,589`). Its local images
-            // were validated by the item walk.
-            if album.is_locked {
-                return Ok(());
-            }
-
-            // The embedded ids from any track (they share an album's release).
-            let embedded = ferrofin_providers::AlbumIds {
-                release_id: tracks
-                    .iter()
-                    .find_map(|t| track_album.get(&parse_id(&t.id)?).cloned()),
-                release_group_id: tracks
-                    .iter()
-                    .find_map(|t| track_rg.get(&parse_id(&t.id)?).cloned()),
-            };
-            let album_name = updated.name.clone().unwrap_or_default();
-            let album_artist: Option<String> = updated
-                .album_artists
-                .as_deref()
-                .and_then(|s| s.split('|').next())
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            // The library's MusicBrainz checkbox gates the REMOTE
-            // resolution only; the tag/name aggregation above is local.
-            let resolved = if policy.metadata_enabled("MusicAlbum", fetcher_names::MUSICBRAINZ) {
-                mb.resolve_album(&album_name, embedded, None, album_artist.as_deref())
-                    .await
-            } else {
-                ferrofin_providers::AlbumIds::default()
-            };
-            if let Some(id) = &resolved.release_id {
-                let _ = self
-                    .persistence
-                    .save_provider_id(album_uuid, "MusicBrainzAlbum", id)
-                    .await;
-            }
-            if let Some(id) = &resolved.release_group_id {
-                let _ = self
-                    .persistence
-                    .save_provider_id(album_uuid, "MusicBrainzReleaseGroup", id)
-                    .await;
-            }
-            // The save below lives in `enrich_album_artwork` and is gated on
-            // its own change flag, so a date applied here has to be reported —
-            // otherwise it is fetched and silently discarded.
-            let dated =
-                apply_release_details(&mut updated, mb, resolved.release_id.as_deref()).await;
-
-            self.enrich_album_artwork(
-                album_uuid,
-                &mut updated,
-                AlbumRemoteKeys {
-                    release_group_id: resolved.release_group_id.as_deref(),
-                    album_artist: album_artist.as_deref(),
-                    artist_mbid,
-                },
-                policy,
-                dated,
-                &locked_fields,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// AudioDb album metadata (description/year) + AudioDb/fanart album artwork,
-    /// keyed by the release-group id (fanart also needs the album-artist's mbid).
-    ///
-    /// The album's `LockedFields` shield its name and overview, as the merge
-    /// of a remote provider's result would (`MergeData(…, item.LockedFields,
-    /// …)`).
-    async fn enrich_album_artwork(
-        &self,
-        album_uuid: Uuid,
-        updated: &mut BaseItemEntity,
-        keys: AlbumRemoteKeys<'_>,
-        policy: FetcherPolicy<'_>,
-        already_changed: bool,
-        locked_fields: &[MetadataField],
-    ) -> Result<(), ServiceError> {
-        let AlbumRemoteKeys {
-            release_group_id,
-            album_artist,
-            artist_mbid,
-        } = keys;
-        let mut changed = already_changed;
-        let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
-        if policy.metadata_enabled("MusicAlbum", fetcher_names::AUDIODB)
-            && let (Some(adb), Some(rg)) = (&self.audiodb, release_group_id)
-            && let Some(a) = adb.album(rg).await
-        {
-            // `ReplaceAlbumName` (AudioDB settings page, off by default): the
-            // client only carries a name when the admin turned it on, and
-            // upstream OVERWRITES — `item.Name = result.strAlbum` — rather than
-            // filling a gap, so this is not gated on the existing name.
-            if let Some(name) = a.name
-                && !locked_fields.contains(&MetadataField::Name)
-                && updated.name.as_deref() != Some(name.as_str())
-            {
-                updated.name = Some(name);
-                changed = true;
-            }
-            if updated.overview.is_none()
-                && !locked_fields.contains(&MetadataField::Overview)
-                && a.description.is_some()
-            {
-                updated.overview = a.description;
-                changed = true;
-            }
-            if updated.production_year.is_none() && a.year.is_some() {
-                updated.production_year = a.year.map(i64::from);
-                changed = true;
-            }
-            images.extend(a.images);
-        }
-        if let (Some(fanart), Some(rg), Some(name)) = (&self.fanart, release_group_id, album_artist)
-            && let Some(aa_mbid) = artist_mbid.get(name)
-        {
-            images.extend(fanart.album_images(aa_mbid, rg).await);
-        }
-        if changed {
-            self.persistence
-                .save_items(std::slice::from_ref(updated))
-                .await?;
-        }
-        self.persist_music_images(album_uuid, images).await;
-        Ok(())
-    }
-
-    /// Resolves and persists each `MusicArtist`'s `MusicBrainzArtist` id — the
-    /// embedded album-artist id from its tracks, else a MusicBrainz name search —
-    /// then its AudioDb bio/genre + AudioDb/fanart artwork.
-    // One straight pass per artist: id, name, life span, AudioDb, fanart; the
-    // Phase 3L lock gates tipped it over the line count.
-    #[allow(clippy::too_many_lines)]
-    async fn enrich_artists(
-        &self,
-        items: &dyn ItemRepository,
-        mb: &ferrofin_providers::MusicBrainzClient,
-        artist_mbid: &HashMap<String, String>,
-        policies: &HashMap<Uuid, FetcherPolicy<'_>>,
-        run: ScanRun<'_>,
-    ) -> Result<(), ServiceError> {
-        let artists = items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::MusicArtist],
-                recursive: true,
-                ..Default::default()
-            })
-            .await?;
-        // Every artist's `LockedFields` in one read; a failed read locks
-        // every field rather than risk one.
-        let artist_ids: Vec<Uuid> = artists
-            .iter()
-            .filter_map(|a| Uuid::parse_str(&a.id).ok())
-            .collect();
-        let artist_locks = match self.persistence.locked_fields_for_items(&artist_ids).await {
-            Ok(map) => Some(map),
-            Err(err) => {
-                tracing::warn!(%err, "failed to read the artists' locked fields");
-                None
-            }
-        };
-        let mut touched: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        for artist in artists {
-            // Between two artists: each artist's enrichment is written whole,
-            // and the lane's item refreshes run; an artist they touched is
-            // left for the next scan rather than saved over.
-            if run.cancel.is_cancelled() {
-                return Ok(());
-            }
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            let Ok(artist_uuid) = Uuid::parse_str(&artist.id) else {
-                continue;
-            };
-            if touched.contains(&artist_uuid) {
-                continue;
-            }
-            let Some(name) = artist.name.as_deref().filter(|n| !n.is_empty()) else {
-                continue;
-            };
-            // Every source below is a remote provider, which a locked item
-            // never runs (`ProviderManager.cs:438,589`).
-            if artist.is_locked {
-                continue;
-            }
-            let locked: &[MetadataField] =
-                artist_locks.as_ref().map_or(ALL_LOCKABLE_FIELDS, |map| {
-                    map.get(&artist_uuid).map_or(&[][..], Vec::as_slice)
-                });
-            let Some(policy) = policy_of(policies, artist.top_parent_id.as_deref()) else {
-                continue;
-            };
-            // The MusicBrainz checkbox gates the REMOTE surface only (the
-            // name search and the persisted provider-id row) — an mbid
-            // already present in the local tags stays usable, so AudioDb/
-            // fanart below still run for tagged libraries (the same
-            // remote-resolve-only gate as `enrich_one_album`).
-            let mb_enabled = policy.metadata_enabled("MusicArtist", fetcher_names::MUSICBRAINZ);
-            // `ReplaceArtistName` (MusicBrainz settings page, off by default)
-            // renames the artist to MusicBrainz's spelling — but ONLY on the
-            // branch that RESOLVED the id by searching. C#
-            // `MusicBrainzArtistProvider.cs:135-150` puts the rename inside
-            // `if (string.IsNullOrWhiteSpace(musicBrainzId))`, so an artist
-            // whose mbid came from its own tags is never renamed.
-            let mut searched_name = None;
-            let mbid = match artist_mbid.get(name) {
-                Some(id) => Some(id.clone()),
-                None if mb_enabled => match mb.search_artist_match(name).await {
-                    Some(hit) => {
-                        searched_name = hit.name;
-                        Some(hit.id)
-                    }
-                    None => None,
-                },
-                None => None,
-            };
-            let Some(id) = mbid else {
-                continue;
-            };
-            if mb_enabled {
-                let _ = self
-                    .persistence
-                    .save_provider_id(artist_uuid, "MusicBrainzArtist", &id)
-                    .await;
-            }
-
-            // AudioDb bio/genre + AudioDb/fanart artist artwork, keyed by the
-            // resolved MusicBrainz artist id.
-            let mut updated = artist.clone();
-            let mut changed = false;
-            if let Some(mb_name) = searched_name
-                && mb_enabled
-                && !locked.contains(&MetadataField::Name)
-                && updated.name.as_deref() != Some(mb_name.as_str())
-                && mb.replace_artist_name().await
-            {
-                updated.name = Some(mb_name);
-                changed = true;
-            }
-            let mut images: Vec<ferrofin_providers::TmdbImage> = Vec::new();
-            // MusicBrainz's own artist fields (C# `MusicBrainzArtistProvider`
-            // writes more than the id): the life span, whose end is what the
-            // artist NFO saver emits as `<disbanded>`.
-            if mb_enabled
-                && (updated.premiere_date.is_none() || updated.end_date.is_none())
-                && let Some(details) = mb.artist_details(&id).await
-            {
-                if updated.premiere_date.is_none()
-                    && let Some(begin) = details
-                        .premiere_date
-                        .and_then(ferrofin_providers::PartialDate::to_utc)
-                {
-                    updated.premiere_date = Some(begin);
-                    changed = true;
-                }
-                if updated.end_date.is_none()
-                    && let Some(end) = details
-                        .end_date
-                        .and_then(ferrofin_providers::PartialDate::to_utc)
-                {
-                    updated.end_date = Some(end);
-                    changed = true;
-                }
-            }
-            if policy.metadata_enabled("MusicArtist", fetcher_names::AUDIODB)
-                && let Some(adb) = &self.audiodb
-                && let Some(a) = adb.artist(&id).await
-            {
-                if updated.overview.is_none()
-                    && !locked.contains(&MetadataField::Overview)
-                    && a.biography.is_some()
-                {
-                    updated.overview = a.biography;
-                    changed = true;
-                }
-                if updated.genres.as_deref().unwrap_or_default().is_empty()
-                    && !locked.contains(&MetadataField::Genres)
-                    && let Some(genre) = a.genre.filter(|g| !g.is_empty())
-                {
-                    updated.genres = Some(genre);
-                    changed = true;
-                }
-                images.extend(a.images);
-            }
-            if let Some(fanart) = &self.fanart {
-                images.extend(fanart.artist_images(&id).await);
-            }
-            if changed {
-                self.persistence
-                    .save_items(std::slice::from_ref(&updated))
-                    .await?;
-            }
-            self.persist_music_images(artist_uuid, images).await;
-        }
-        Ok(())
-    }
-
     /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
     /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
     /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
@@ -5229,7 +5233,7 @@ impl LibraryScanner {
         item: &Planned,
         links: Option<&StoredItemLinks>,
     ) -> ItemRefreshPlan {
-        let policy = policy_for(item, refresh.policies);
+        let policy = refresh.policy_for(item);
         let state = stored.map(|row| StoredState {
             date_last_refreshed: row.date_last_refreshed,
             date_last_saved: row.date_last_saved,
@@ -6573,10 +6577,26 @@ impl LibraryScanner {
         }
     }
 
-    /// Downloads the artwork-repository thumb for every Studio row still
-    /// without images (port of upstream's `StudiosImageProvider`). Idempotent:
-    /// studios with any image row are skipped, and downloads reuse on-disk
-    /// files. Best-effort per studio — one failure skips that studio only.
+    /// The studio half of upstream's `StudiosValidator` (`StudiosValidator.cs:
+    /// 69-84`): a studio is refreshed once, when it is new, with the default
+    /// options — its first refresh, so `StudiosImageProvider` (a remote image
+    /// provider, which `GetNonLocalImageProviders` runs for an item never
+    /// refreshed) looks up its artwork-repository thumb once. Here every
+    /// studio never refreshed looks its thumb up when it has no image yet,
+    /// and is stamped `DateLastRefreshed` unless the lookup failed (owner
+    /// decision D1): a studio the repository has no thumb for is not asked
+    /// again on every scan, one whose lookup failed is. A thumb that could
+    /// not be written or recorded is a failure too, as upstream counts a
+    /// failed image save. The studios are selected by that stamp in one
+    /// read (a studio never refreshed), so an unchanged library reads no
+    /// studio row.
+    ///
+    /// Every lookup reads the repository's manifest (`thumbs.txt`), which
+    /// the client caches only once it is answered. So a manifest request
+    /// that fails stops the pass: the studios not yet looked up stay
+    /// unstamped for the next validation, rather than each asking for the
+    /// manifest again. A studio row that cannot be read is skipped, the
+    /// rest go on (one warning per pass names the count and the first).
     async fn enrich_studio_images(&self, run: ScanRun<'_>) -> Result<(), ServiceError> {
         let (Some(studios), Some(repo), Some(meta_root)) = (
             &self.studios_client,
@@ -6585,55 +6605,66 @@ impl LibraryScanner {
         ) else {
             return Ok(());
         };
-        // Only the studio rows are read below, so ask for no fields: the default
-        // query carries every `ItemFields`, and `ItemCounts` would run the
-        // per-kind count statements over every studio in the library and throw
-        // the answers away.
-        let result = repo
-            .get_studios(&ferrofin_traits::options::InternalItemsQuery {
-                dto_options: ferrofin_traits::options::DtoOptions {
-                    fields: Vec::new(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
+        let fresh = self
+            .persistence
+            .never_refreshed_ids(BaseItemKind::Studio, false)
             .await?;
-        for row in result.items {
+        let mut refreshed: Vec<Uuid> = Vec::new();
+        let mut skipped = SkippedItems::default();
+        for id in fresh {
             // Between two studios: each studio's thumb is written whole, and
             // the lane's refreshes run.
             if run.cancel.is_cancelled() {
-                return Ok(());
+                break;
             }
             Box::pin(self.serve_lane(run)).await;
-            let entity = row.item;
-            let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
-                continue;
-            };
-            let Ok(id) = Uuid::parse_str(&entity.id) else {
-                continue;
-            };
-            if !repo.get_image_infos(id).await?.is_empty() {
-                continue;
-            }
-            let Some(url) = studios.thumb_url(name).await else {
-                continue;
-            };
-            let dir = meta_root.join(id.to_string());
-            let stem = image_type_file_stem(ImageType::Thumb);
-            let dest = if let Some(existing) = existing_art_file(&dir, stem) {
-                existing
-            } else {
-                let dest = dir.join(format!("{stem}.jpg"));
-                let Some(bytes) = studios.download(&url).await else {
-                    continue;
-                };
-                if let Err(err) =
-                    std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&dest, &bytes))
-                {
-                    tracing::warn!(%err, studio = name, "failed to write studio thumb");
+            // Read now: a refresh the lane served may have changed it.
+            let entity = match repo.retrieve_item(id).await {
+                Ok(Some(entity)) => entity,
+                Ok(None) => continue,
+                Err(err) => {
+                    skipped.note(id, &err);
                     continue;
                 }
-                dest
+            };
+            if entity.date_last_refreshed.is_some() {
+                continue;
+            }
+            let Some(name) = entity.name.as_deref().filter(|n| !n.is_empty()) else {
+                refreshed.push(id);
+                continue;
+            };
+            match repo.get_image_infos(id).await {
+                Ok(images) if !images.is_empty() => {
+                    refreshed.push(id);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    skipped.note(id, &err);
+                    continue;
+                }
+            }
+            let dest = match studio_thumb(studios, &meta_root.join(id.to_string()), name).await {
+                StudioThumb::Found(dest) => dest,
+                StudioThumb::Answered => {
+                    refreshed.push(id);
+                    continue;
+                }
+                StudioThumb::Failed(Some(err)) => {
+                    skipped.note(id, &err);
+                    continue;
+                }
+                StudioThumb::Failed(None) => continue,
+                StudioThumb::RepositoryDown => {
+                    // The manifest request failed: stop before every studio
+                    // left asks for it again.
+                    tracing::debug!(
+                        item_id = %id,
+                        "studio artwork repository unavailable; the rest wait for the next scan"
+                    );
+                    break;
+                }
             };
             let mut images = vec![ItemImageInfo {
                 path: dest.to_string_lossy().into_owned(),
@@ -6644,9 +6675,16 @@ impl LibraryScanner {
                 blur_hash: None,
             }];
             self.fill_image_metadata(&mut images).await;
-            if let Err(err) = self.persistence.save_item_images(id, &images).await {
-                tracing::warn!(%err, studio = name, "failed to persist studio thumb");
+            match self.persistence.save_item_images(id, &images).await {
+                Ok(()) => refreshed.push(id),
+                Err(err) => skipped.note(id, &err),
             }
+        }
+        skipped.report("studio images");
+        if !refreshed.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&refreshed, Utc::now())
+                .await?;
         }
         Ok(())
     }
@@ -6957,7 +6995,23 @@ impl LibraryScanner {
         art_cache: &mut ArtworkCache,
     ) -> Vec<ItemImageInfo> {
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
-        let enabled = policy.image_enabled(short, fetcher_names::EMBEDDED_IMAGES);
+        // Two upstream providers under two checkbox names: a track's cover is
+        // `AudioImageProvider` ("Image Extractor", `AudioImageProvider.cs:51`,
+        // `item is Audio`, an audiobook too), a video's frame or attachment
+        // `EmbeddedImageProvider` ("Embedded Image Extractor",
+        // `EmbeddedImageProvider.cs:69`, `item is Video`). Asking a track's
+        // library for the video one's name left a music library that ticked
+        // "Image Extractor" — jellyfin-web's default — with no embedded
+        // covers.
+        let provider = if matches!(
+            image_item_kind(&entity.type_),
+            ImageItemKind::Audio | ImageItemKind::AudioBook
+        ) {
+            fetcher_names::AUDIO_IMAGES
+        } else {
+            fetcher_names::EMBEDDED_IMAGES
+        };
+        let enabled = policy.image_enabled(short, provider);
         if let Some(album) = art_cache.track_albums.get(&item_id).copied() {
             if enabled {
                 return self
@@ -9370,16 +9424,6 @@ struct PersonLock {
     fields: Vec<MetadataField>,
 }
 
-/// The keys an album's AudioDb/fanart lookups go by.
-struct AlbumRemoteKeys<'a> {
-    /// The resolved MusicBrainz release-group id.
-    release_group_id: Option<&'a str>,
-    /// The album's first album artist.
-    album_artist: Option<&'a str>,
-    /// Album-artist name → MusicBrainz artist id, from the tracks' tags.
-    artist_mbid: &'a HashMap<String, String>,
-}
-
 /// One item's inputs to the artwork pass, grouped so
 /// [`LibraryScanner::collect_artwork`] keeps a readable signature.
 struct ArtworkPass<'a> {
@@ -9483,13 +9527,14 @@ fn images_changed(images: &[ItemImageInfo], stored: Option<&[ItemImageInfo]>) ->
 /// resolved options gets the permissive default.
 fn policy_for<'a>(
     item: &Planned,
-    policies: &'a std::collections::HashMap<Uuid, FetcherPolicy<'a>>,
+    policies: &std::collections::HashMap<Uuid, FetcherPolicy<'a>>,
+    outside: FetcherPolicy<'a>,
 ) -> FetcherPolicy<'a> {
     item.ancestors
         .first()
         .and_then(|id| policies.get(id))
         .copied()
-        .unwrap_or_default()
+        .unwrap_or(outside)
 }
 
 /// Applies a book's embedded metadata to the row, filling only what is still
@@ -10845,41 +10890,6 @@ fn apply_details(entity: &mut BaseItemEntity, d: &TmdbDetails) {
     }
 }
 
-/// Fills an album's release date and year from MusicBrainz — C#
-/// `MusicBrainzAlbumProvider` writes more onto a `MusicAlbum` than its ids, and
-/// for a tagless album this is the only year there is. A row that already has a
-/// date makes no request.
-async fn apply_release_details(
-    album: &mut BaseItemEntity,
-    mb: &ferrofin_providers::MusicBrainzClient,
-    release_id: Option<&str>,
-) -> bool {
-    if album.premiere_date.is_some() {
-        return false;
-    }
-    let Some(release) = release_id else {
-        return false;
-    };
-    let Some(details) = mb.release_details(release).await else {
-        return false;
-    };
-    let mut changed = false;
-    if let Some(date) = details
-        .premiere_date
-        .and_then(ferrofin_providers::PartialDate::to_utc)
-    {
-        album.premiere_date = Some(date);
-        changed = true;
-    }
-    if album.production_year.is_none()
-        && let Some(year) = details.production_year
-    {
-        album.production_year = Some(i64::from(year));
-        changed = true;
-    }
-    changed
-}
-
 /// The ids a fetcher may resolve this row by: the sidecar's first, then any the
 /// row already carries from a previous scan.
 ///
@@ -11813,6 +11823,8 @@ fn discover_local_images(entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
         .collect()
 }
 
+mod music;
+
 #[cfg(test)]
 mod plan_paths_tests;
 
@@ -12724,37 +12736,67 @@ mod tests {
         };
         let policy = super::FetcherPolicy {
             options: Some(&options),
+            global: None,
         };
         assert_eq!(policy.metadata_language(), "de");
         assert_eq!(policy.country_code(), "de");
     }
 
-    /// A music row's policy in the post-scan passes comes from its own
-    /// library: a library the admin removed gives none (the row is skipped,
-    /// never enriched under another library's or the permissive defaults),
-    /// and a row in no library (a by-name artist) takes upstream's
-    /// `new LibraryOptions()` defaults.
+    /// A planned item's fetcher policy is its own library's, with the
+    /// server-wide `MetadataOptions` behind it for a kind the library saved
+    /// no checkboxes for; an item in no configured library (a by-name
+    /// artist) takes the server-wide options alone — upstream's
+    /// `GetLibraryOptions` gives it `new LibraryOptions()`, and
+    /// `IsMetadataFetcherEnabled` then asks the server
+    /// (`BaseItemManager.cs:45-46`).
     #[test]
-    fn a_rows_policy_is_its_own_librarys_or_none() {
+    fn an_items_policy_is_its_librarys_backed_by_the_server_wide_options() {
+        use ferrofin_model::configuration::{LibraryOptions, MetadataOptions, TypeOptions};
+        use ferrofin_providers::library_options::fetcher_names::{AUDIODB, MUSICBRAINZ};
         let music = uuid::Uuid::from_u128(0x5A);
         let folders = vec![super::VirtualFolderInfo {
             item_id: Some(music.simple().to_string()),
-            library_options: Some(ferrofin_model::configuration::LibraryOptions {
+            library_options: Some(LibraryOptions {
                 preferred_metadata_language: Some("de".to_owned()),
+                type_options: vec![TypeOptions {
+                    type_: Some("MusicAlbum".to_owned()),
+                    metadata_fetchers: vec![AUDIODB.to_owned()],
+                    ..TypeOptions::default()
+                }],
                 ..Default::default()
             }),
             ..Default::default()
         }];
-        let policies = super::fetcher_policies(&folders);
-        let own = super::policy_of(&policies, Some(&music.to_string())).expect("its library");
+        // The `ServerConfiguration` constructor's music entries.
+        let server = ["MusicAlbum", "MusicArtist"].map(|kind| MetadataOptions {
+            item_type: Some(kind.to_owned()),
+            disabled_metadata_fetchers: vec![AUDIODB.to_owned()],
+            ..MetadataOptions::default()
+        });
+        let policies = super::fetcher_policies(&folders, Some(&server));
+        let outside = super::FetcherPolicy {
+            options: None,
+            global: Some(&server),
+        };
+        let planned = |library: uuid::Uuid| super::Planned {
+            id: uuid::Uuid::new_v4(),
+            entity: ferrofin_db::entities::base_items::BaseItemEntity::default(),
+            ancestors: vec![library],
+        };
+        let own = super::policy_for(&planned(music), &policies, outside);
         assert_eq!(own.metadata_language(), "de");
-        let removed = uuid::Uuid::from_u128(0x5B).to_string();
-        assert!(super::policy_of(&policies, Some(&removed)).is_none());
-        assert!(super::policy_of(&policies, Some("not-a-guid")).is_none());
-        for none in [None, Some(""), Some("  ")] {
-            let default = super::policy_of(&policies, none).expect("defaults");
-            assert!(default.options.is_none());
-        }
+        // The library's saved MusicAlbum list is the whole answer…
+        assert!(own.metadata_enabled("MusicAlbum", AUDIODB));
+        assert!(!own.metadata_enabled("MusicAlbum", MUSICBRAINZ));
+        // …and a kind it saved none for falls back to the server.
+        assert!(!own.metadata_enabled("MusicArtist", AUDIODB));
+        assert!(own.metadata_enabled("MusicArtist", MUSICBRAINZ));
+        // An item whose library is not configured takes the server's alone.
+        let elsewhere =
+            super::policy_for(&planned(uuid::Uuid::from_u128(0x5B)), &policies, outside);
+        assert!(elsewhere.options.is_none());
+        assert!(!elsewhere.metadata_enabled("MusicAlbum", AUDIODB));
+        assert!(elsewhere.metadata_enabled("MusicAlbum", MUSICBRAINZ));
     }
 
     // OMDb's poster is appended last so the dedup keeps it only as a last
@@ -12828,15 +12870,13 @@ mod tests {
             &cache,
             super::FetcherPolicy {
                 options: Some(&options),
+                global: None,
             },
             "Movie",
         );
         assert!(images.is_empty());
     }
 
-    // The post-scan music pass resolves each album's + artist's MusicBrainz ids
-    // from the embedded ids on its tracks (no network when they're all present),
-    // and aggregates the album-artist onto the album. Seeds through the seams.
     /// Serves `manifest` for `thumbs.txt` requests and `image` for everything
     /// else — enough HTTP for the studios client (blocking, own thread).
     fn spawn_art_server(manifest: &'static str, image: &'static [u8]) -> String {
@@ -13342,7 +13382,158 @@ mod tests {
 
     // The post-scan studio pass downloads the artwork-repository thumb for a
     // materialized Studio row without images — and skips it once it has one.
+    // It is `StudiosValidator`'s first refresh of a studio: a studio the
+    // repository answered for (thumb or none) is stamped and not asked
+    // again; one whose lookup failed is not stamped, so the next scan asks
+    // again (owner decision D1).
+    /// A studio artwork repository that answers every request with
+    /// `status` and an empty body, counting the requests.
+    fn spawn_refusing_server(
+        status: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf);
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (format!("http://{addr}"), asked)
+    }
+
+    /// The studio pass stops at a manifest request that fails — one request
+    /// per pass, however many studios wait, none of them stamped, so the
+    /// next validation asks again — and a thumb it could not write is a
+    /// failure: that studio stays unstamped while the others are stamped.
     #[tokio::test(flavor = "multi_thread")]
+    // One library, a refusing repository, then an answering one.
+    #[allow(clippy::too_many_lines)]
+    async fn a_failed_studio_manifest_stops_the_pass_and_a_failed_write_stamps_nothing() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let movie_id = Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(movie_id),
+                type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+                name: Some("Solaris".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed movie");
+        persistence
+            .save_item_values(
+                movie_id,
+                &[
+                    (3, "Mosfilm".into()),
+                    (3, "Lenfilm".into()),
+                    (3, "Nowhere Films".into()),
+                ],
+            )
+            .await
+            .expect("materialize studios");
+        let studios = items
+            .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
+            .await
+            .expect("studios")
+            .items;
+        let studio = |name: &str| {
+            Uuid::parse_str(
+                &studios
+                    .iter()
+                    .find(|s| s.item.name.as_deref() == Some(name))
+                    .expect("studio")
+                    .item
+                    .id,
+            )
+            .unwrap()
+        };
+        let (mosfilm, lenfilm, nowhere) = (
+            studio("Mosfilm"),
+            studio("Lenfilm"),
+            studio("Nowhere Films"),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = |repo: &str| {
+            let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+                FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                    .with_item_store(persistence.clone()),
+            );
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_metadata_dir(tmp.path().join("metadata"))
+                .with_studio_images(Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
+                    repo,
+                )))
+        };
+        let stamped = |id: Uuid| {
+            let items = Arc::clone(&items);
+            async move {
+                items
+                    .retrieve_item(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .date_last_refreshed
+                    .is_some()
+            }
+        };
+
+        // A repository that refuses (403: no backoff, no open circuit).
+        let (refusing, asked) = spawn_refusing_server("403 Forbidden");
+        scanner(&refusing)
+            .enrich_studio_images(super::ScanRun::defaults())
+            .await
+            .expect("pass");
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the manifest is asked once, not once per studio"
+        );
+        for id in [mosfilm, lenfilm, nowhere] {
+            assert!(!stamped(id).await, "retried by the next validation");
+        }
+
+        // An answering repository; Mosfilm's thumb cannot be written (its
+        // folder is a file).
+        std::fs::create_dir_all(tmp.path().join("metadata")).unwrap();
+        std::fs::write(tmp.path().join("metadata").join(mosfilm.to_string()), b"x").unwrap();
+        let base = spawn_art_server("Mosfilm\nLenfilm", b"JPEGDATA");
+        scanner(&base)
+            .enrich_studio_images(super::ScanRun::defaults())
+            .await
+            .expect("pass");
+        assert!(!stamped(mosfilm).await, "an unwritten thumb is a failure");
+        assert!(stamped(lenfilm).await);
+        assert!(
+            stamped(nowhere).await,
+            "no thumb in the repository: an answer"
+        );
+        assert_eq!(items.get_image_infos(lenfilm).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    // One scenario: seed, first pass, second pass, a failing repository.
+    #[allow(clippy::too_many_lines)]
     async fn enrich_studio_images_downloads_thumbs_for_bare_studios() {
         use crate::item_persistence_service::FerrofinItemPersistenceService;
         use crate::item_repository::FerrofinItemRepository;
@@ -13372,15 +13563,26 @@ mod tests {
             .await
             .expect("seed movie");
         persistence
-            .save_item_values(movie_id, &[(3, "Mosfilm".into())])
+            .save_item_values(
+                movie_id,
+                &[(3, "Mosfilm".into()), (3, "Nowhere Films".into())],
+            )
             .await
             .expect("materialize studio");
         let studios = items
             .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
             .await
             .expect("studios");
-        assert_eq!(studios.items.len(), 1);
-        let studio_id = uuid::Uuid::parse_str(&studios.items[0].item.id).unwrap();
+        assert_eq!(studios.items.len(), 2);
+        let studio = |name: &str| {
+            let row = studios
+                .items
+                .iter()
+                .find(|s| s.item.name.as_deref() == Some(name))
+                .expect("studio");
+            uuid::Uuid::parse_str(&row.item.id).unwrap()
+        };
+        let (studio_id, unknown_id) = (studio("Mosfilm"), studio("Nowhere Films"));
 
         let base = spawn_art_server("Mosfilm", b"JPEGDATA");
         let tmp = tempfile::tempdir().unwrap();
@@ -13408,6 +13610,18 @@ mod tests {
             ferrofin_model::entities::ImageType::Thumb
         );
         assert_eq!(std::fs::read(&images[0].path).unwrap(), b"JPEGDATA");
+        // Both were answered for — a thumb, and none — so both are refreshed.
+        for id in [studio_id, unknown_id] {
+            let row = items.retrieve_item(id).await.unwrap().unwrap();
+            assert!(row.date_last_refreshed.is_some(), "{:?} stamped", row.name);
+        }
+        assert!(
+            items
+                .get_image_infos(unknown_id)
+                .await
+                .expect("images")
+                .is_empty()
+        );
 
         // Idempotent: a second pass leaves the single image row in place.
         scanner
@@ -13416,6 +13630,40 @@ mod tests {
             .expect("re-enrich");
         let images = items.get_image_infos(studio_id).await.expect("images");
         assert_eq!(images.len(), 1);
+
+        // A studio whose lookup FAILED (the repository refuses the
+        // connection) stays unstamped, so the next scan asks again.
+        persistence
+            .save_item_values(movie_id, &[(3, "Lenfilm".into())])
+            .await
+            .expect("materialize studio");
+        let lenfilm = items
+            .get_studios(&ferrofin_traits::options::InternalItemsQuery::default())
+            .await
+            .expect("studios")
+            .items
+            .into_iter()
+            .find(|s| s.item.name.as_deref() == Some("Lenfilm"))
+            .map(|s| uuid::Uuid::parse_str(&s.item.id).unwrap())
+            .expect("Lenfilm");
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+            .with_items(Arc::clone(&items))
+            .with_metadata_dir(tmp.path().join("metadata"))
+            .with_studio_images(Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
+                &dead,
+            )))
+            .enrich_studio_images(super::ScanRun::defaults())
+            .await
+            .expect("enrich");
+        let row = items.retrieve_item(lenfilm).await.unwrap().unwrap();
+        assert_eq!(row.date_last_refreshed, None, "a failed lookup is retried");
     }
 
     #[test]
@@ -13532,12 +13780,12 @@ mod tests {
                 Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
                 Arc::clone(&items),
             )
-            .enrich_music(
-                &std::collections::HashMap::new(),
-                super::ScanRun::defaults(),
+            .music_pass_for_test(
+                &[(album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy::default(),
+                false,
             )
-            .await
-            .expect("enrich");
+            .await;
 
         let album = items.retrieve_item(album_id).await.unwrap().unwrap();
         // Deduped case-insensitively (`Jazz` and `jazz` are one genre), with
@@ -13786,12 +14034,47 @@ mod tests {
         assert_eq!(updated.studios.as_deref(), Some("New Label"));
     }
 
-    /// A TheAudioDb stand-in answering every album and artist lookup with a
-    /// description, biography and genre; returns its base URL and a request
-    /// counter.
-    fn spawn_audiodb() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    /// The release, release group and artist every [`spawn_music_stub`]
+    /// MusicBrainz answer names.
+    const MB_RELEASE: &str = "11111111-1111-4111-8111-111111111111";
+    const MB_GROUP: &str = "22222222-2222-4222-8222-222222222222";
+    const MB_ARTIST: &str = "33333333-3333-4333-8333-333333333333";
+
+    /// Requests a [`spawn_music_stub`] answered, per service.
+    #[derive(Default)]
+    struct MusicHits {
+        musicbrainz: std::sync::atomic::AtomicUsize,
+        searches: std::sync::atomic::AtomicUsize,
+        audiodb: std::sync::atomic::AtomicUsize,
+        /// The MusicBrainz search request lines.
+        search_lines: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MusicHits {
+        /// The MusicBrainz search request lines so far.
+        fn search_lines(&self) -> Vec<String> {
+            self.search_lines.lock().unwrap().clone()
+        }
+        fn musicbrainz(&self) -> usize {
+            self.musicbrainz.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// The MusicBrainz searches by name (not lookups by id).
+        fn searches(&self) -> usize {
+            self.searches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn audiodb(&self) -> usize {
+            self.audiodb.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A MusicBrainz and TheAudioDb stand-in on one port: every release
+    /// lookup or search answers [`MB_RELEASE`] in [`MB_GROUP`] (dated
+    /// 1959-08-17), every artist one [`MB_ARTIST`], and TheAudioDb answers
+    /// every album and artist with a description, biography and genre.
+    /// Returns its base URL and the requests it answered.
+    fn spawn_music_stub() -> (String, Arc<MusicHits>) {
         use std::io::{Read as _, Write as _};
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = Arc::new(MusicHits::default());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let counter = Arc::clone(&hits);
@@ -13801,11 +14084,46 @@ mod tests {
                 let mut buf = [0u8; 4096];
                 let n = s.read(&mut buf).unwrap_or(0);
                 let line = String::from_utf8_lossy(&buf[..n]).into_owned();
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let body = if line.contains("/album-mb.php") {
-                    r#"{"album":[{"strAlbum":"AudioDb Album","strDescriptionEN":"Album text."}]}"#
+                let line = line.lines().next().unwrap_or_default().to_owned();
+                let release = format!(
+                    r#"{{"id":"{MB_RELEASE}","title":"Kind of Blue","date":"1959-08-17","release-group":{{"id":"{MB_GROUP}"}}}}"#
+                );
+                let body = if line.contains("/ws/2/") {
+                    counter
+                        .musicbrainz
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if line.contains("query=") {
+                        counter
+                            .searches
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        counter.search_lines.lock().unwrap().push(line.clone());
+                    }
+                    if line.contains("/ws/2/release-group/") {
+                        format!(
+                            r#"{{"title":"Kind of Blue","first-release-date":"1959-08-17","releases":[{{"id":"{MB_RELEASE}"}}]}}"#
+                        )
+                    } else if line.contains("/ws/2/release/") {
+                        release
+                    } else if line.contains("/ws/2/release?") {
+                        format!(r#"{{"releases":[{release}]}}"#)
+                    } else if line.contains("/ws/2/artist/") {
+                        format!(
+                            r#"{{"id":"{MB_ARTIST}","name":"Miles Davis","life-span":{{"begin":"1926-05-26","end":"1991-09-28"}}}}"#
+                        )
+                    } else {
+                        format!(r#"{{"artists":[{{"id":"{MB_ARTIST}","name":"Miles Davis"}}]}}"#)
+                    }
                 } else {
-                    r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#
+                    counter
+                        .audiodb
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if line.contains("/album-mb.php") {
+                        r#"{"album":[{"strAlbum":"AudioDb Album","strDescriptionEN":"Album text."}]}"#
+                            .to_owned()
+                    } else {
+                        r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#
+                            .to_owned()
+                    }
                 };
                 let _ = write!(
                     s,
@@ -13817,95 +14135,194 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
+    use ferrofin_traits::options::InternalItemsQuery;
+    use ferrofin_traits::persistence::ItemRepository;
+    use uuid::Uuid;
+
+    /// One album with one tagged track and its by-name artist, seeded as a
+    /// first scan leaves them for the music pass.
+    struct MusicFixture {
+        items: Arc<dyn ItemRepository>,
+        persistence: Arc<crate::item_persistence_service::FerrofinItemPersistenceService>,
+        album_id: Uuid,
+        artist_id: Uuid,
+        _tmp: tempfile::TempDir,
+        vf: Arc<dyn VirtualFolderManager>,
+    }
+
+    impl MusicFixture {
+        /// The fixture: `dated` puts a premiere date on the album, the track
+        /// and the artist (so no MusicBrainz date is looked up); `tags` puts
+        /// the release, release-group and album-artist ids on the track.
+        async fn new(dated: bool, tags: bool, album_top_parent: Option<Uuid>) -> Self {
+            use crate::item_persistence_service::FerrofinItemPersistenceService;
+            use crate::item_repository::FerrofinItemRepository;
+            use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+            use crate::test_support::test_db;
+            use chrono::TimeZone as _;
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+            let db = test_db().await;
+            let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+            let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(ItemTypeLookup::new()),
+            ));
+            let (album_id, track_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let stored = |k| stored_type_name(k).unwrap().to_owned();
+            let date = dated.then(|| chrono::Utc.with_ymd_and_hms(1959, 8, 17, 0, 0, 0).unwrap());
+            persistence
+                .save_items(&[
+                    BaseItemEntity {
+                        id: ferrofin_db::store::guid_to_db(album_id),
+                        type_: stored(BaseItemKind::MusicAlbum),
+                        name: Some("Kind of Blue".into()),
+                        premiere_date: date,
+                        is_folder: true,
+                        top_parent_id: album_top_parent.map(ferrofin_db::store::guid_to_db),
+                        ..Default::default()
+                    },
+                    BaseItemEntity {
+                        id: ferrofin_db::store::guid_to_db(track_id),
+                        type_: stored(BaseItemKind::Audio),
+                        name: Some("So What".into()),
+                        parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
+                        album_artists: Some("Miles Davis".into()),
+                        premiere_date: date,
+                        production_year: Some(1959),
+                        ..Default::default()
+                    },
+                ])
+                .await
+                .expect("seed");
+            persistence
+                .set_ancestors(track_id, &[album_id])
+                .await
+                .expect("ancestors");
+            if tags {
+                for (k, v) in [
+                    ("MusicBrainzAlbum", MB_RELEASE),
+                    ("MusicBrainzReleaseGroup", MB_GROUP),
+                    ("MusicBrainzAlbumArtist", MB_ARTIST),
+                ] {
+                    persistence.save_provider_id(track_id, k, v).await.unwrap();
+                }
+            }
+            // The track's album artist materializes the by-name artist.
+            persistence
+                .save_item_values(track_id, &[(1, "Miles Davis".into())])
+                .await
+                .expect("materialize artist");
+            let artist = items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::MusicArtist],
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+                .expect("artists")
+                .into_iter()
+                .next()
+                .expect("the artist");
+            let artist_id = Uuid::parse_str(&artist.id).expect("id");
+            persistence
+                .save_items(&[BaseItemEntity {
+                    premiere_date: date,
+                    end_date: date,
+                    ..artist
+                }])
+                .await
+                .expect("artist");
+            let tmp = tempfile::tempdir().unwrap();
+            let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+                FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                    .with_item_store(persistence.clone()),
+            );
+            Self {
+                items,
+                persistence,
+                album_id,
+                artist_id,
+                _tmp: tmp,
+                vf,
+            }
+        }
+
+        /// A scanner with the MusicBrainz and TheAudioDb clients against
+        /// `base`.
+        fn scanner(&self, base: &str) -> LibraryScanner {
+            let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
+                self.persistence.clone();
+            LibraryScanner::new(
+                Arc::clone(&self.vf),
+                Arc::new(FerrofinFileSystem::new()),
+                persistence,
+            )
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new(base, "test")),
+                Arc::clone(&self.items),
+            )
+            .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::with_base_url(
+                base,
+            )))
+        }
+
+        /// The music pass as a first scan's walk hands it the album and the
+        /// artist.
+        async fn pass(&self, scanner: &LibraryScanner, policy: super::FetcherPolicy<'_>) {
+            use super::music::MusicKind;
+            scanner
+                .music_pass_for_test(
+                    &[
+                        (self.album_id, MusicKind::Album),
+                        (self.artist_id, MusicKind::ByNameArtist),
+                    ],
+                    policy,
+                    true,
+                )
+                .await;
+        }
+
+        async fn row(&self, id: Uuid) -> BaseItemEntity {
+            self.items.retrieve_item(id).await.unwrap().unwrap()
+        }
+
+        /// The item's stored `name` provider id.
+        async fn id_of(&self, id: Uuid, name: &str) -> Option<String> {
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+            self.persistence
+                .provider_ids_for_items(&[id])
+                .await
+                .unwrap()
+                .remove(&id)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v)
+        }
+    }
+
     /// The music post-pass under Phase 3L's lock rules, over one album with
-    /// one track and its artist: `(album, artist, audiodb requests, album
-    /// MusicBrainz id stored, artist MusicBrainz id stored)` after the pass.
-    // A fixture: seeding the album, track, artist and ids is the length.
-    #[allow(clippy::too_many_lines)]
+    /// one tagged track and its artist: `(album, artist, TheAudioDb
+    /// requests, album MusicBrainz id stored, artist MusicBrainz id stored)`
+    /// after the pass.
     async fn music_pass_with_locks(
         album_locked: bool,
         artist_locked: bool,
         field_locks: &[super::MetadataField],
     ) -> (BaseItemEntity, BaseItemEntity, usize, bool, bool) {
-        use super::{HashMap, InternalItemsQuery, Uuid};
-        use crate::item_persistence_service::FerrofinItemPersistenceService;
-        use crate::item_repository::FerrofinItemRepository;
-        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
-        use crate::test_support::test_db;
-        use chrono::TimeZone as _;
-        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-
-        let db = test_db().await;
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
-            db.clone(),
-            Arc::new(ItemTypeLookup::new()),
-        ));
-        let (album_id, track_id) = (Uuid::new_v4(), Uuid::new_v4());
-        let stored = |k| stored_type_name(k).unwrap().to_owned();
-        // Dated, so no MusicBrainz release/artist details are fetched.
-        let dated = Some(chrono::Utc.with_ymd_and_hms(1959, 8, 17, 0, 0, 0).unwrap());
-        persistence
-            .save_items(&[
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(album_id),
-                    type_: stored(BaseItemKind::MusicAlbum),
-                    name: Some("Kind of Blue".into()),
-                    premiere_date: dated,
-                    is_locked: album_locked,
-                    is_folder: true,
-                    ..Default::default()
-                },
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(track_id),
-                    type_: stored(BaseItemKind::Audio),
-                    name: Some("So What".into()),
-                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
-                    album_artists: Some("Miles Davis".into()),
-                    premiere_date: dated,
-                    ..Default::default()
-                },
-            ])
-            .await
-            .expect("seed");
-        persistence
-            .set_ancestors(track_id, &[album_id])
-            .await
-            .expect("ancestors");
-        for (k, v) in [
-            ("MusicBrainzAlbum", "rel-x"),
-            ("MusicBrainzReleaseGroup", "rg-x"),
-            ("MusicBrainzAlbumArtist", "aa-x"),
-        ] {
-            persistence.save_provider_id(track_id, k, v).await.unwrap();
-        }
-        persistence
-            .save_item_values(track_id, &[(1, "Miles Davis".into())])
-            .await
-            .expect("materialize artist");
-        let artist = items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::MusicArtist],
-                recursive: true,
-                ..Default::default()
-            })
-            .await
-            .expect("artists")
-            .into_iter()
-            .next()
-            .expect("the artist");
-        let artist_id = Uuid::parse_str(&artist.id).expect("id");
-        persistence
-            .save_items(&[BaseItemEntity {
-                is_locked: artist_locked,
-                premiere_date: dated,
-                end_date: dated,
-                ..artist
-            }])
-            .await
-            .expect("artist");
-        for id in [album_id, artist_id] {
-            persistence
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let fx = MusicFixture::new(true, true, None).await;
+        for (id, locked) in [(fx.album_id, album_locked), (fx.artist_id, artist_locked)] {
+            let row = fx.row(id).await;
+            fx.persistence
+                .save_items(&[BaseItemEntity {
+                    is_locked: locked,
+                    ..row
+                }])
+                .await
+                .expect("lock");
+            fx.persistence
                 .replace_locked_fields(
                     id,
                     &field_locks
@@ -13916,49 +14333,24 @@ mod tests {
                 .await
                 .expect("locks");
         }
-
-        let (base, hits) = spawn_audiodb();
-        let tmp = tempfile::tempdir().unwrap();
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_music(
-                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
-                Arc::clone(&items),
-            )
-            .with_audiodb(Arc::new(ferrofin_providers::AudioDbClient::with_base_url(
-                &base,
-            )));
-        scanner
-            .enrich_music(&HashMap::new(), super::ScanRun::defaults())
-            .await
-            .expect("enrich");
-        let has_id = |key: &'static str, id: Uuid| {
-            let items = Arc::clone(&items);
-            async move {
-                items
-                    .get_items_with_provider_id(key)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|(i, _)| *i == id)
-            }
-        };
+        let (base, hits) = spawn_music_stub();
+        let scanner = fx.scanner(&base);
+        fx.pass(&scanner, super::FetcherPolicy::default()).await;
         (
-            items.retrieve_item(album_id).await.unwrap().unwrap(),
-            items.retrieve_item(artist_id).await.unwrap().unwrap(),
-            hits.load(std::sync::atomic::Ordering::SeqCst),
-            has_id("MusicBrainzAlbum", album_id).await,
-            has_id("MusicBrainzArtist", artist_id).await,
+            fx.row(fx.album_id).await,
+            fx.row(fx.artist_id).await,
+            hits.audiodb(),
+            fx.id_of(fx.album_id, "MusicBrainzAlbum").await.is_some(),
+            fx.id_of(fx.artist_id, "MusicBrainzArtist").await.is_some(),
         )
     }
 
     /// Phase 3L, music post-pass: a locked album or artist runs no remote
-    /// source (MusicBrainz ids, AudioDb, fanart); an unlocked one with
-    /// `Overview`/`Genres` field locks gets the remote ids but not those
-    /// fields; with no lock at all AudioDb fills them.
+    /// source (MusicBrainz, AudioDb, fanart) and takes no ids from its
+    /// tracks (`AlbumMetadataService.UpdateMetadataFromChildren` returns on
+    /// `IsLocked` before `SetAlbumFromSongs`); an unlocked one with
+    /// `Overview`/`Genres` field locks gets the ids but not those fields;
+    /// with no lock at all AudioDb fills them.
     #[tokio::test]
     async fn the_music_pass_honours_item_and_field_locks() {
         let (album, artist, hits, album_mb, artist_mb) =
@@ -13986,173 +14378,64 @@ mod tests {
         assert_eq!(artist.genres.as_deref(), Some("Jazz"));
     }
 
+    /// The album takes its tracks' embedded release, release-group and
+    /// album-artist ids (`SetProviderIdFromSongs`), and looks the release up
+    /// by them — never by a search. The artist here is known only by name:
+    /// upstream hands it no track ids (`MusicArtist.Children` is empty for
+    /// it, so its `SongInfos` are), so it is searched by name — once.
     #[tokio::test]
-    async fn enrich_music_resolves_ids_from_embedded_track_tags() {
-        use crate::item_persistence_service::FerrofinItemPersistenceService;
-        use crate::item_repository::FerrofinItemRepository;
-        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
-        use crate::test_support::test_db;
-        use ferrofin_db::entities::base_items::BaseItemEntity;
-        use ferrofin_model::data::BaseItemKind;
-        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-
-        let db = test_db().await;
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-            Arc::new(ItemTypeLookup::new());
-        let items: Arc<dyn ItemRepository> =
-            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
-
-        let album_id = uuid::Uuid::new_v4();
-        let track_id = uuid::Uuid::new_v4();
-        let stored = |k| stored_type_name(k).unwrap().to_owned();
-        persistence
-            .save_items(&[
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(album_id),
-                    type_: stored(BaseItemKind::MusicAlbum),
-                    name: Some("Kind of Blue".into()),
-                    ..Default::default()
-                },
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(track_id),
-                    type_: stored(BaseItemKind::Audio),
-                    name: Some("So What".into()),
-                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
-                    album_artists: Some("Miles Davis".into()),
-                    production_year: Some(1959),
-                    ..Default::default()
-                },
-            ])
-            .await
-            .expect("seed");
-        persistence
-            .set_ancestors(track_id, &[album_id])
-            .await
-            .expect("ancestors");
-        // Embedded MusicBrainz ids on the track, and the MusicArtist item.
-        for (k, v) in [
-            ("MusicBrainzAlbum", "rel-x"),
-            ("MusicBrainzReleaseGroup", "rg-x"),
-            ("MusicBrainzAlbumArtist", "aa-x"),
-        ] {
-            persistence.save_provider_id(track_id, k, v).await.unwrap();
-        }
-        persistence
-            .save_item_values(track_id, &[(1, "Miles Davis".into())])
-            .await
-            .expect("materialize artist");
-
-        // A minimal scanner with the music pass wired (MB client never hits the
-        // network because every id is already embedded).
-        let tmp = tempfile::tempdir().unwrap();
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
+    async fn the_music_pass_resolves_ids_from_embedded_track_tags() {
+        let fx = MusicFixture::new(true, true, None).await;
+        let (base, hits) = spawn_music_stub();
+        let scanner = fx.scanner(&base);
+        fx.pass(&scanner, super::FetcherPolicy::default()).await;
+        assert_eq!(
+            fx.id_of(fx.album_id, "MusicBrainzAlbum").await.as_deref(),
+            Some(MB_RELEASE)
         );
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_music(
-                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
-                Arc::clone(&items),
-            );
-
-        scanner
-            .enrich_music(
-                &std::collections::HashMap::new(),
-                super::ScanRun::defaults(),
-            )
-            .await
-            .expect("enrich");
-
-        // The album adopted its tracks' release + release-group ids...
-        let album_rel = items
-            .get_items_with_provider_id("MusicBrainzAlbum")
-            .await
-            .unwrap();
-        assert!(album_rel.contains(&(album_id, "rel-x".to_owned())));
-        let album_rg = items
-            .get_items_with_provider_id("MusicBrainzReleaseGroup")
-            .await
-            .unwrap();
-        assert!(album_rg.contains(&(album_id, "rg-x".to_owned())));
-        // ...and its album-artist aggregated from the track.
-        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        assert_eq!(
+            fx.id_of(fx.album_id, "MusicBrainzReleaseGroup")
+                .await
+                .as_deref(),
+            Some(MB_GROUP)
+        );
+        assert_eq!(
+            fx.id_of(fx.album_id, "MusicBrainzAlbumArtist")
+                .await
+                .as_deref(),
+            Some(MB_ARTIST)
+        );
+        let album = fx.row(fx.album_id).await;
         assert_eq!(album.album_artists.as_deref(), Some("Miles Davis"));
-        // The MusicArtist got the embedded album-artist mbid.
-        let artist_ids = items
-            .get_items_with_provider_id("MusicBrainzArtist")
-            .await
-            .unwrap();
-        assert!(
-            artist_ids.iter().any(|(_, v)| v == "aa-x"),
-            "artist resolved to embedded mbid: {artist_ids:?}"
+        assert_eq!(
+            fx.id_of(fx.artist_id, "MusicBrainzArtist").await.as_deref(),
+            Some(MB_ARTIST),
+            "the artist resolved by its search"
         );
+        // The album's ids were known: it is looked up by them. Only the
+        // by-name artist is searched. (This asserted no search at all while
+        // a by-name artist took its tagged tracks' album-artist id, which
+        // upstream never gives it.)
+        assert_eq!(hits.searches(), 1, "the by-name artist's search only");
+        assert!(hits.musicbrainz() > 0, "the matches are looked up");
+        // Both refreshes completed: stamped (D1).
+        assert!(album.date_last_refreshed.is_some());
+        assert!(fx.row(fx.artist_id).await.date_last_refreshed.is_some());
     }
 
-    // The music pass honors the per-library MusicBrainz checkbox: rows whose
-    // owning library disabled it are skipped entirely (resolved per row via
-    // TopParentId).
+    /// The library's MusicBrainz checkbox gates the REMOTE provider only: an
+    /// album of a library that unticked it makes no MusicBrainz request,
+    /// while the ids its tracks carry are still its own —
+    /// `AlbumMetadataService.SetProviderIdFromSongs` is local, upstream runs
+    /// it whatever the fetchers. (This used to assert that such an album
+    /// gained no id at all; that is not upstream's behaviour.)
     #[tokio::test]
-    async fn enrich_music_skips_libraries_that_disabled_musicbrainz() {
-        use crate::item_persistence_service::FerrofinItemPersistenceService;
-        use crate::item_repository::FerrofinItemRepository;
-        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
-        use crate::test_support::test_db;
-        use ferrofin_db::entities::base_items::BaseItemEntity;
+    async fn the_music_pass_honours_a_librarys_unticked_musicbrainz() {
         use ferrofin_model::configuration::TypeOptions;
-        use ferrofin_model::data::BaseItemKind;
-        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-
-        let db = test_db().await;
-        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-            Arc::new(ItemTypeLookup::new());
-        let items: Arc<dyn ItemRepository> =
-            Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
-
-        let library_id = uuid::Uuid::new_v4();
-        let album_id = uuid::Uuid::new_v4();
-        let track_id = uuid::Uuid::new_v4();
-        let stored = |k| stored_type_name(k).unwrap().to_owned();
-        persistence
-            .save_items(&[
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(album_id),
-                    type_: stored(BaseItemKind::MusicAlbum),
-                    name: Some("Kind of Blue".into()),
-                    top_parent_id: Some(ferrofin_db::store::guid_to_db(library_id)),
-                    ..Default::default()
-                },
-                BaseItemEntity {
-                    id: ferrofin_db::store::guid_to_db(track_id),
-                    type_: stored(BaseItemKind::Audio),
-                    name: Some("So What".into()),
-                    parent_id: Some(ferrofin_db::store::guid_to_db(album_id)),
-                    ..Default::default()
-                },
-            ])
-            .await
-            .expect("seed");
-        persistence
-            .set_ancestors(track_id, &[album_id])
-            .await
-            .expect("ancestors");
-        persistence
-            .save_provider_id(track_id, "MusicBrainzAlbum", "rel-x")
-            .await
-            .unwrap();
-
-        let tmp = tempfile::tempdir().unwrap();
-        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_music(
-                Arc::new(ferrofin_providers::MusicBrainzClient::new("", "test")),
-                Arc::clone(&items),
-            );
-
+        let library = Uuid::new_v4();
+        let fx = MusicFixture::new(false, true, Some(library)).await;
+        let (base, hits) = spawn_music_stub();
+        let scanner = fx.scanner(&base);
         // The owning library saved a MusicAlbum entry WITHOUT MusicBrainz.
         let options = LibraryOptions {
             type_options: vec![TypeOptions {
@@ -14162,25 +14445,235 @@ mod tests {
             }],
             ..LibraryOptions::default()
         };
-        let mut policies = std::collections::HashMap::new();
-        policies.insert(
-            library_id,
-            super::FetcherPolicy {
-                options: Some(&options),
-            },
-        );
         scanner
-            .enrich_music(&policies, super::ScanRun::defaults())
-            .await
-            .expect("enrich");
+            .music_pass_for_test(
+                &[(fx.album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy {
+                    options: Some(&options),
+                    global: None,
+                },
+                true,
+            )
+            .await;
+        assert_eq!(hits.musicbrainz(), 0, "MusicBrainz unticked: no request");
+        assert_eq!(
+            hits.audiodb(),
+            1,
+            "TheAudioDB ticked: asked by release group"
+        );
+        assert_eq!(
+            fx.id_of(fx.album_id, "MusicBrainzAlbum").await.as_deref(),
+            Some(MB_RELEASE),
+            "the tracks' id is the album's"
+        );
+        assert_eq!(
+            fx.row(fx.album_id).await.overview.as_deref(),
+            Some("Album text.")
+        );
+    }
 
-        let album_rel = items
-            .get_items_with_provider_id("MusicBrainzAlbum")
+    /// Without tags and without a stored id, the album is searched once by
+    /// name and album artist and dated by its release group; the artist
+    /// searched by name. A stored match is then never searched again: the
+    /// next refresh asks by id.
+    #[tokio::test]
+    async fn an_untagged_album_is_searched_once_then_looked_up_by_its_stored_ids() {
+        let fx = MusicFixture::new(false, false, None).await;
+        let (base, hits) = spawn_music_stub();
+        let scanner = fx.scanner(&base);
+        fx.pass(&scanner, super::FetcherPolicy::default()).await;
+        assert_eq!(
+            fx.id_of(fx.album_id, "MusicBrainzAlbum").await.as_deref(),
+            Some(MB_RELEASE)
+        );
+        assert_eq!(
+            fx.id_of(fx.artist_id, "MusicBrainzArtist").await.as_deref(),
+            Some(MB_ARTIST)
+        );
+        let album = fx.row(fx.album_id).await;
+        assert_eq!(album.production_year, Some(1959));
+        let artist = fx.row(fx.artist_id).await;
+        assert!(
+            artist.premiere_date.is_some(),
+            "the life span was looked up"
+        );
+        // Album: a release search and the release group's lookup (the hit
+        // carries its group); artist: a search and its lookup.
+        assert_eq!(hits.searches(), 2, "one search each");
+        assert!(hits.musicbrainz() >= 4, "searched and looked up");
+        // Again: both are matched now — looked up by id, never searched.
+        fx.pass(&scanner, super::FetcherPolicy::default()).await;
+        assert_eq!(hits.searches(), 2, "a stored match is never searched again");
+    }
+
+    /// A folder artist's `SongInfos` are every track below it
+    /// (`MusicArtist.cs:162-172`), whatever name they credit: a folder named
+    /// `AC_DC` whose tracks tag `AC/DC` takes their `MusicBrainzAlbumArtist`
+    /// id (`GetMusicBrainzArtistId`, `AlbumInfoExtensions.cs:70-82`) and is
+    /// never searched.
+    #[tokio::test]
+    async fn a_folder_artist_takes_the_first_album_artist_id_of_all_its_tracks() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let (artist, album, track) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let stored = |k| stored_type_name(k).unwrap().to_owned();
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(artist),
+                    type_: stored(BaseItemKind::MusicArtist),
+                    name: Some("AC_DC".into()),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(album),
+                    type_: stored(BaseItemKind::MusicAlbum),
+                    name: Some("Back in Black".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(artist)),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(track),
+                    type_: stored(BaseItemKind::Audio),
+                    name: Some("Hells Bells".into()),
+                    parent_id: Some(ferrofin_db::store::guid_to_db(album)),
+                    album_artists: Some("AC/DC".into()),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("seed");
+        persistence.set_ancestors(album, &[artist]).await.unwrap();
+        persistence
+            .set_ancestors(track, &[album, artist])
             .await
             .unwrap();
+        persistence
+            .save_provider_id(track, "MusicBrainzAlbumArtist", MB_ARTIST)
+            .await
+            .unwrap();
+        let (base, hits) = spawn_music_stub();
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+            .with_music(
+                Arc::new(ferrofin_providers::MusicBrainzClient::new(&base, "test")),
+                Arc::clone(&items),
+            )
+            .music_pass_for_test(
+                &[(artist, super::music::MusicKind::Artist)],
+                super::FetcherPolicy::default(),
+                true,
+            )
+            .await;
+        assert_eq!(hits.searches(), 0, "the tracks' id: no search");
+        let ids = persistence
+            .provider_ids_for_items(&[artist])
+            .await
+            .unwrap()
+            .remove(&artist)
+            .unwrap_or_default();
         assert!(
-            !album_rel.contains(&(album_id, "rel-x".to_owned())),
-            "a library that disabled MusicBrainz must not gain mb ids: {album_rel:?}"
+            ids.iter()
+                .any(|(k, v)| k == "MusicBrainzArtist" && v == MB_ARTIST),
+            "{ids:?}"
+        );
+    }
+
+    /// `MusicAlbum.GetMusicArtist` (`MusicAlbum.cs:69-87`): an album with no
+    /// artist among its parents takes the artist its album artist names —
+    /// here one known only by name — so its search names that artist's
+    /// MusicBrainz id (`arid:`), not its name.
+    #[tokio::test]
+    async fn an_album_outside_an_artist_folder_is_searched_by_its_album_artists_id() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let fx = MusicFixture::new(false, false, None).await;
+        fx.persistence
+            .save_provider_id(fx.artist_id, "MusicBrainzArtist", MB_ARTIST)
+            .await
+            .unwrap();
+        let (base, hits) = spawn_music_stub();
+        let scanner = fx.scanner(&base);
+        scanner
+            .music_pass_for_test(
+                &[(fx.album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy::default(),
+                true,
+            )
+            .await;
+        let searched = hits.search_lines();
+        assert_eq!(searched.len(), 1, "{searched:?}");
+        assert!(
+            searched[0].contains("arid") && searched[0].contains(MB_ARTIST),
+            "{searched:?}"
+        );
+    }
+
+    /// `GetArtist(name)` → `CreateItemByName` (`LibraryManager.cs:1348-1362`)
+    /// orders a folder artist before one known only by name: the album's
+    /// search takes the folder artist's MusicBrainz id, though a by-name
+    /// artist of the same name (without one) exists.
+    #[tokio::test]
+    async fn an_album_takes_the_folder_artist_its_album_artist_names_first() {
+        use crate::item_type_lookup::stored_type_name;
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let fx = MusicFixture::new(false, false, None).await;
+        let (library, folder_artist) = (Uuid::new_v4(), Uuid::new_v4());
+        fx.persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(library),
+                    type_: stored_type_name(BaseItemKind::CollectionFolder)
+                        .unwrap()
+                        .to_owned(),
+                    name: Some("Music".into()),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: ferrofin_db::store::guid_to_db(folder_artist),
+                    type_: stored_type_name(BaseItemKind::MusicArtist)
+                        .unwrap()
+                        .to_owned(),
+                    name: Some("Miles Davis".into()),
+                    is_folder: true,
+                    parent_id: Some(ferrofin_db::store::guid_to_db(library)),
+                    top_parent_id: Some(ferrofin_db::store::guid_to_db(library)),
+                    ..Default::default()
+                },
+            ])
+            .await
+            .expect("folder artist");
+        fx.persistence
+            .save_provider_id(folder_artist, "MusicBrainzArtist", MB_ARTIST)
+            .await
+            .unwrap();
+        let (base, hits) = spawn_music_stub();
+        fx.scanner(&base)
+            .music_pass_for_test(
+                &[(fx.album_id, super::music::MusicKind::Album)],
+                super::FetcherPolicy::default(),
+                true,
+            )
+            .await;
+        let searched = hits.search_lines();
+        assert_eq!(searched.len(), 1, "{searched:?}");
+        assert!(
+            searched[0].contains("arid") && searched[0].contains(MB_ARTIST),
+            "the folder artist's id: {searched:?}"
         );
     }
 
@@ -15690,6 +16183,7 @@ mod tests {
             }),
             now: chrono::Utc::now(),
             policies: &std::collections::HashMap::new(),
+            outside: super::FetcherPolicy::default(),
             locked: &std::collections::HashSet::new(),
             externals: None,
             superseded: std::collections::HashSet::new(),
@@ -20794,10 +21288,10 @@ mod tests {
         }
     }
 
-    /// The cumulative-runtime pass reads its album rows before it serves
-    /// the lane between two of them. What a refresh served there wrote to an
-    /// album stays — the pass writes the runtime column alone — and an album
-    /// the refresh removed is not written back as a ghost row.
+    /// The cumulative-runtime pass reads every folder's sum in one query,
+    /// then serves the lane before each write. What a refresh served there
+    /// wrote to an album stays — the pass writes the runtime column alone —
+    /// and an album the refresh removed is not written back as a ghost row.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_runtime_pass_writes_only_the_runtime_of_rows_that_still_exist() {
         let db = Database::connect_in_memory().await.unwrap();
@@ -20838,21 +21332,20 @@ mod tests {
         }
         // The refresh served before the first album (the artist is the
         // first boundary): it renames one album and removes the other.
-        let effect_db = db.clone();
+        let (effect, effect_items) = (Arc::clone(&persistence), Arc::clone(&items));
         let lane = WritesAtBoundary {
             at: 2,
             asked: std::sync::atomic::AtomicUsize::new(0),
             side_effect: std::sync::Mutex::new(Some(Box::pin(async move {
-                sqlx::query(r#"UPDATE "BaseItems" SET "Name" = 'Identified' WHERE "Id" = ?1"#)
-                    .bind(ferrofin_db::store::guid_to_db(uuid::Uuid::from_u128(kept)))
-                    .execute(effect_db.writer())
+                let mut album = effect_items
+                    .retrieve_item(uuid::Uuid::from_u128(kept))
                     .await
+                    .unwrap()
                     .unwrap();
-                sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(ferrofin_db::store::guid_to_db(uuid::Uuid::from_u128(
-                        removed,
-                    )))
-                    .execute(effect_db.writer())
+                album.name = Some("Identified".to_owned());
+                effect.save_items(&[album]).await.unwrap();
+                effect
+                    .delete_items(&[uuid::Uuid::from_u128(removed)])
                     .await
                     .unwrap();
             }))),
@@ -20867,7 +21360,11 @@ mod tests {
         )
         .with_items(Arc::clone(&items));
         scanner
-            .update_cumulative_run_time_ticks(None, super::ScanRun::defaults().with_lane(&lane))
+            .update_cumulative_run_time_ticks(
+                &[0xA0, kept, removed].map(uuid::Uuid::from_u128),
+                super::ARTIST_RUNTIME_CHILDREN,
+                super::ScanRun::defaults().with_lane(&lane),
+            )
             .await
             .unwrap();
         assert!(
@@ -20900,6 +21397,8 @@ mod tests {
     /// summed runtime of their non-folder recursive children — the column both
     /// `RunTimeTicks` and `CumulativeRunTimeTicks` are emitted from.
     #[tokio::test]
+    // One fixture, three passes over it.
+    #[allow(clippy::too_many_lines)]
     async fn cumulative_run_time_ticks_sums_non_folder_recursive_children() {
         let db = Database::connect_in_memory().await.unwrap();
         db.run_migrations().await.unwrap();
@@ -20940,7 +21439,20 @@ mod tests {
         let mut disc = row(inner, BaseItemKind::Folder, true, Some(999));
         disc.parent_id = Some(ferrofin_db::store::guid_to_db(album));
         rows.push(disc);
+        // Nor a child that is no `Audio` (`AlbumMetadataService.
+        // GetChildrenForMetadataUpdates`)…
+        let stray = uuid::Uuid::from_u128(0x3002);
+        rows.push(row(stray, BaseItemKind::Movie, false, Some(999)));
+        // …while a folder artist sums its music videos (`IHasArtist`).
+        let (video_artist, video) = (uuid::Uuid::from_u128(0x1004), uuid::Uuid::from_u128(0x3003));
+        rows.push(row(video_artist, BaseItemKind::MusicArtist, true, None));
+        rows.push(row(video, BaseItemKind::MusicVideo, false, Some(7)));
         persistence.save_items(&rows).await.unwrap();
+        persistence.set_ancestors(stray, &[album]).await.unwrap();
+        persistence
+            .set_ancestors(video, &[video_artist])
+            .await
+            .unwrap();
         for i in 0..3u128 {
             persistence
                 .set_ancestors(uuid::Uuid::from_u128(0x2000 + i), &[album])
@@ -20970,31 +21482,47 @@ mod tests {
                     .run_time_ticks
             }
         };
-        // An item refresh's pass is scoped to the folders it touched: the
-        // album outside it is not visited.
+        // The pass derives every folder the scan planned: an album it did
+        // not plan is not visited.
+        let planned = |id: uuid::Uuid, kind: BaseItemKind| super::Planned {
+            id,
+            entity: row(id, kind, true, None),
+            ancestors: Vec::new(),
+        };
+        let plan = vec![
+            planned(album, BaseItemKind::MusicAlbum),
+            planned(artist, BaseItemKind::MusicArtist),
+            planned(series, BaseItemKind::Series),
+            planned(video_artist, BaseItemKind::MusicArtist),
+        ];
         scanner
-            .update_cumulative_run_time_ticks(Some(&[artist, series]), super::ScanRun::defaults())
+            .update_folder_aggregates(&plan[1..], super::ScanRun::defaults())
             .await
             .unwrap();
         assert_eq!(ticks(artist).await, Some(0));
-        assert_eq!(ticks(album).await, None, "not in scope");
+        assert_eq!(ticks(album).await, None, "not planned");
         assert_eq!(ticks(series).await, None, "Series does not support it");
 
         scanner
-            .update_cumulative_run_time_ticks(None, super::ScanRun::defaults())
+            .update_folder_aggregates(&plan, super::ScanRun::defaults())
             .await
             .unwrap();
         assert_eq!(
             ticks(album).await,
             Some(60_000_000),
-            "3 tracks, not the disc folder"
+            "3 tracks, not the disc folder nor the movie"
         );
+        assert_eq!(ticks(video_artist).await, Some(7), "its music video");
         assert_eq!(ticks(artist).await, Some(0), "written as 0, not left NULL");
         assert_eq!(ticks(series).await, None, "Series does not support it");
 
         // Idempotent: a second pass finds nothing to change.
         scanner
-            .update_cumulative_run_time_ticks(None, super::ScanRun::defaults())
+            .update_cumulative_run_time_ticks(
+                &[album, artist],
+                super::ALBUM_RUNTIME_CHILDREN,
+                super::ScanRun::defaults(),
+            )
             .await
             .unwrap();
         assert_eq!(ticks(album).await, Some(60_000_000));
@@ -21676,25 +22204,20 @@ mod tests {
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(crate::test_support::item_repository_over(db.clone()));
         scanner.scan_all().await.unwrap();
+        let book =
+            crate::item_type_lookup::derive_item_id(BaseItemKind::Book, &file.to_string_lossy())
+                .expect("id");
         let year = || async {
-            sqlx::query_scalar::<_, Option<i64>>(
-                r#"SELECT "ProductionYear" FROM "BaseItems" WHERE "Type" LIKE '%Entities.Book'"#,
-            )
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
+            crate::test_support::fetch_item(&db, book)
+                .await
+                .production_year
         };
         assert_eq!(
             year().await,
             Some(1897),
             "a new book keeps the resolver's year"
         );
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "ProductionYear" = NULL WHERE "Type" LIKE '%Entities.Book'"#,
-        )
-        .execute(db.writer())
-        .await
-        .unwrap();
+        crate::item_persistence_service::seed_production_year(&db, book, None).await;
 
         let outcome = scanner.scan_all().await.unwrap();
         assert_eq!(year().await, None, "{outcome:?}");

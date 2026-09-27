@@ -136,6 +136,14 @@ impl StudiosClient {
 
     /// The repository manifest (`thumbs.txt`) as a list of studio folder names,
     /// fetched once and cached. Any failure yields an empty list (best-effort).
+    ///
+    /// Only an answer is cached — the manifest, or a `404` saying the
+    /// repository has none (so a repo that 404s is not re-hit on every
+    /// studio; a restart clears it). A request that FAILED (a transport
+    /// error, a `5xx`) is counted as a provider failure by the limiter and
+    /// not cached, so the next studio asks again and the scan does not record
+    /// every studio as "the repository has nothing for it" (owner decision D1
+    /// of `PLAN_SCAN_CHANGE_DETECTION`: a failure is retried, a miss is not).
     async fn manifest(&self, repo_url: &str) -> Vec<String> {
         if let Ok(guard) = self.manifest.lock()
             && let Some((cached_url, cached)) = guard.as_ref()
@@ -145,6 +153,11 @@ impl StudiosClient {
         }
         let url = format!("{repo_url}/thumbs.txt");
         let list = match self.http.get(&url).send_limited(&self.limiter).await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => Vec::new(),
+            Ok(resp) if !resp.status().is_success() => {
+                tracing::debug!(status = %resp.status(), "studios: manifest fetch failed");
+                return Vec::new();
+            }
             Ok(resp) => match resp.counted_text().await {
                 Ok(body) => body
                     .lines()
@@ -154,16 +167,14 @@ impl StudiosClient {
                     .collect(),
                 Err(e) => {
                     tracing::warn!(url, error = %e, "studios: manifest body read failed");
-                    Vec::new()
+                    return Vec::new();
                 }
             },
             Err(e) => {
                 tracing::debug!(error = %e, "studios: manifest fetch failed");
-                Vec::new()
+                return Vec::new();
             }
         };
-        // Cache even an empty result: a repo that 404s should not be re-hit on
-        // every studio; a restart clears it.
         if let Ok(mut guard) = self.manifest.lock() {
             *guard = Some((repo_url.to_owned(), list.clone()));
         }
@@ -306,24 +317,52 @@ mod tests {
     }
 
     /// A fetch failure (here a refused connection — offline, deterministic) is
-    /// swallowed to an empty manifest, and that empty result is cached so a
-    /// second lookup does not re-hit the network.
+    /// swallowed to an empty manifest and counted as a provider failure, but
+    /// NOT cached: the next lookup asks again, so a scan never records every
+    /// studio as "the repository has nothing for it" on a network blip (owner
+    /// decision D1 of `PLAN_SCAN_CHANGE_DETECTION`: a failed lookup is
+    /// retried, a miss is not). A `404` is an answer, and is cached.
     #[tokio::test]
-    async fn manifest_fetch_failure_yields_empty_and_is_cached() {
+    async fn a_failed_manifest_fetch_is_counted_and_not_cached_a_404_is() {
+        use crate::rate_limit::count_request_failures;
         // Port 1 refuses immediately; no network egress.
         let client = StudiosClient::with_repo_url("http://127.0.0.1:1/studios");
-        assert!(client.thumb_url("Netflix").await.is_none());
+        let (url, failures) = count_request_failures(client.thumb_url("Netflix")).await;
+        assert!(url.is_none());
+        assert!(failures > 0, "the refused connection is a failure");
+        assert!(
+            client.manifest.lock().unwrap().is_none(),
+            "a failure is not cached"
+        );
+
+        // A repository that answers 404 has no manifest: cached, not a failure.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
+        });
+        let client = StudiosClient::with_repo_url(&base);
+        let (url, failures) = count_request_failures(client.thumb_url("Netflix")).await;
+        assert!(url.is_none());
+        assert_eq!(failures, 0, "a 404 is an answer");
         assert_eq!(
             client
                 .manifest
                 .lock()
                 .unwrap()
                 .as_ref()
-                .map(|(u, l)| (u.as_str(), l.len())),
-            Some(("http://127.0.0.1:1/studios", 0))
+                .map(|(u, l)| (u.clone(), l.len())),
+            Some((base, 0))
         );
-        // Cached empty → second call still None (and would not re-fetch).
-        assert!(client.thumb_url("Netflix").await.is_none());
     }
 
     #[tokio::test]

@@ -1401,11 +1401,17 @@ impl LocalProviderManager {
     ) -> MetadataRefreshOptions {
         let library = self.library_options_for(entity).await;
         let kind = short_kind(entity);
+        let global = self.global_metadata_options_for(kind);
         let metadata_allowed = !entity.is_locked
-            && metadata_fetcher_enabled(library.as_ref(), kind, fetcher_names::TMDB);
+            && metadata_fetcher_enabled(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                fetcher_names::TMDB,
+            );
         let images_allowed = (!entity.is_locked
             || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-            && image_fetcher_enabled(library.as_ref(), kind, fetcher_names::TMDB);
+            && image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, fetcher_names::TMDB);
         MetadataRefreshOptions {
             metadata_refresh_mode: if metadata_allowed {
                 options.metadata_refresh_mode
@@ -3034,9 +3040,11 @@ impl ProviderManager for LocalProviderManager {
         // short-circuits to true before every other test, and a LOCKED
         // reference item drops every non-local provider outright.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let global = self.global_metadata_options_for(&kind);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
-                || (!locked && metadata_fetcher_enabled(library.as_ref(), &kind, name))
+                || (!locked
+                    && metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name))
         };
 
         // Select the providers that serve this item kind, drop the ones the
@@ -3073,8 +3081,9 @@ impl ProviderManager for LocalProviderManager {
         // LINQ's `OrderBy`/`ThenBy` are.
         let order = crate::library_options::metadata_fetcher_order(library.as_ref(), &kind)
             .unwrap_or_else(|| {
-                self.global_metadata_options_for(&kind)
-                    .map(|o| o.metadata_fetcher_order)
+                global
+                    .as_ref()
+                    .map(|o| o.metadata_fetcher_order.clone())
                     .unwrap_or_default()
             });
         providers.sort_by_key(|p| {

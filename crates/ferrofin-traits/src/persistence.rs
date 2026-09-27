@@ -64,6 +64,19 @@ pub struct PlayedAndTotal {
     pub total: i32,
 }
 
+/// A folder's stored value of a children-derived column next to the value
+/// its descendants give it now
+/// ([`ItemPersistenceService::folder_run_time_sums`],
+/// [`ItemPersistenceService::folder_last_media_added`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderAggregate<T> {
+    /// The column as stored.
+    pub stored: Option<T>,
+    /// The value the descendants give it; `None` when there is none to give
+    /// (no descendant carries it).
+    pub aggregate: Option<T>,
+}
+
 /// Filter selecting media streams to fetch.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.MediaStreamQuery`.
@@ -750,10 +763,11 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// Writes an existing row's `RunTimeTicks` — the cumulative runtime of a
-    /// music album or artist — and nothing else, when it differs. An update,
-    /// never an insert: a row deleted meanwhile stays deleted, and the other
-    /// columns keep whatever a concurrent refresh wrote. Returns whether the
-    /// row was written.
+    /// music album or artist — when it differs, with the `DateLastSaved`
+    /// stamp every save carries (the DTO `Etag` hashes it), and nothing else.
+    /// An update, never an insert: a row deleted meanwhile stays deleted, and
+    /// the other columns keep whatever a concurrent refresh wrote. Returns
+    /// whether the row was written.
     ///
     /// The default writes nothing (for stub/fake services).
     ///
@@ -763,6 +777,128 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn update_run_time_ticks(&self, item_id: Uuid, ticks: i64) -> Result<bool, ServiceError> {
         let _ = (item_id, ticks);
         Ok(false)
+    }
+
+    /// The cumulative runtime of each of `folder_ids`, in one aggregate read:
+    /// its stored `RunTimeTicks` and the sum of the `RunTimeTicks` of its
+    /// non-folder descendants of `child_kinds` (a missing one counts 0) over
+    /// the `AncestorIds` closure — upstream's `UpdateCumulativeRunTimeTicks`
+    /// (`MetadataService.cs:485-503`) over the service's
+    /// `GetChildrenForMetadataUpdates`. A folder with no such descendant sums
+    /// to `Some(0)`; an id with no row is absent.
+    ///
+    /// The default knows of no folder (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn folder_run_time_sums(
+        &self,
+        folder_ids: &[Uuid],
+        child_kinds: &[BaseItemKind],
+    ) -> Result<HashMap<Uuid, FolderAggregate<i64>>, ServiceError> {
+        let _ = (folder_ids, child_kinds);
+        Ok(HashMap::new())
+    }
+
+    /// The date media was last added under each of `folder_ids`, in one
+    /// aggregate read: its stored `DateLastMediaAdded` and the latest
+    /// `DateCreated` of its non-folder, non-virtual descendants over the
+    /// `AncestorIds` closure — upstream's `UpdateDateLastMediaAdded`
+    /// (`MetadataService.cs:509-541`). `None` as the aggregate means no such
+    /// descendant; an id with no row is absent.
+    ///
+    /// The default knows of no folder (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn folder_last_media_added(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, FolderAggregate<chrono::DateTime<chrono::Utc>>>, ServiceError> {
+        let _ = folder_ids;
+        Ok(HashMap::new())
+    }
+
+    /// Writes an existing row's `DateLastMediaAdded`, when it differs, with
+    /// its `DateLastSaved` stamp and nothing else — the targeted write of
+    /// [`folder_last_media_added`](Self::folder_last_media_added)'s answer,
+    /// as [`update_run_time_ticks`](Self::update_run_time_ticks) is of the
+    /// runtime. `None` stores `NULL`: upstream's `DateTime.MinValue` for a
+    /// folder with no media, which its mapper persists as `NULL`
+    /// (`BaseItemMapper.cs:418`) and reads back as `MinValue` (`:234`).
+    /// Returns whether the row was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_date_last_media_added(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, at);
+        Ok(false)
+    }
+
+    /// The ids of the rows of `kind` never refreshed (`DateLastRefreshed`
+    /// unset), in id order — with `by_name_only`, only those in no library
+    /// (no `TopParentId`: an artist known only by name). The persisted
+    /// selection of the closing passes that refresh a by-name item once,
+    /// when it is new (`ArtistsValidator.cs:86-91`, `StudiosValidator.cs:
+    /// 69-84`): a refresh that fails leaves the row unstamped, so the next
+    /// library validation selects it again.
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn never_refreshed_ids(
+        &self,
+        kind: BaseItemKind,
+        by_name_only: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let _ = (kind, by_name_only);
+        Ok(Vec::new())
+    }
+
+    /// The ids of the `MusicArtist` rows in no library (no `TopParentId`)
+    /// that a folder-resolved artist of the same `CleanName` supersedes, in
+    /// id order — the persisted selection of the by-name artist
+    /// retirement.
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn superseded_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Stamps `DateLastRefreshed = at` on existing rows, with the
+    /// `DateLastSaved = at` of the save that records it, and nothing else —
+    /// the record of a completed refresh of an item whose refresh wrote
+    /// nothing of its own (a by-name studio whose artwork the refresh looked
+    /// for; upstream saves a first refresh). Returns how many rows were
+    /// written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn stamp_date_last_refreshed(
+        &self,
+        item_ids: &[Uuid],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, ServiceError> {
+        let _ = (item_ids, at);
+        Ok(0)
     }
 
     /// The locked metadata fields (`BaseItemMetadataFields`, upstream's

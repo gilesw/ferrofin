@@ -24,7 +24,9 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::{ItemPersistenceService, StoredImageMetadata, StoredItemLinks};
+use ferrofin_traits::persistence::{
+    FolderAggregate, ItemPersistenceService, StoredImageMetadata, StoredItemLinks,
+};
 use std::collections::HashMap;
 
 /// One `BaseItemImageInfos` row as the scan's change detection reads it:
@@ -2219,15 +2221,161 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
 
     async fn update_run_time_ticks(&self, item_id: Uuid, ticks: i64) -> Result<bool, ServiceError> {
         let written = sqlx::query(
-            r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2
+            r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?2, "DateLastSaved" = ?3
                WHERE "Id" = ?1 AND "RunTimeTicks" IS NOT ?2"#,
         )
         .bind(guid_to_db(item_id))
         .bind(ticks)
+        .bind(datetime_to_db(chrono::Utc::now()))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
         Ok(written.rows_affected() > 0)
+    }
+
+    async fn folder_run_time_sums(
+        &self,
+        folder_ids: &[Uuid],
+        child_kinds: &[BaseItemKind],
+    ) -> Result<HashMap<Uuid, FolderAggregate<i64>>, ServiceError> {
+        let types: Vec<&str> = child_kinds
+            .iter()
+            .filter_map(|k| stored_type_name(*k))
+            .collect();
+        let mut out = HashMap::with_capacity(folder_ids.len());
+        if types.is_empty() {
+            return Ok(out);
+        }
+        for chunk in folder_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = folder_run_time_sums_sql(chunk.len(), types.len());
+            let mut query = sqlx::query_as::<_, (String, Option<i64>, i64)>(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for type_name in &types {
+                query = query.bind(*type_name);
+            }
+            for (id, stored, sum) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&id) {
+                    out.insert(
+                        id,
+                        FolderAggregate {
+                            stored,
+                            aggregate: Some(sum),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn folder_last_media_added(
+        &self,
+        folder_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, FolderAggregate<chrono::DateTime<chrono::Utc>>>, ServiceError> {
+        let mut out = HashMap::with_capacity(folder_ids.len());
+        for chunk in folder_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = folder_last_media_added_sql(chunk.len());
+            let mut query = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                ),
+            >(&sql);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            for (id, stored, aggregate) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
+                if let Ok(id) = Uuid::parse_str(&id) {
+                    out.insert(id, FolderAggregate { stored, aggregate });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn update_date_last_media_added(
+        &self,
+        item_id: Uuid,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems" SET "DateLastMediaAdded" = ?2, "DateLastSaved" = ?3
+               WHERE "Id" = ?1 AND "DateLastMediaAdded" IS NOT ?2"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(opt_datetime_to_db(at))
+        .bind(datetime_to_db(chrono::Utc::now()))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(written.rows_affected() > 0)
+    }
+
+    async fn never_refreshed_ids(
+        &self,
+        kind: BaseItemKind,
+        by_name_only: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let Some(type_name) = stored_type_name(kind) else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = sqlx::query_scalar(never_refreshed_ids_sql(by_name_only))
+            .bind(type_name)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn superseded_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let Some(type_name) = stored_type_name(BaseItemKind::MusicArtist) else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = sqlx::query_scalar(SUPERSEDED_BY_NAME_ARTISTS_SQL)
+            .bind(type_name)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn stamp_date_last_refreshed(
+        &self,
+        item_ids: &[Uuid],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, ServiceError> {
+        let mut written = 0;
+        let at = datetime_to_db(at);
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let placeholders = (2..=chunk.len() + 1)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?1, "DateLastSaved" = ?1
+                   WHERE "Id" IN ({placeholders})"#
+            );
+            let mut query = sqlx::query(&sql).bind(&at);
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            written += query
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+        }
+        Ok(written)
     }
 
     async fn locked_fields_for_items(
@@ -2958,6 +3106,189 @@ fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
         | BaseItemKind::MusicArtist => blank(item.name.as_ref()),
         _ => false,
     }
+}
+
+/// `?1, …, ?n`.
+fn numbered_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`ItemPersistenceService::folder_run_time_sums`] over `n` folder ids
+/// (binds `?1..?n`) and `kinds` child types (binds after them): each folder
+/// by its primary key, and per folder a correlated sum over its non-folder
+/// descendants of those types — `AncestorIds` sought by `ParentItemId`, each
+/// child reached by its id. The `CROSS JOIN` pins that order: left free,
+/// SQLite may drive the sum from `BaseItems."IsFolder"` (every non-folder
+/// row in the database) and probe `AncestorIds` per row. `EXPLAIN QUERY
+/// PLAN` pinned by `folder_aggregates_seek_from_the_ancestor_closure`.
+pub(crate) fn folder_run_time_sums_sql(n: usize, kinds: usize) -> String {
+    let types = (n + 1..=n + kinds)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"SELECT f."Id", f."RunTimeTicks",
+                  (SELECT COALESCE(SUM(c."RunTimeTicks"), 0)
+                     FROM "AncestorIds" AS a
+                     CROSS JOIN "BaseItems" AS c ON c."Id" = a."ItemId"
+                    WHERE a."ParentItemId" = f."Id" AND c."IsFolder" = 0
+                      AND c."Type" IN ({types}))
+             FROM "BaseItems" AS f
+            WHERE f."Id" IN ({})"#,
+        numbered_placeholders(n)
+    )
+}
+
+/// [`ItemPersistenceService::folder_last_media_added`] over `n` folder ids,
+/// shaped and pinned as [`folder_run_time_sums_sql`]: the latest
+/// `DateCreated` of the non-folder, non-virtual descendants. The column is
+/// `YYYY-MM-DD HH:MM:SS[.fffffff]` text (EF Core's form, and
+/// [`datetime_to_db`]'s), whose textual order is chronological, so its
+/// `MAX` is the latest.
+pub(crate) fn folder_last_media_added_sql(n: usize) -> String {
+    format!(
+        r#"SELECT f."Id", f."DateLastMediaAdded",
+                  (SELECT MAX(c."DateCreated")
+                     FROM "AncestorIds" AS a
+                     CROSS JOIN "BaseItems" AS c ON c."Id" = a."ItemId"
+                    WHERE a."ParentItemId" = f."Id"
+                      AND c."IsFolder" = 0 AND c."IsVirtualItem" = 0)
+             FROM "BaseItems" AS f
+            WHERE f."Id" IN ({})"#,
+        numbered_placeholders(n)
+    )
+}
+
+/// [`ItemPersistenceService::never_refreshed_ids`]: the rows of the type
+/// bound as `?1` never refreshed, sought by the `Type`-leading
+/// `IX_BaseItems_Type_TopParentId_Id` (with `by_name_only`, its
+/// `TopParentId` too); `EXPLAIN QUERY PLAN` pinned by
+/// `the_closing_pass_selections_seek_by_type`.
+pub(crate) fn never_refreshed_ids_sql(by_name_only: bool) -> &'static str {
+    if by_name_only {
+        r#"SELECT "Id" FROM "BaseItems"
+           WHERE "Type" = ?1 AND "DateLastRefreshed" IS NULL
+             AND ("TopParentId" IS NULL OR "TopParentId" = '')
+           ORDER BY "Id""#
+    } else {
+        r#"SELECT "Id" FROM "BaseItems"
+           WHERE "Type" = ?1 AND "DateLastRefreshed" IS NULL
+           ORDER BY "Id""#
+    }
+}
+
+/// [`ItemPersistenceService::superseded_by_name_artists`] over the
+/// `MusicArtist` type bound as `?1`: the rows in no library whose
+/// `CleanName` a row in a library carries too. Both sides are sought by
+/// `Type` — the twin by `IX_BaseItems_Type_CleanName` — never a scan of
+/// `BaseItems`; `EXPLAIN QUERY PLAN` pinned by
+/// `the_closing_pass_selections_seek_by_type`.
+pub(crate) const SUPERSEDED_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "BaseItems" AS b
+   WHERE b."Type" = ?1
+     AND (b."TopParentId" IS NULL OR b."TopParentId" = '')
+     AND b."CleanName" IS NOT NULL
+     AND EXISTS (SELECT 1 FROM "BaseItems" AS f
+                  WHERE f."Type" = ?1 AND f."CleanName" = b."CleanName"
+                    AND f."TopParentId" IS NOT NULL AND f."TopParentId" <> '')
+   ORDER BY b."Id""#;
+
+/// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
+/// unset), in id order — `PeopleValidator`'s new person items.
+///
+/// # Errors
+///
+/// [`ServiceError::Backend`] on a storage failure.
+pub(crate) async fn never_refreshed_items(
+    db: &Database,
+    item_type: &str,
+) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(never_refreshed_ids_sql(false))
+        .bind(item_type)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// The `item_type` rows not refreshed since `cutoff` (or never) that lack an
+/// overview or a primary image, in id order, each as `(id, has overview, has
+/// primary image)` — `PeopleValidator.RefreshPeopleImagesAsync`'s selection.
+///
+/// # Errors
+///
+/// [`ServiceError::Backend`] on a storage failure.
+pub(crate) async fn items_lacking_overview_or_primary(
+    db: &Database,
+    item_type: &str,
+    cutoff: &str,
+) -> Result<Vec<(String, bool, bool)>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "Id",
+                  coalesce("Overview", '') <> '',
+                  EXISTS (SELECT 1 FROM "BaseItemImageInfos" i
+                          WHERE i."ItemId" = b."Id" AND i."ImageType" = 0)
+           FROM "BaseItems" b
+           WHERE "Type" = ?1
+             AND ("DateLastRefreshed" IS NULL OR "DateLastRefreshed" < ?2)
+             AND (("Overview" IS NULL OR "Overview" = '')
+                  OR NOT EXISTS (SELECT 1 FROM "BaseItemImageInfos" i
+                                 WHERE i."ItemId" = b."Id" AND i."ImageType" = 0))
+           ORDER BY "Id""#,
+    )
+    .bind(item_type)
+    .bind(cutoff)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
+/// Test-only: sets a row's `ProductionYear` directly (a value a user
+/// cleared, say), stamping nothing else.
+#[cfg(test)]
+pub(crate) async fn seed_production_year(db: &Database, id: Uuid, year: Option<i64>) {
+    sqlx::query(r#"UPDATE "BaseItems" SET "ProductionYear" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .bind(year)
+        .execute(db.writer())
+        .await
+        .expect("seed production year");
+}
+
+/// Test-only: stamps a row as refreshed at `refreshed` (stored text) with
+/// `overview`, keeping the raw SQL inside the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_refreshed_overview(
+    db: &Database,
+    id: Uuid,
+    refreshed: &str,
+    overview: &str,
+) {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?2, "Overview" = ?3 WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .bind(refreshed)
+    .bind(overview)
+    .execute(db.writer())
+    .await
+    .expect("seed refreshed overview");
+}
+
+/// Test-only: a primary image row at `path` for `item`.
+#[cfg(test)]
+pub(crate) async fn seed_primary_image(db: &Database, image_id: Uuid, item: Uuid, path: &str) {
+    sqlx::query(
+        r#"INSERT INTO "BaseItemImageInfos" ("Id", "ItemId", "Path", "ImageType", "DateModified", "Width", "Height")
+           VALUES (?1, ?2, ?3, 0, '2026-09-01 00:00:00.0000000', 0, 0)"#,
+    )
+    .bind(guid_to_db(image_id))
+    .bind(guid_to_db(item))
+    .bind(path)
+    .execute(db.writer())
+    .await
+    .expect("seed primary image");
 }
 
 /// Stamps a row's `PresentationUniqueKey` directly, for tests that need a
@@ -5786,6 +6117,389 @@ mod tests {
                 .await
                 .expect("repeat"),
             0
+        );
+    }
+
+    /// The rows [`folder_aggregates_follow_the_ancestor_closure`] seeds: a
+    /// music artist over an album over three tracks (one virtual, one with no
+    /// runtime) plus a disc folder, and a series over a season over two
+    /// episodes (one virtual, newer than the real one).
+    async fn seed_folder_tree(
+        db: &ferrofin_db::Database,
+    ) -> (Uuid, Uuid, Uuid, chrono::DateTime<chrono::Utc>) {
+        use chrono::TimeZone as _;
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (artist, album, disc) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
+        let at = |d| chrono::Utc.with_ymd_and_hms(2024, 1, d, 0, 0, 0).unwrap();
+        let row = |id: Uuid, kind, folder: bool| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(kind).unwrap().to_owned(),
+            is_folder: folder,
+            ..BaseItemEntity::default()
+        };
+        let mut rows = vec![
+            row(artist, BaseItemKind::MusicArtist, true),
+            BaseItemEntity {
+                run_time_ticks: Some(7),
+                ..row(album, BaseItemKind::MusicAlbum, true)
+            },
+            row(disc, BaseItemKind::Folder, true),
+            row(series, BaseItemKind::Series, true),
+            row(season, BaseItemKind::Season, true),
+        ];
+        let mut tracks = Vec::new();
+        for (ticks, virtual_item) in [(Some(10), false), (None, false), (Some(5), true)] {
+            let id = Uuid::new_v4();
+            tracks.push(id);
+            rows.push(BaseItemEntity {
+                run_time_ticks: ticks,
+                is_virtual_item: virtual_item,
+                ..row(id, BaseItemKind::Audio, false)
+            });
+        }
+        let mut episodes = Vec::new();
+        for (day, virtual_item) in [(3, false), (9, true)] {
+            let id = Uuid::new_v4();
+            episodes.push(id);
+            rows.push(BaseItemEntity {
+                date_created: Some(at(day)),
+                is_virtual_item: virtual_item,
+                ..row(id, BaseItemKind::Episode, false)
+            });
+        }
+        service.save_items(&rows).await.expect("seed");
+        service.set_ancestors(album, &[artist]).await.unwrap();
+        service.set_ancestors(disc, &[album, artist]).await.unwrap();
+        for track in tracks {
+            service
+                .set_ancestors(track, &[disc, album, artist])
+                .await
+                .unwrap();
+        }
+        service.set_ancestors(season, &[series]).await.unwrap();
+        for episode in episodes {
+            service
+                .set_ancestors(episode, &[season, series])
+                .await
+                .unwrap();
+        }
+        (artist, album, series, at(3))
+    }
+
+    /// `UpdateCumulativeRunTimeTicks` / `UpdateDateLastMediaAdded`
+    /// (`MetadataService.cs:485-541`) as one aggregate read each: the runtime
+    /// sums every non-folder descendant (a missing runtime counts 0, a virtual
+    /// track counts), the last-media date takes the latest `DateCreated` of the
+    /// non-folder, NON-VIRTUAL descendants, a folder with neither answers 0 /
+    /// `None`, and an unknown id is absent. The targeted writes change only
+    /// their own column, and only when it moved.
+    #[tokio::test]
+    async fn folder_aggregates_follow_the_ancestor_closure() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let (artist, album, series, newest) = seed_folder_tree(&db).await;
+        let unknown = Uuid::new_v4();
+
+        let sums = service
+            .folder_run_time_sums(
+                &[artist, album, series, unknown],
+                &[BaseItemKind::Audio, BaseItemKind::AudioBook],
+            )
+            .await
+            .expect("sums");
+        assert_eq!(sums[&artist].aggregate, Some(15));
+        assert_eq!(sums[&artist].stored, None);
+        assert_eq!(sums[&album].aggregate, Some(15));
+        assert_eq!(sums[&album].stored, Some(7));
+        assert_eq!(
+            sums[&series].aggregate,
+            Some(0),
+            "no runtime under the series"
+        );
+        assert!(!sums.contains_key(&unknown));
+
+        let added = service
+            .folder_last_media_added(&[series, artist, unknown])
+            .await
+            .expect("dates");
+        assert_eq!(
+            added[&series].aggregate,
+            Some(newest),
+            "the virtual episode is skipped"
+        );
+        assert_eq!(added[&series].stored, None);
+        assert_eq!(
+            added[&artist].aggregate, None,
+            "tracks carry no DateCreated"
+        );
+        assert!(!added.contains_key(&unknown));
+
+        assert!(service.update_run_time_ticks(album, 15).await.unwrap());
+        assert!(
+            !service.update_run_time_ticks(album, 15).await.unwrap(),
+            "unchanged"
+        );
+        assert!(
+            service
+                .update_date_last_media_added(series, Some(newest))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .update_date_last_media_added(series, Some(newest))
+                .await
+                .unwrap()
+        );
+        let row = crate::test_support::fetch_item(&db, series).await;
+        assert_eq!(row.date_last_media_added, Some(newest));
+        assert!(
+            row.date_last_saved.is_some(),
+            "a write that moves the value stamps DateLastSaved, as upstream's save does"
+        );
+        let saved = row.date_last_saved;
+        assert!(
+            !service
+                .update_date_last_media_added(series, Some(newest))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            crate::test_support::fetch_item(&db, series)
+                .await
+                .date_last_saved,
+            saved,
+            "an unmoved value writes nothing"
+        );
+        assert!(
+            crate::test_support::fetch_item(&db, album)
+                .await
+                .date_last_saved
+                .is_some(),
+            "the runtime write stamps it too"
+        );
+
+        let at = newest + chrono::TimeDelta::days(1);
+        assert_eq!(
+            service
+                .stamp_date_last_refreshed(&[artist, album, unknown], at)
+                .await
+                .unwrap(),
+            2
+        );
+        let row = crate::test_support::fetch_item(&db, artist).await;
+        assert_eq!(row.date_last_refreshed, Some(at));
+        assert_eq!(
+            row.date_last_saved,
+            Some(at),
+            "the refresh's save: upstream saves a first refresh"
+        );
+    }
+
+    /// `EXPLAIN QUERY PLAN` for `sql` with `binds` parameters, one `detail`
+    /// per step, outer to inner.
+    async fn query_plan(db: &ferrofin_db::Database, sql: &str, binds: usize) -> Vec<String> {
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        for _ in 0..binds {
+            query = query.bind("x");
+        }
+        query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect()
+    }
+
+    /// Both folder aggregates must reach each folder by its primary key and
+    /// sum its descendants from the ANCESTOR CLOSURE — `AncestorIds` sought by
+    /// `ParentItemId`, each child by its id — never from a `BaseItems` index
+    /// (`IsFolder`, `TopParentId`, …), which would walk every item in the
+    /// library per folder. The `CROSS JOIN` in the statements pins it.
+    #[tokio::test]
+    async fn folder_aggregates_seek_from_the_ancestor_closure() {
+        let db = test_db().await;
+        for (sql, binds) in [
+            (super::folder_run_time_sums_sql(3, 2), 5),
+            (super::folder_last_media_added_sql(3), 3),
+        ] {
+            let plan = query_plan(&db, &sql, binds).await;
+            assert!(
+                plan.iter().any(|s| s.starts_with("SEARCH f USING")
+                    && s.contains("sqlite_autoindex_BaseItems_1")
+                    && s.contains("Id=?")),
+                "the folders by primary key, got: {plan:?}"
+            );
+            let a = plan
+                .iter()
+                .position(|s| {
+                    s.starts_with("SEARCH a USING") && s.contains("IX_AncestorIds_ParentItemId")
+                })
+                .unwrap_or_else(|| panic!("AncestorIds by ParentItemId, got: {plan:?}"));
+            let c = plan
+                .iter()
+                .position(|s| {
+                    s.starts_with("SEARCH c USING")
+                        && s.contains("sqlite_autoindex_BaseItems_1")
+                        && s.contains("Id=?")
+                })
+                .unwrap_or_else(|| panic!("each child by its id, got: {plan:?}"));
+            assert!(a < c, "the closure drives the children, got: {plan:?}");
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan of any table, got: {plan:?}"
+            );
+        }
+    }
+
+    /// The selections every library validation's closing passes run
+    /// (never-refreshed by-name artists and studios, superseded by-name
+    /// artists) seek `BaseItems` by `Type` — never a scan of the table,
+    /// which on an unchanged rescan of a large library would be the pass's
+    /// whole cost.
+    #[tokio::test]
+    async fn the_closing_pass_selections_seek_by_type() {
+        let db = test_db().await;
+        for (sql, binds) in [
+            (super::never_refreshed_ids_sql(true), 1),
+            (super::never_refreshed_ids_sql(false), 1),
+            (super::SUPERSEDED_BY_NAME_ARTISTS_SQL, 1),
+        ] {
+            let plan = query_plan(&db, sql, binds).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan of any table, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .filter(|s| s.starts_with("SEARCH"))
+                    .all(|s| s.contains("(Type=?")),
+                "every read sought by Type, got: {plan:?}"
+            );
+        }
+        let plan = query_plan(&db, super::SUPERSEDED_BY_NAME_ARTISTS_SQL, 1).await;
+        assert!(
+            plan.iter().any(|s| s.starts_with("SEARCH f USING")
+                && s.contains("IX_BaseItems_Type_CleanName")
+                && s.contains("CleanName=?")),
+            "the folder twin by Type and CleanName, got: {plan:?}"
+        );
+    }
+
+    /// The two persisted selections over real rows: a never-refreshed row of
+    /// the kind (in no library, when asked), and a by-name artist whose
+    /// `CleanName` a library artist carries.
+    #[tokio::test]
+    async fn the_closing_pass_selections_pick_the_rows_they_name() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let library = Uuid::from_u128(0x10);
+        let row = |id: u128, kind: BaseItemKind, name: &str, top: Option<Uuid>, refreshed: bool| {
+            ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(Uuid::from_u128(id)),
+                type_: stored_type_name(kind).unwrap_or_default().to_owned(),
+                name: Some(name.to_owned()),
+                clean_name: Some(crate::text_util::get_clean_value(name)),
+                is_folder: true,
+                top_parent_id: top.map(guid_to_db),
+                date_last_refreshed: refreshed.then(chrono::Utc::now),
+                ..Default::default()
+            }
+        };
+        svc.save_items(&[
+            row(0x10, BaseItemKind::CollectionFolder, "Music", None, true),
+            row(
+                0x21,
+                BaseItemKind::MusicArtist,
+                "Miles Davis",
+                Some(library),
+                false,
+            ),
+            row(0x22, BaseItemKind::MusicArtist, "Miles Davis", None, true),
+            row(0x23, BaseItemKind::MusicArtist, "Gil Evans", None, false),
+            row(0x31, BaseItemKind::Studio, "Blue Note", None, false),
+            row(0x32, BaseItemKind::Studio, "Columbia", None, true),
+        ])
+        .await
+        .expect("seed");
+        assert_eq!(
+            svc.never_refreshed_ids(BaseItemKind::MusicArtist, true)
+                .await
+                .unwrap(),
+            vec![Uuid::from_u128(0x23)],
+            "the by-name artist never refreshed, not the library one"
+        );
+        assert_eq!(
+            svc.never_refreshed_ids(BaseItemKind::MusicArtist, false)
+                .await
+                .unwrap(),
+            vec![Uuid::from_u128(0x21), Uuid::from_u128(0x23)]
+        );
+        assert_eq!(
+            svc.never_refreshed_ids(BaseItemKind::Studio, false)
+                .await
+                .unwrap(),
+            vec![Uuid::from_u128(0x31)]
+        );
+        assert_eq!(
+            svc.superseded_by_name_artists().await.unwrap(),
+            vec![Uuid::from_u128(0x22)],
+            "only the by-name twin of a library artist"
+        );
+    }
+
+    /// A folder with no media stores `DateLastMediaAdded` as `NULL` —
+    /// upstream's `DateTime.MinValue`, which its mapper persists as `NULL`
+    /// (`BaseItemMapper.cs:418`) — and a write of the same value is none.
+    #[tokio::test]
+    async fn an_unset_last_media_date_is_stored_as_null() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let series = Uuid::from_u128(0x51);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        svc.save_items(&[ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(series),
+            type_: stored_type_name(BaseItemKind::Series)
+                .unwrap_or_default()
+                .to_owned(),
+            name: Some("Charlie".to_owned()),
+            is_folder: true,
+            date_last_media_added: Some(at),
+            ..Default::default()
+        }])
+        .await
+        .expect("seed");
+        assert!(
+            svc.update_date_last_media_added(series, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            crate::test_support::fetch_item(&db, series)
+                .await
+                .date_last_media_added,
+            None
+        );
+        assert!(
+            !svc.update_date_last_media_added(series, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            svc.update_date_last_media_added(series, Some(at))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !svc.update_date_last_media_added(series, Some(at))
+                .await
+                .unwrap()
         );
     }
 }

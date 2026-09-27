@@ -1676,9 +1676,15 @@ impl LibraryManager for FerrofinLibraryManager {
                 "queue_refresh_scan needs a library scanner, which this library manager has none of",
             ));
         }
-        // A file item's own refresh waits in the priority lane; a folder's
+        // A file item's own refresh — and a by-name artist's, which has no
+        // folder to validate — waits in the priority lane; a folder's
         // validation — as large as a whole library — queues like a scan.
-        let request = if matches!(target, ScanTarget::Items(_)) {
+        let item_only = match &target {
+            ScanTarget::Items(_) => true,
+            ScanTarget::Artist { path, folders, .. } => path.is_none() && folders.is_empty(),
+            _ => false,
+        };
+        let request = if item_only {
             ScanRequest::item_refresh(target, options.clone())
         } else {
             ScanRequest::folder_refresh(target, options.clone())
@@ -2534,6 +2540,47 @@ mod tests {
         assert_eq!(
             scopes,
             vec![ScanTarget::All, first, second, ScanTarget::Library(library)]
+        );
+    }
+
+    /// A by-name artist's refresh has no folder to validate: it is an item
+    /// refresh, served by a running scan at its next item boundary (so its
+    /// music pass never runs beside the scan's); an artist whose albums'
+    /// folders must be validated queues like a folder refresh.
+    #[tokio::test]
+    async fn a_by_name_artist_refresh_rides_the_lane() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        let by_name = ScanTarget::Artist {
+            id: Uuid::from_u128(0xA1),
+            path: None,
+            folders: Vec::new(),
+        };
+        let with_folders = ScanTarget::Artist {
+            id: Uuid::from_u128(0xA2),
+            path: None,
+            folders: vec!["/music/Artist".to_owned()],
+        };
+        for target in [&by_name, &with_folders] {
+            mgr.queue_refresh_scan(target.clone(), &replace_all())
+                .await
+                .expect("artist refresh");
+        }
+        runner.release(3 * GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.served(),
+            vec![(0, by_name)],
+            "served inside the scan"
+        );
+        let scopes: Vec<ScanTarget> = runner.runs().into_iter().map(|r| r.scope).collect();
+        assert_eq!(
+            scopes,
+            vec![ScanTarget::All, with_folders],
+            "queued after it"
         );
     }
 

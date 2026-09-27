@@ -962,15 +962,8 @@ impl PeopleValidationTask {
         base: f64,
         span: f64,
     ) -> Result<(), ServiceError> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            r#"SELECT "Id" FROM "BaseItems"
-               WHERE "Type" = ?1 AND "DateLastRefreshed" IS NULL
-               ORDER BY "Id""#,
-        )
-        .bind(PERSON_TYPE)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let ids =
+            crate::item_persistence_service::never_refreshed_items(&self.db, PERSON_TYPE).await?;
         let refreshed = self
             .refresh_people(&ids, progress, base, span, |_| {
                 MetadataRefreshOptions::default()
@@ -1028,24 +1021,12 @@ impl PeopleValidationTask {
     ) -> Result<(), ServiceError> {
         use ferrofin_traits::providers::MetadataRefreshMode;
         let cutoff = datetime_to_db(Utc::now() - chrono::Duration::days(PEOPLE_REFRESH_DAYS));
-        let rows: Vec<(String, bool, bool)> = sqlx::query_as(
-            r#"SELECT "Id",
-                      coalesce("Overview", '') <> '',
-                      EXISTS (SELECT 1 FROM "BaseItemImageInfos" i
-                              WHERE i."ItemId" = b."Id" AND i."ImageType" = 0)
-               FROM "BaseItems" b
-               WHERE "Type" = ?1
-                 AND ("DateLastRefreshed" IS NULL OR "DateLastRefreshed" < ?2)
-                 AND (("Overview" IS NULL OR "Overview" = '')
-                      OR NOT EXISTS (SELECT 1 FROM "BaseItemImageInfos" i
-                                     WHERE i."ItemId" = b."Id" AND i."ImageType" = 0))
-               ORDER BY "Id""#,
+        let rows = crate::item_persistence_service::items_lacking_overview_or_primary(
+            &self.db,
+            PERSON_TYPE,
+            &cutoff,
         )
-        .bind(PERSON_TYPE)
-        .bind(cutoff)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        .await?;
         tracing::info!(count = rows.len(), "people needing image/overview refresh");
         let has: std::collections::HashMap<String, (bool, bool)> = rows
             .iter()
@@ -2535,23 +2516,20 @@ mod tests {
         // A person already refreshed with everything it needs: left alone.
         let complete = Uuid::from_u128(0xA3);
         seed_named_item(&db, complete, BaseItemKind::Person, "John Smith").await;
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "DateLastRefreshed" = '2026-09-01 00:00:00.0000000',
-                                      "Overview" = 'Bio.' WHERE "Id" = ?1"#,
+        crate::item_persistence_service::seed_refreshed_overview(
+            &db,
+            complete,
+            "2026-09-01 00:00:00.0000000",
+            "Bio.",
         )
-        .bind(guid_to_db(complete))
-        .execute(db.writer())
-        .await
-        .expect("refreshed person");
-        sqlx::query(
-            r#"INSERT INTO "BaseItemImageInfos" ("Id", "ItemId", "Path", "ImageType", "DateModified", "Width", "Height")
-               VALUES (?1, ?2, '/p.jpg', 0, '2026-09-01 00:00:00.0000000', 0, 0)"#,
+        .await;
+        crate::item_persistence_service::seed_primary_image(
+            &db,
+            Uuid::from_u128(0xA4),
+            complete,
+            "/p.jpg",
         )
-        .bind(guid_to_db(Uuid::from_u128(0xA4)))
-        .bind(guid_to_db(complete))
-        .execute(db.writer())
-        .await
-        .expect("image");
+        .await;
 
         let providers = Arc::new(RecordingProviders::default());
         let task = PeopleValidationTask::new(db.clone(), providers.clone());
@@ -2616,19 +2594,15 @@ mod tests {
         let db = test_db().await;
         let person = Uuid::from_u128(0xB1);
         seed_named_item(&db, person, BaseItemKind::Person, "Jane Doe").await;
-        sqlx::query(r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, 'Jane Doe', 'Actor')"#)
-            .bind(guid_to_db(Uuid::from_u128(0xB2)))
-            .execute(db.writer())
-            .await
-            .expect("people row");
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "DateLastRefreshed" = '2020-01-01 00:00:00.0000000',
-                                      "Overview" = 'Bio.' WHERE "Id" = ?1"#,
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xB2), "Jane Doe", "Actor")
+            .await;
+        crate::item_persistence_service::seed_refreshed_overview(
+            &db,
+            person,
+            "2020-01-01 00:00:00.0000000",
+            "Bio.",
         )
-        .bind(guid_to_db(person))
-        .execute(db.writer())
-        .await
-        .expect("old refresh");
+        .await;
         let providers = Arc::new(RecordingProviders::default());
         let task = PeopleValidationTask::new(db.clone(), providers.clone());
         task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)

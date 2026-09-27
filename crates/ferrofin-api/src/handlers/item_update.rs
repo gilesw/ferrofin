@@ -822,9 +822,12 @@ pub(crate) fn refresh_scan_target(item: &BaseItemEntity, item_id: Uuid) -> Optio
 /// ([`ScanTarget::Artist`]'s `path`); its own folder is validated only when
 /// one of its credited albums sits under it. An artist known only by name
 /// has no folder (`MusicArtist.ValidateChildrenInternal` returns on
-/// `IsAccessedByName`), so it refreshes itself through the provider queue.
-/// An album with no artist folder above it names the by-name artist, whose
-/// validation is that no-op, so it is not scanned — as upstream.
+/// `IsAccessedByName`): the scanner refreshes it after its albums' folders
+/// (a `path` of `None`), its music providers under the request's options —
+/// through the scan queue's priority lane when there is no folder to
+/// validate, so it runs inside a running scan and never beside one. An album
+/// with no artist folder above it names the by-name artist, whose validation
+/// is that no-op, so it is not scanned — as upstream.
 async fn artist_refresh_route(
     state: &AppState,
     item: &BaseItemEntity,
@@ -851,18 +854,11 @@ async fn artist_refresh_route(
             folders.push(path);
         }
     }
-    let folder_backed = own_folder.is_some();
-    if !folder_backed && folders.is_empty() {
-        return Ok(RefreshRoute::item_only());
-    }
-    Ok(RefreshRoute {
-        scan: Some(ScanTarget::Artist {
-            id: item_id,
-            path: own_folder,
-            folders,
-        }),
-        item: !folder_backed,
-    })
+    Ok(RefreshRoute::scan(ScanTarget::Artist {
+        id: item_id,
+        path: own_folder,
+        folders,
+    }))
 }
 
 /// The path of the nearest folder-backed `MusicArtist` above `album` (the

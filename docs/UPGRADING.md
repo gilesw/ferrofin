@@ -8,6 +8,43 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — items without per-library fetcher choices follow the server-wide metadata options
+
+Scans and single-item refreshes (`POST /Items/{id}/Refresh`, Identify) now decide which
+remote providers run for an item, and in what order, the way Jellyfin does. This applies to
+every kind of item (movies, series, seasons, episodes, music videos, albums, artists, …):
+
+- A library that saved its own choices for the item's kind keeps them: the **Metadata
+  downloaders** and **Image fetchers** checkboxes and their order, under **Dashboard →
+  Libraries → Manage library**.
+- A kind the library never saved choices for (a library created by an earlier Ferrofin, or
+  over the API without `TypeOptions`), and an item in no library at all (an artist known
+  only by name, such as a compilation's album artist), now follow the **server-wide
+  metadata options**: their disabled metadata and image fetchers and their fetcher orders.
+  Earlier versions ignored those and ran every fetcher in the built-in order.
+
+The server-wide options ship with Jellyfin's defaults, which turn off:
+
+- **TheAudioDB** as a metadata downloader for music albums and music artists (its artwork
+  stays on). Earlier versions asked it for every album and artist.
+- **The Open Movie Database** as a metadata downloader and image fetcher for music videos
+  (it only runs with `FERROFIN_OMDB_KEY` set).
+
+If you customised the server-wide options — their disabled fetchers or their order, stored
+in the server configuration's `MetadataOptions` — those settings now also apply to movies,
+series and every other kind whose library saved no choices of its own. The web client has
+no page for the server-wide options: they are edited through `POST /System/Configuration`
+(`MetadataOptions`, one entry per item type), and stored in `system.json`.
+
+The upgrade removes nothing already stored: descriptions and artwork a now-disabled
+provider supplied stay, until a "Replace all metadata" refresh of the item clears what its
+enabled providers do not return. To keep a provider for a library's items, open
+**Dashboard → Libraries**, choose **Manage library**, tick the provider for each kind
+(for TheAudioDB, **Music Albums** and **Music Artists**; for OMDb, **Music Videos**) and
+save: the library then has saved choices, and its next scan uses them. Artists known only
+by name have no library: remove `TheAudioDB` from the `MusicArtist` entry's
+`DisabledMetadataFetchers` in the server-wide options to turn it back on for them.
+
 ## Unreleased — editing an item no longer locks it
 
 Earlier versions locked an item (`LockData`) whenever a metadata-editor save changed one of

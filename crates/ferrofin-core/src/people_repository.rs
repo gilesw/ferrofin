@@ -1234,6 +1234,19 @@ impl PeopleRepository for FerrofinPeopleRepository {
     }
 }
 
+/// Test-only: a `Peoples` row with no item link, so the raw SQL stays inside
+/// the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_people_row(db: &Database, id: uuid::Uuid, name: &str, person_type: &str) {
+    sqlx::query(r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, ?2, ?3)"#)
+        .bind(guid_to_db(id))
+        .bind(name)
+        .bind(person_type)
+        .execute(db.writer())
+        .await
+        .expect("seed people row");
+}
+
 #[cfg(test)]
 mod tests {
     /// `Person` is the only 10.11.8 entity with

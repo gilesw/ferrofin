@@ -55,12 +55,21 @@ struct OneItemLibrary {
     scans: std::sync::Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>,
     /// The scanner is stopped: `run_refresh_scan` runs nothing.
     stopped: bool,
+    /// The item is a music artist known only by name (no folder, no
+    /// library).
+    by_name_artist: bool,
 }
 
 #[async_trait]
 impl LibraryManager for OneItemLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok((id == ITEM_ID).then(|| {
+            if self.by_name_artist {
+                let mut artist = minimal_base_item(ITEM_ID, "Gil Evans", "MusicArtist");
+                "MediaBrowser.Controller.Entities.Audio.MusicArtist".clone_into(&mut artist.type_);
+                artist.path = Some("/config/metadata/artists/Gil Evans".to_owned());
+                return artist;
+            }
             let mut item = minimal_base_item(ITEM_ID, "The Matrix", "Movie");
             if let Some((path, library)) = &self.file {
                 item.path = Some(path.clone());
@@ -560,6 +569,50 @@ async fn apply_on_a_file_item_refreshes_it_through_its_scan() {
     let chosen = options.search_result.as_ref().expect("the chosen result");
     assert_eq!(chosen.name.as_deref(), Some("Heat"));
     assert_eq!(chosen.search_provider_name.as_deref(), Some("TheTVDB"));
+}
+
+/// Apply on a music artist known only by name refreshes it through the
+/// scanner — `ScanTarget::Artist` with no folder, in the priority lane —
+/// whose music pass fetches MusicBrainz and TheAudioDB by the chosen id; the
+/// provider manager (which has no music provider) is not used. Its metadata
+/// path under the config directory is under no library, which used to make
+/// this a `409`.
+#[tokio::test]
+async fn apply_on_a_by_name_artist_refreshes_it_through_the_scanner() {
+    let library = Arc::new(OneItemLibrary {
+        by_name_artist: true,
+        ..OneItemLibrary::default()
+    });
+    let recorder = RefreshRecorder::default();
+    let state = file_item_state(&library, recorder.clone());
+    let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
+    let body = Body::from(
+        r#"{"Name":"Gil Evans","SearchProviderName":"MusicBrainz",
+            "ProviderIds":{"MusicBrainzArtist":"66666666-6666-4666-8666-666666666666"}}"#,
+    );
+    let (status, _) = send_to(state, "POST", &uri, body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        recorder.lock().unwrap().is_none(),
+        "the provider manager is not asked"
+    );
+    let scans = library.scans.lock().unwrap().clone();
+    assert_eq!(scans.len(), 1);
+    let (target, options) = &scans[0];
+    assert_eq!(
+        *target,
+        ScanTarget::Artist {
+            id: ITEM_ID,
+            path: None,
+            folders: Vec::new(),
+        }
+    );
+    assert!(options.replace_all_metadata && options.remove_old_metadata);
+    let chosen = options.search_result.as_ref().expect("the chosen result");
+    assert_eq!(
+        chosen.provider_ids.as_ref().expect("ids")["MusicBrainzArtist"],
+        "66666666-6666-4666-8666-666666666666"
+    );
 }
 
 /// A stopped scanner runs nothing, so Apply is a `503`, never a silent

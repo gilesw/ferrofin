@@ -1035,7 +1035,15 @@ pub async fn build_app_state(
     .with_studio_images(Arc::clone(&studios_client))
     // Compute each artwork's dimensions + blurhash during the scan (feeds the DTO's
     // Width/Height + ImageBlurHashes).
-    .with_image_processor(Arc::clone(&image_processor));
+    .with_image_processor(Arc::clone(&image_processor))
+    // The SERVER-WIDE per-item-type MetadataOptions: the fetcher gate for a
+    // kind a library saved no checkboxes for, and for an item in no library
+    // (a by-name artist), as upstream's `IsMetadataFetcherEnabled` falls
+    // back to them. Read live, once per scan.
+    .with_metadata_options({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.snapshot_shared().metadata_options.clone()
+    });
     // Scan-progress log cadence (bootstrap knob); `None` keeps the 100-item default.
     if let Some(every) = config.scan_progress_every {
         scanner = scanner.with_progress_every(every as usize);

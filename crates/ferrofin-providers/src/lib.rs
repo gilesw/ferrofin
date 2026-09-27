@@ -60,8 +60,8 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
-    AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate, ReleaseArtistCredit,
-    ReleaseDetails, ReleaseHit,
+    AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,
+    ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
 pub use similarity::{

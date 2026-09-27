@@ -19,13 +19,25 @@ use crate::tmdb::TmdbImage;
 /// TheAudioDb API base including the plugin's built-in free key (`195003`).
 const API_BASE: &str = "https://www.theaudiodb.com/api/v1/json/195003";
 
-/// Mapped artist metadata + artwork.
+/// Mapped artist metadata + artwork — what `AudioDbArtistProvider.
+/// ProcessResult` (`AudioDbArtistProvider.cs:197-233`) reads. Its
+/// `strWebsite` → `HomePageUrl` is not read: Ferrofin stores no home page.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioDbArtist {
     /// The biography (English), if any.
     pub biography: Option<String>,
     /// Genre, if any.
     pub genre: Option<String>,
+    /// Sub-genre (`strSubGenre`), if any: the artist's second genre.
+    pub sub_genre: Option<String>,
+    /// The year the artist formed (`intFormedYear`), if it parses.
+    pub formed_year: Option<i32>,
+    /// Country (`strCountry`), if any: its production location.
+    pub country: Option<String>,
+    /// TheAudioDB's own artist id (`idArtist`).
+    pub audiodb_id: Option<String>,
+    /// The artist's MusicBrainz id as TheAudioDB has it (`strMusicBrainzID`).
+    pub musicbrainz_id: Option<String>,
     /// Artwork (thumb→Primary, logo→Logo, banner→Banner, fanart→Backdrop).
     pub images: Vec<TmdbImage>,
 }
@@ -34,10 +46,15 @@ pub struct AudioDbArtist {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioDbAlbum {
     /// The album title AudioDB has (`strAlbum`), present **only** when the
-    /// plugin's `ReplaceAlbumName` setting is on. C#
-    /// `AudioDbAlbumProvider.cs:90` overwrites `item.Name` with it under
-    /// exactly that condition, so a `None` here means "leave the scanned name
-    /// alone", not "AudioDB had no title".
+    /// plugin's `ReplaceAlbumName` setting is on, so a `None` here means
+    /// "leave the scanned name alone", not "AudioDB had no title". The scan
+    /// renames the album with it.
+    ///
+    /// ACCEPTED DIVERGENCE (Ferrofin makes the documented option work;
+    /// upstream's is a no-op): `AudioDbAlbumProvider.cs:93-96` sets
+    /// `item.Album`, which no `MergeData` copies onto the album, so the
+    /// setting has changed nothing upstream since 26c778eb16 — while its
+    /// twin `ReplaceArtistName` sets the artist's `Name`.
     pub name: Option<String>,
     /// The album description (English), if any.
     pub description: Option<String>,
@@ -45,6 +62,18 @@ pub struct AudioDbAlbum {
     pub year: Option<i32>,
     /// Genre, if any.
     pub genre: Option<String>,
+    /// The album's artist (`strArtist`): its album artist.
+    pub artist: Option<String>,
+    /// TheAudioDB's own artist id (`idArtist`).
+    pub audiodb_artist_id: Option<String>,
+    /// TheAudioDB's own album id (`idAlbum`).
+    pub audiodb_album_id: Option<String>,
+    /// The album artist's MusicBrainz id as TheAudioDB has it
+    /// (`strMusicBrainzArtistID`).
+    pub musicbrainz_artist_id: Option<String>,
+    /// The album's MusicBrainz release-group id as TheAudioDB has it
+    /// (`strMusicBrainzID`).
+    pub musicbrainz_release_group_id: Option<String>,
     /// Artwork (thumb→Primary, CD art→Disc).
     pub images: Vec<TmdbImage>,
 }
@@ -62,6 +91,16 @@ struct ArtistWire {
     biography: Option<String>,
     #[serde(rename = "strGenre")]
     genre: Option<String>,
+    #[serde(rename = "strSubGenre")]
+    sub_genre: Option<String>,
+    #[serde(rename = "intFormedYear")]
+    formed_year: Option<String>,
+    #[serde(rename = "strCountry")]
+    country: Option<String>,
+    #[serde(rename = "idArtist")]
+    id: Option<String>,
+    #[serde(rename = "strMusicBrainzID")]
+    musicbrainz_id: Option<String>,
     #[serde(rename = "strArtistThumb")]
     thumb: Option<String>,
     #[serde(rename = "strArtistLogo")]
@@ -91,6 +130,16 @@ struct AlbumWire {
     year: Option<String>,
     #[serde(rename = "strGenre")]
     genre: Option<String>,
+    #[serde(rename = "strArtist")]
+    artist: Option<String>,
+    #[serde(rename = "idArtist")]
+    artist_id: Option<String>,
+    #[serde(rename = "idAlbum")]
+    album_id: Option<String>,
+    #[serde(rename = "strMusicBrainzArtistID")]
+    musicbrainz_artist_id: Option<String>,
+    #[serde(rename = "strMusicBrainzID")]
+    musicbrainz_id: Option<String>,
     #[serde(rename = "strAlbumThumb")]
     thumb: Option<String>,
     #[serde(rename = "strAlbumCDart")]
@@ -173,6 +222,15 @@ impl AudioDbClient {
         Some(AudioDbArtist {
             biography: non_blank(wire.biography),
             genre: non_blank(wire.genre),
+            sub_genre: non_blank(wire.sub_genre),
+            // `int.TryParse(result.intFormedYear, NumberStyles.Integer, …)`.
+            formed_year: wire
+                .formed_year
+                .as_deref()
+                .and_then(|y| y.trim().parse().ok()),
+            country: non_blank(wire.country),
+            audiodb_id: non_blank(wire.id),
+            musicbrainz_id: non_blank(wire.musicbrainz_id),
             images,
         })
     }
@@ -185,10 +243,12 @@ impl AudioDbClient {
         push_image(&mut images, wire.thumb, ImageType::Primary);
         push_image(&mut images, wire.cd_art, ImageType::Disc);
         // `if (Plugin.Instance.Configuration.ReplaceAlbumName &&
-        //     !string.IsNullOrWhiteSpace(result.strAlbum)) item.Name = result.strAlbum;`
-        // — off by default, and the blank guard is upstream's, not a
-        // convenience: AudioDB returns `""` for albums it has no title for and
-        // wiping a scanned album's name with it would be data loss.
+        //     !string.IsNullOrWhiteSpace(result.strAlbum)) item.Album = result.strAlbum;`
+        // — off by default; handed back as the album's name (see
+        // `AudioDbAlbum::name`, an accepted divergence). The blank guard is
+        // upstream's, not a convenience: AudioDB returns `""` for albums it
+        // has no title for and wiping a scanned album's name with it would be
+        // data loss.
         let cfg: crate::plugin_config::AudioDbConfig =
             self.plugin.load(crate::builtin_plugins::AUDIODB.id).await;
         Some(AudioDbAlbum {
@@ -200,6 +260,11 @@ impl AudioDbClient {
             description: non_blank(wire.description),
             year: wire.year.as_deref().and_then(|y| y.trim().parse().ok()),
             genre: non_blank(wire.genre),
+            artist: non_blank(wire.artist),
+            audiodb_artist_id: non_blank(wire.artist_id),
+            audiodb_album_id: non_blank(wire.album_id),
+            musicbrainz_artist_id: non_blank(wire.musicbrainz_artist_id),
+            musicbrainz_release_group_id: non_blank(wire.musicbrainz_id),
             images,
         })
     }
@@ -297,12 +362,18 @@ mod tests {
             (
                 "/artist-mb.php",
                 r#"{"artists":[{"strArtist":"Miles Davis","strBiographyEN":"Trumpeter.",
-                    "strGenre":"Jazz","strArtistThumb":"/t.jpg","strArtistFanart":"/f.jpg"}]}"#
+                    "strGenre":"Jazz","strSubGenre":"Bebop","intFormedYear":"1944",
+                    "strCountry":"Alton, Illinois","idArtist":"111239",
+                    "strMusicBrainzID":"561d854a-6a28-4aa7-8c99-323e6ce46c2a",
+                    "strArtistThumb":"/t.jpg","strArtistFanart":"/f.jpg"}]}"#
                     .to_owned(),
             ),
             (
                 "/album-mb.php",
                 r#"{"album":[{"strAlbum":"Kind of Blue","intYearReleased":"1959","strGenre":"Jazz",
+                    "strArtist":"Miles Davis","idArtist":"111239","idAlbum":"2109614",
+                    "strMusicBrainzArtistID":"561d854a-6a28-4aa7-8c99-323e6ce46c2a",
+                    "strMusicBrainzID":"8e8a594f-2175-3d0d-9f10-5ab6e5d3ec59",
                     "strDescriptionEN":"Seminal.","strAlbumThumb":"/c.jpg","strAlbumCDart":"/cd.jpg"}]}"#
                     .to_owned(),
             ),
@@ -313,11 +384,30 @@ mod tests {
         let a = c.artist("mb-artist").await.expect("artist");
         assert_eq!(a.biography.as_deref(), Some("Trumpeter."));
         assert_eq!(a.genre.as_deref(), Some("Jazz"));
+        assert_eq!(a.sub_genre.as_deref(), Some("Bebop"));
+        assert_eq!(a.formed_year, Some(1944));
+        assert_eq!(a.country.as_deref(), Some("Alton, Illinois"));
+        assert_eq!(a.audiodb_id.as_deref(), Some("111239"));
+        assert_eq!(
+            a.musicbrainz_id.as_deref(),
+            Some("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
+        );
         assert_eq!(a.images.len(), 2);
 
         let al = c.album("mb-rg").await.expect("album");
         assert_eq!(al.year, Some(1959));
         assert_eq!(al.description.as_deref(), Some("Seminal."));
+        assert_eq!(al.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(al.audiodb_artist_id.as_deref(), Some("111239"));
+        assert_eq!(al.audiodb_album_id.as_deref(), Some("2109614"));
+        assert_eq!(
+            al.musicbrainz_artist_id.as_deref(),
+            Some("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
+        );
+        assert_eq!(
+            al.musicbrainz_release_group_id.as_deref(),
+            Some("8e8a594f-2175-3d0d-9f10-5ab6e5d3ec59")
+        );
         assert_eq!(al.images.len(), 2);
 
         // A different server returning empty → None.
