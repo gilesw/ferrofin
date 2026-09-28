@@ -1743,11 +1743,11 @@ async fn a_failed_write_leaves_the_album_due() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
     let album = ferrofin_db::store::guid_to_db(fx.album_id());
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"CREATE TRIGGER "test_refuse_ids" BEFORE INSERT ON "BaseItemProviders"
            WHEN NEW."ItemId" = '{album}'
            BEGIN SELECT RAISE(ABORT, 'refused'); END"#
-    ))
+    )))
     .execute(fx.db.writer())
     .await
     .expect("trigger");

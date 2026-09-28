@@ -1150,7 +1150,11 @@ impl FerrofinItemPersistenceService {
     /// `sql` — [`UPSERT_SQL`] for a full-row replace, [`scan_upsert_sql`] for
     /// the library scan's ownership-respecting variant. Both bind the same
     /// columns in the same order: [`written_columns`]'s, then the save time.
-    async fn upsert_item(&self, item: &BaseItemEntity, sql: &str) -> Result<(), ServiceError> {
+    async fn upsert_item(
+        &self,
+        item: &BaseItemEntity,
+        sql: &'static str,
+    ) -> Result<(), ServiceError> {
         let mut query = sqlx::query(sql);
         for (_, value) in written_columns(item) {
             query = match value {
@@ -1423,7 +1427,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({})"#,
                 numbered_placeholders(chunk.len())
             );
-            let mut query = sqlx::query_scalar::<_, String>(&sql);
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -1441,7 +1445,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 let mut query = sqlx::query_as::<
                     _,
                     (String, Option<String>, Option<String>, Option<String>),
-                >(&sql);
+                >(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
                     query = query.bind(id);
                 }
@@ -1463,7 +1467,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             let select = format!(
                 r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#
             );
-            let mut query = sqlx::query_scalar::<_, String>(&select);
+            let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(select.as_str()));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -1472,7 +1476,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
             ] {
-                let mut query = sqlx::query(&sql);
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
                 for id in chunk {
                     query = query.bind(id);
                 }
@@ -1485,7 +1489,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 r#"DELETE FROM "BaseItems" WHERE "Id" IN ({})"#,
                 numbered_placeholders(chunk.len())
             );
-            let mut query = sqlx::query(&sql);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(id);
             }
@@ -2150,7 +2154,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     Option<Vec<u8>>,
                     Option<chrono::DateTime<chrono::Utc>>,
                 ),
-            >(&sql);
+            >(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2198,7 +2202,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                    FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
                    ORDER BY "ItemId", "ImageType", "Id""#
             );
-            let mut query = sqlx::query_as::<_, ScanImageRow>(&images);
+            let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(images.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2223,7 +2227,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 r#"SELECT "ItemId", "ParentItemId" FROM "AncestorIds"
                    WHERE "ItemId" IN ({placeholders})"#
             );
-            let mut query = sqlx::query_as::<_, (String, String)>(&ancestors);
+            let mut query =
+                sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(ancestors.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2237,7 +2242,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                    WHERE "ItemId" IN ({placeholders}) AND "IsExternal" = 1
                      AND "Path" IS NOT NULL"#
             );
-            let mut query = sqlx::query_as::<_, (String, i32, String)>(&externals);
+            let mut query =
+                sqlx::query_as::<_, (String, i32, String)>(sqlx::AssertSqlSafe(externals.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2266,7 +2272,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut out = Vec::new();
         for chunk in paths.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = items_at_paths_sql(chunk.len());
-            let mut query = sqlx::query_as::<_, PathRow>(&sql);
+            let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
             for path in chunk {
                 query = query.bind(path);
             }
@@ -2294,7 +2300,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(Some(Vec::new()));
         }
         let sql = library_items_sql(top_parent_ids.len());
-        let mut query = sqlx::query_as::<_, PathRow>(&sql);
+        let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
         for library in top_parent_ids {
             query = query.bind(guid_to_db(*library));
         }
@@ -2320,7 +2326,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 items_under_roots_sql(libraries.len(), chunk.len()),
                 pathless_children_sql(libraries.len(), chunk.len()),
             ] {
-                let mut query = sqlx::query_as::<_, PathRow>(&sql);
+                let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
                 for library in &libraries {
                     query = query.bind(library);
                 }
@@ -2346,8 +2352,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut out: Vec<ItemChildLink> = Vec::new();
         for chunk in parents.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = child_links_sql(chunk.len());
-            let mut query =
-                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(&sql);
+            let mut query = sqlx::query_as::<
+                _,
+                (String, Option<String>, Option<String>, Option<String>),
+            >(sqlx::AssertSqlSafe(sql.as_str()));
             for parent in chunk {
                 query = query.bind(guid_to_db(*parent));
             }
@@ -2445,7 +2453,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         for chunk in folder_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = folder_run_time_sums_sql(chunk.len(), types.len());
-            let mut query = sqlx::query_as::<_, (String, Option<i64>, i64)>(&sql);
+            let mut query =
+                sqlx::query_as::<_, (String, Option<i64>, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2481,7 +2490,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     Option<chrono::DateTime<chrono::Utc>>,
                     Option<chrono::DateTime<chrono::Utc>>,
                 ),
-            >(&sql);
+            >(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2562,7 +2571,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?1, "DateLastSaved" = ?1
                    WHERE "Id" IN ({placeholders})"#
             );
-            let mut query = sqlx::query(&sql).bind(&at);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&at);
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2591,7 +2600,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 r#"SELECT "ItemId", "Id" FROM "BaseItemMetadataFields"
                    WHERE "ItemId" IN ({placeholders}) ORDER BY "ItemId", "Id""#
             );
-            let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
+            let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -3552,14 +3561,17 @@ pub(crate) fn never_refreshed_ids_sql(by_name_only: bool) -> &'static str {
 /// `CleanName` a row in a library carries too. Both sides are sought by
 /// `Type` — the twin by `IX_BaseItems_Type_CleanName` — never a scan of
 /// `BaseItems`; `EXPLAIN QUERY PLAN` pinned by
-/// `the_closing_pass_selections_seek_by_type`.
+/// `the_closing_pass_selections_seek_by_type`. The `+` on the twin's
+/// `TopParentId` keeps SQLite (3.50+) off the `(Type, TopParentId, …)`
+/// indexes, which it otherwise ranges on `TopParentId <> ''` instead of
+/// seeking the `CleanName` equality.
 pub(crate) const SUPERSEDED_BY_NAME_ARTISTS_SQL: &str = r#"SELECT b."Id" FROM "BaseItems" AS b
    WHERE b."Type" = ?1
      AND (b."TopParentId" IS NULL OR b."TopParentId" = '')
      AND b."CleanName" IS NOT NULL
      AND EXISTS (SELECT 1 FROM "BaseItems" AS f
                   WHERE f."Type" = ?1 AND f."CleanName" = b."CleanName"
-                    AND f."TopParentId" IS NOT NULL AND f."TopParentId" <> '')
+                    AND +f."TopParentId" IS NOT NULL AND +f."TopParentId" <> '')
    ORDER BY b."Id""#;
 
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
@@ -5138,7 +5150,7 @@ mod tests {
                 .join(" || '|' || ")
         );
         let snapshot = || async {
-            sqlx::query_scalar::<_, String>(&snapshot_sql)
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(snapshot_sql.as_str()))
                 .bind(guid_to_db(id))
                 .fetch_one(db.pool())
                 .await
@@ -6826,7 +6838,8 @@ mod tests {
     /// per step, outer to inner.
     async fn query_plan(db: &ferrofin_db::Database, sql: &str, binds: usize) -> Vec<String> {
         let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(&explain);
+        let mut query =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()));
         for _ in 0..binds {
             query = query.bind("x");
         }
@@ -6907,7 +6920,9 @@ mod tests {
         }
         let plan = query_plan(&db, super::SUPERSEDED_BY_NAME_ARTISTS_SQL, 1).await;
         assert!(
-            plan.iter().any(|s| s.starts_with("SEARCH f USING")
+            // SQLite 3.50+ words a correlated subquery's seek `SEARCH f EXISTS
+            // USING …`; older versions `SEARCH f USING …`.
+            plan.iter().any(|s| s.starts_with("SEARCH f ")
                 && s.contains("IX_BaseItems_Type_CleanName")
                 && s.contains("CleanName=?")),
             "the folder twin by Type and CleanName, got: {plan:?}"
@@ -7455,11 +7470,11 @@ mod tests {
         let db = test_db().await;
         let (_, season, _, extra, _, _, _) = season_with_links(&db).await;
         let before = rows_and_links(&db).await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"CREATE TRIGGER "TestFailDelete" BEFORE DELETE ON "BaseItems"
                WHEN old."Id" = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
             guid_to_db(extra)
-        ))
+        )))
         .execute(db.writer())
         .await
         .expect("trigger");

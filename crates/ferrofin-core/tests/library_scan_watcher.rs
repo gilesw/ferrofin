@@ -1329,7 +1329,7 @@ async fn top_parent(db: &Database, id: &str) -> Option<String> {
 }
 
 async fn count(db: &Database, sql: &str) -> i64 {
-    sqlx::query_scalar(sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .fetch_one(db.pool())
         .await
         .expect("count")

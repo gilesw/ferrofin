@@ -366,9 +366,9 @@ impl Fixture {
     }
 
     async fn set(&self, path: &Path, column: &str, value: Option<String>) {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"UPDATE "BaseItems" SET "{column}" = ?1 WHERE "Id" = ?2"#
-        ))
+        )))
         .bind(value)
         .bind(Self::id(path))
         .execute(self.db.writer())
@@ -410,10 +410,10 @@ async fn count_writes(db: &Database) {
             .await
             .expect("counter row");
         for event in ["INSERT", "UPDATE", "DELETE"] {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 r#"CREATE TRIGGER "TestWrites_{table}_{event}" AFTER {event} ON "{table}"
                    BEGIN UPDATE "TestWrites" SET "N" = "N" + 1 WHERE "Tbl" = '{table}'; END"#
-            ))
+            )))
             .execute(db.writer())
             .await
             .expect("trigger");
@@ -2409,9 +2409,9 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
     let tmp = tempfile::tempdir().expect("tmp");
     let (db, scanner, show, _requests) = two_shows_library(tmp.path()).await;
     let season = r#""Type" LIKE '%TV.Season'"#;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"UPDATE "BaseItems" SET "IsLocked" = 1, "IndexNumber" = NULL WHERE {season}"#
-    ))
+    )))
     .execute(db.writer())
     .await
     .expect("lock");
@@ -2425,9 +2425,9 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
         )
         .await
         .expect("folder refresh");
-    let number: Option<i64> = sqlx::query_scalar(&format!(
+    let number: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         r#"SELECT "IndexNumber" FROM "BaseItems" WHERE {season}"#
-    ))
+    )))
     .fetch_one(db.pool())
     .await
     .expect("season");

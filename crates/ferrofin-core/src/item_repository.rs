@@ -727,7 +727,7 @@ impl FerrofinItemRepository {
         }
         sql.push_str(r#" ORDER BY iv."Value""#);
 
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
         for t in &type_ints {
             query = query.bind(*t);
         }
@@ -1200,11 +1200,7 @@ fn clamp_count(n: i64) -> i32 {
 /// `(Type, CleanValue)`, then the map's primary key and the content row's.
 /// Shared by the page query and the total-count query so their WHERE stays
 /// identical.
-fn push_value_exists<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    inner: InnerScope,
-) {
+fn push_value_exists(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
     qb.push(
         r#" AND EXISTS (SELECT 1 FROM "ItemValues" iv
            JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
@@ -1220,10 +1216,10 @@ fn push_value_exists<'a>(
 /// `ByName.cs:314-317`): the `ItemValues` rows of `scope.type_ints` whose
 /// `CleanValue` is one of `clean_names`, joined to the content rows (`ci`)
 /// that carry them. Ends inside the `WHERE`, ready for more `AND` terms.
-fn push_value_links<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    clean_names: &'a [String],
+fn push_value_links(
+    qb: &mut QueryBuilder<Sqlite>,
+    scope: &ByNameScope<'_>,
+    clean_names: &[String],
 ) {
     qb.push(
         r#""ItemValues" iv
@@ -1255,11 +1251,7 @@ enum InnerScope {
 /// to any query that does not ask for owned items: no alternate versions, no
 /// owned non-extras (`TranslateQuery.cs:796-807`).
 #[allow(clippy::too_many_lines)] // one predicate per C# field, kept in the C# order
-fn push_content_scope<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    scope: &'a ByNameScope<'a>,
-    inner: InnerScope,
-) {
+fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, inner: InnerScope) {
     let ByNameScope {
         filter,
         content_type_names,
@@ -1454,7 +1446,7 @@ struct ByNameScope<'a> {
 /// row's own columns come back with it; ids are stored as the uppercase
 /// hyphenated GUID text, so the ordering is the text ordering of that form.
 fn push_representative_rank(
-    qb: &mut QueryBuilder<'_, Sqlite>,
+    qb: &mut QueryBuilder<Sqlite>,
     return_type: &str,
     top_parents: &[String],
 ) {
@@ -1646,14 +1638,16 @@ impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
 /// studios and genres, excluded ids — is the same `TranslateQuery` a browse
 /// runs, so it runs through [`append_predicates`] over `outer`, the filter
 /// narrowed to exactly those fields (see [`by_name_outer_filter`]).
-fn append_by_name_filters<'a>(
-    qb: &mut QueryBuilder<'a, Sqlite>,
-    filter: &'a InternalItemsQuery,
-    outer: &'a InternalItemsQuery,
+fn append_by_name_filters(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    outer: &InternalItemsQuery,
 ) {
-    let non_blank = |v: &'a Option<String>| v.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    fn non_blank(v: Option<&str>) -> Option<&str> {
+        v.map(str::trim).filter(|s| !s.is_empty())
+    }
     append_predicates(qb, outer);
-    if let Some(term) = non_blank(&filter.search_term) {
+    if let Some(term) = non_blank(filter.search_term.as_deref()) {
         let lowered = lower_invariant(term);
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
             let like = format!("%{}%", lowered.trim_matches('%'));
@@ -1667,7 +1661,7 @@ fn append_by_name_filters<'a>(
             qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
         }
     }
-    if let Some(prefix) = non_blank(&filter.name_starts_with) {
+    if let Some(prefix) = non_blank(filter.name_starts_with.as_deref()) {
         qb.push(r#" AND ferrofin_upper_invariant(COALESCE(bi."SortName", bi."Name")) LIKE "#)
             .push_bind(format!("{}%", upper_invariant(prefix)));
     }
@@ -1677,11 +1671,11 @@ fn append_by_name_filters<'a>(
     // only the first character, case-sensitively, made `nameLessThan=Jb` and
     // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
     // `>=` dropped the boundary row itself.
-    if let Some(boundary) = non_blank(&filter.name_starts_with_or_greater) {
+    if let Some(boundary) = non_blank(filter.name_starts_with_or_greater.as_deref()) {
         qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
             .push_bind(lower_invariant(boundary));
     }
-    if let Some(boundary) = non_blank(&filter.name_less_than) {
+    if let Some(boundary) = non_blank(filter.name_less_than.as_deref()) {
         qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
             .push_bind(lower_invariant(boundary));
     }
@@ -2006,7 +2000,7 @@ impl ItemRepository for FerrofinItemRepository {
                 r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
                 placeholders(chunk.len())
             );
-            let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2239,7 +2233,7 @@ impl ItemRepository for FerrofinItemRepository {
                 placeholders(chunk.len()),
                 chunk.len() + 1
             );
-            let mut query = sqlx::query_as::<_, BaseItemEntity>(&sql);
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
@@ -2456,7 +2450,7 @@ impl ItemRepository for FerrofinItemRepository {
         );
         sql.push_str(&placeholders(ids.len()));
         sql.push(')');
-        let mut query = sqlx::query_scalar::<_, String>(&sql).bind(stream_disc);
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql)).bind(stream_disc);
         for id in &ids {
             query = query.bind(guid_to_db(*id));
         }
@@ -2491,7 +2485,7 @@ impl ItemRepository for FerrofinItemRepository {
         sql.push_str(r#") AND ms."ItemId" IN ("#);
         sql.push_str(&placeholders(ids.len()));
         sql.push(')');
-        let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+        let mut query = sqlx::query_as::<_, (i64, String)>(sqlx::AssertSqlSafe(sql));
         for disc in by_disc.keys() {
             query = query.bind(*disc);
         }
@@ -2583,7 +2577,7 @@ impl ItemRepository for FerrofinItemRepository {
                    AND NOT EXISTS (SELECT 1 FROM "UserData" ud
                        WHERE ud."ItemId" = bi."Id" AND ud."UserId" = ?2 AND ud."Played" = 1))"#,
         );
-        let all_played: i64 = sqlx::query_scalar(&sql)
+        let all_played: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(guid_to_db(id))
             .bind(uid)
             .fetch_one(self.db.pool())
