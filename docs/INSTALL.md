@@ -142,11 +142,27 @@ has been verified so you can roll back if needed.
 #### Stop both servers and copy the Jellyfin state
 
 Install `rsync` and stop both services before copying. Run the checked-in script from a
-Ferrofin checkout. It uses the Debian package paths by default, copies the complete data
-tree and `/etc/jellyfin` into Ferrofin's data/config directories, and assigns the copied
-files to the `ferrofin` user. `--ignore-existing` keeps files already present at the
-destination. In particular, Jellyfin's `root/default/` library folders are copied to
-`/var/lib/ferrofin/data/root/default/`, where Ferrofin discovers them.
+Ferrofin checkout. It uses the Debian package paths by default and assigns the copied files
+to the `ferrofin` user. Ferrofin's `data_dir` has the same layout as Jellyfin's
+`/var/lib/jellyfin`, so each path keeps its relative position; the `data/` inside each
+holds the database, playlists and collections:
+
+| Jellyfin | Ferrofin | Contents |
+|---|---|---|
+| `/var/lib/jellyfin/data/jellyfin.db` (and `-wal`/`-shm`) | `{data_dir}/data/` | the database |
+| `/var/lib/jellyfin/data/playlists/`, `collections/` | `{data_dir}/data/` | playlist and collection folders |
+| `/var/lib/jellyfin/root/default/` | `{data_dir}/root/default/` | library definitions |
+| `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
+| `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
+
+The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
+sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
+`config.toml` and stays read-only to the service.
+
+The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`. `root/default/` holds
+only the library definitions (`.mblink` files naming each media path); media stays where
+it is.
 
 ```sh
 sudo systemctl stop jellyfin ferrofin
@@ -157,21 +173,15 @@ sudo scripts/migrate-jellyfin.sh
 The script must run after installing Ferrofin but before its first start. It refuses to
 copy over an existing Ferrofin database, because `--ignore-existing` would otherwise
 silently keep that database instead of adopting Jellyfin's. It leaves the original
-Jellyfin files untouched. For Docker or nonstandard package layouts, pass the source data
-directory, source config directory, and Ferrofin data directory as arguments, in that
-order:
+Jellyfin files untouched. For Docker or other non-Debian layouts, `--help` lists the options
+for the Jellyfin and Ferrofin directories.
 
-```sh
-sudo scripts/migrate-jellyfin.sh /path/to/jellyfin/data /path/to/jellyfin/config /path/to/ferrofin/data
-```
-
-The copy includes library definitions, metadata, images, playlists, plugin files, and
-configuration. Jellyfin .NET plugins are retained in the copy but cannot run in Ferrofin;
-they require Ferrofin-compatible replacements. `network.xml` carries remote-access
-policy, IP filters, trusted proxies, and local-network definitions. A copied symbolic
-link still points at its original target, so ensure any linked external state remains
-available to Ferrofin. If Jellyfin uses custom cache, metadata, or configuration paths,
-copy those separately to the configured Ferrofin paths.
+Jellyfin .NET plugins cannot run in Ferrofin; they require Ferrofin-compatible
+replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies, and
+local-network definitions. A copied symbolic link still points at its original target, so
+ensure any linked external state remains available to Ferrofin. If Jellyfin uses custom
+cache, metadata, or configuration paths, copy those separately to the configured Ferrofin
+paths.
 
 #### Unicode usernames
 
