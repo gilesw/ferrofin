@@ -13,7 +13,7 @@ find dist -maxdepth 1 -name 'ferrofin_*.deb' -print -quit
 '''
 
 [tasks."deb:amd64"]
-description = "Build the Ferrofin Debian package natively for an x86-64 NAS"
+description = "Build the Ferrofin Debian package natively on an x86-64 Linux host"
 run = '''
 set -eu
 test "$(uname -m)" = "x86_64" || { echo "deb:amd64 must run on an x86_64 Linux host; use deb for the native architecture" >&2; exit 1; }

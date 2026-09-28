@@ -88,7 +88,7 @@ tikv-jemallocator.workspace = true
 # ── Debian package (cargo-nfpm, also used by the release workflow) ──
 [package.metadata.nfpm]
 name = "ferrofin"
-maintainer = "Giles Westwood <giles.westwood@gmail.com>"
+maintainer = "Giles Westwood <201443+gilesw@users.noreply.github.com>"
 section = "video"
 priority = "optional"
 version = "${FERROFIN_VERSION}"
