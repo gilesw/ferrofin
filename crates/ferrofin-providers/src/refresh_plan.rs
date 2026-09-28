@@ -182,6 +182,8 @@ pub struct ItemRefreshPlan {
     pub locked_local: bool,
     /// Which remote image providers run.
     pub remote_images: ImageFetch,
+    /// Why the item refreshes, for the scan's per-item log line.
+    pub reason: RefreshReason,
 }
 
 impl ItemRefreshPlan {
@@ -196,7 +198,63 @@ impl ItemRefreshPlan {
         run_all_providers: false,
         locked_local: false,
         remote_images: ImageFetch::None,
+        reason: RefreshReason::Unchanged,
     };
+}
+
+/// The first of the decision's triggers that fired for an item — what a
+/// path-scoped scan logs as the reason it processed the item. Ranked as the
+/// decision weighs them: an item with no stored row, then the options, the
+/// first and the required refresh, then the change monitors, then the
+/// scan's backfill rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshReason {
+    /// No stored row: the item is created (its first refresh).
+    New,
+    /// The options run every provider (`FullRefresh` or `ReplaceAllMetadata`).
+    Requested,
+    /// The stored row was never refreshed.
+    FirstRefresh,
+    /// The library's `AutomaticRefreshIntervalDays` elapsed.
+    Interval,
+    /// The file's (or folder's) mtime drifted from the stored one.
+    Modified,
+    /// A cumulative-runtime folder has no runtime.
+    NoRuntime,
+    /// The NFO/XML sidecar is newer than the last save.
+    LocalMetadata,
+    /// The external subtitle/audio files beside the video changed.
+    Sidecars,
+    /// The external lyric files beside the audio changed.
+    Lyrics,
+    /// The stored row has no media info yet.
+    MissingMediaInfo,
+    /// The scan's backfill rule (owner decision D2) asks the remote
+    /// providers again.
+    Backfill,
+    /// Nothing fired: the item is only validated.
+    Unchanged,
+}
+
+impl RefreshReason {
+    /// The reason's name in the scan log.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "created",
+            Self::Requested => "requested",
+            Self::FirstRefresh => "first_refresh",
+            Self::Interval => "interval",
+            Self::Modified => "mtime",
+            Self::NoRuntime => "runtime",
+            Self::LocalMetadata => "nfo",
+            Self::Sidecars => "sidecar",
+            Self::Lyrics => "lyrics",
+            Self::MissingMediaInfo => "media_info",
+            Self::Backfill => "backfill",
+            Self::Unchanged => "unchanged",
+        }
+    }
 }
 
 /// What a refresh pass did, as far as the save rule needs it.
@@ -242,19 +300,27 @@ fn file_changed(stored: Option<DateTime<Utc>>, mtime: DateTime<Utc>) -> bool {
 ///
 /// `BaseItem.RequiresRefresh` + the `Folder` override: the file changed
 /// (never for a path-less item or an unset `DateModified`), or a folder that
-/// sums its children's runtime has none.
-fn item_requires_refresh(stored: &StoredState, fs: &FileFacts) -> bool {
+/// sums its children's runtime has none. `None` when neither holds, else the
+/// one that does (the file first).
+fn item_requires_refresh(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> {
     let changed = matches!(
         (stored.date_modified, fs.mtime),
         (Some(saved), Some(now)) if drifted(saved, now, FILE_CHANGE_TOLERANCE_MS)
     );
-    changed || (fs.supports_cumulative_run_time && stored.run_time_ticks.is_none())
+    if changed {
+        Some(RefreshReason::Modified)
+    } else if fs.supports_cumulative_run_time && stored.run_time_ticks.is_none() {
+        Some(RefreshReason::NoRuntime)
+    } else {
+        None
+    }
 }
 
-/// `ProbeProvider.HasChanged` + `IsMissingMediaInfo`.
-fn probe_changed(stored: &StoredState, fs: &FileFacts) -> bool {
+/// `ProbeProvider.HasChanged` + `IsMissingMediaInfo`: `None` when the probe
+/// has nothing to redo, else which of its arms fired (the mtime first).
+fn probe_changed(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> {
     let (checks_mtime, is_video) = match fs.probe {
-        ProbeKind::None => return false,
+        ProbeKind::None => return None,
         ProbeKind::Video { file_or_iso } => (file_or_iso, true),
         ProbeKind::Audio => (true, false),
     };
@@ -263,7 +329,7 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> bool {
             .mtime
             .is_some_and(|mtime| file_changed(stored.date_modified, mtime))
     {
-        return true;
+        return Some(RefreshReason::Modified);
     }
     // `IsMissingMediaInfo` (`ProbeProvider.cs:179-195`). A video's
     // `IsCompleteMedia` is false only for a channel livestream or an active
@@ -274,7 +340,15 @@ fn probe_changed(stored: &StoredState, fs: &FileFacts) -> bool {
         && !fs.is_shortcut
         && fs.is_file_protocol
         && !(is_video && fs.is_placeholder);
-    missing_media_info || (is_video && fs.sidecars_changed) || (!is_video && fs.lyrics_changed)
+    if is_video && fs.sidecars_changed {
+        Some(RefreshReason::Sidecars)
+    } else if !is_video && fs.lyrics_changed {
+        Some(RefreshReason::Lyrics)
+    } else if missing_media_info {
+        Some(RefreshReason::MissingMediaInfo)
+    } else {
+        None
+    }
 }
 
 /// `BaseNfoProvider.HasChanged` / `BaseXmlProvider.HasChanged`: the sidecar
@@ -320,23 +394,39 @@ pub fn plan_item_refresh(
     backfill: bool,
 ) -> ItemRefreshPlan {
     let unset = StoredState::default();
+    let is_new = stored.is_none();
     let stored = stored.unwrap_or(&unset);
     let options = request.options;
     let mode = options.metadata_refresh_mode;
     let is_first_refresh = stored.date_last_refreshed.is_none();
     let interval_days = library.map_or(0, |l| l.automatic_refresh_interval_days);
-    let mut requires_refresh = interval_days > 0
+    let interval_elapsed = interval_days > 0
         && stored
             .date_last_refreshed
             .is_none_or(|last| now - last >= TimeDelta::days(i64::from(interval_days)));
-    if !requires_refresh && mode != MetadataRefreshMode::None {
-        requires_refresh = item_requires_refresh(stored, fs);
-    }
+    let item_required = if !interval_elapsed && mode != MetadataRefreshMode::None {
+        item_requires_refresh(stored, fs)
+    } else {
+        None
+    };
+    let requires_refresh = interval_elapsed || item_required.is_some();
 
     let at_least_default = matches!(
         mode,
         MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
     );
+    // The first trigger that fired, as the decision ranks them.
+    let mut reason = if is_new {
+        RefreshReason::New
+    } else if options.replace_all_metadata || mode == MetadataRefreshMode::FullRefresh {
+        RefreshReason::Requested
+    } else if is_first_refresh {
+        RefreshReason::FirstRefresh
+    } else if interval_elapsed {
+        RefreshReason::Interval
+    } else {
+        item_required.unwrap_or(RefreshReason::Unchanged)
+    };
     let (
         probe,
         local_metadata,
@@ -351,8 +441,20 @@ pub fn plan_item_refresh(
             || mode == MetadataRefreshMode::FullRefresh
             || (is_first_refresh && at_least_default)
             || (requires_refresh && at_least_default);
-        let probe_changed = probe_changed(stored, fs);
+        let probe_change = probe_changed(stored, fs);
+        let probe_changed = probe_change.is_some();
         let local_changed = local_metadata_changed(stored, fs);
+        if reason == RefreshReason::Unchanged {
+            reason = if local_changed {
+                RefreshReason::LocalMetadata
+            } else if let Some(change) = probe_change {
+                change
+            } else if !stored.is_locked && backfill && at_least_default {
+                RefreshReason::Backfill
+            } else {
+                RefreshReason::Unchanged
+            };
+        }
         let probe = fs.probe != ProbeKind::None && (run_all || probe_changed);
         // `CanRefreshMetadata` (`ProviderManager.cs:588-592`): a locked
         // item runs local and forced providers only — and of those,
@@ -405,6 +507,7 @@ pub fn plan_item_refresh(
         run_all_providers,
         locked_local,
         remote_images,
+        reason,
     }
 }
 

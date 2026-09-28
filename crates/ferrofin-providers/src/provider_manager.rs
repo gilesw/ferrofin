@@ -5190,7 +5190,7 @@ mod tests {
 
     #[async_trait]
     impl ferrofin_traits::persistence::ItemPersistenceService for RecordingStore {
-        async fn delete_items(&self, _ids: &[Uuid]) -> Result<(), ServiceError> {
+        async fn delete_items(&self, _ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {

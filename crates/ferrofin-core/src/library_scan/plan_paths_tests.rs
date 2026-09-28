@@ -230,17 +230,24 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
 }
 
 /// The full plan filtered to `paths` (and `exact`), as a scoped scan used to
-/// build it.
+/// build it: the items at, under or above a path, and the path-less virtual
+/// seasons those items sit in.
 fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Planned> {
-    full.iter()
-        .filter(|p| {
-            p.entity.path.as_deref().is_some_and(|path| {
-                exact == Some(path)
-                    || paths
-                        .iter()
-                        .any(|c| path_is_under(path, c) || path_is_under(c, path))
-            })
+    let by_path = |p: &Planned| {
+        p.entity.path.as_deref().is_some_and(|path| {
+            exact == Some(path)
+                || paths
+                    .iter()
+                    .any(|c| path_is_under(path, c) || path_is_under(c, path))
         })
+    };
+    let parents: std::collections::HashSet<String> = full
+        .iter()
+        .filter(|p| by_path(p))
+        .filter_map(|p| p.entity.parent_id.clone())
+        .collect();
+    full.iter()
+        .filter(|p| by_path(p) || (p.entity.path.is_none() && parents.contains(&p.entity.id)))
         .map(|p| Planned {
             id: p.id,
             entity: p.entity.clone(),
@@ -358,6 +365,57 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     assert_eq!(
         canon(scanner.plan_paths(&folders, PlanScope::paths(&albums, Some(&artist)))),
         canon(filtered(&full, &albums, Some(&artist))),
+    );
+}
+
+/// A loose episode of a series with no season folders brings its virtual
+/// season (no path of its own) along in a scoped plan: the row the full plan
+/// groups it under, parent of the episode — never a dangling parent id —
+/// and the series' own scoped plan holds every virtual season the full plan
+/// gives it.
+#[tokio::test]
+async fn plan_paths_plans_a_loose_episodes_virtual_season() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folders = fixture(tmp.path());
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default())).await;
+    let full = scanner.plan(&folders);
+    let root = tmp.path().to_string_lossy().into_owned();
+    let loose = format!("{root}/tv/Flat Show/Flat Show S02E01.mkv");
+    let scoped = scanner.plan_paths(
+        &folders,
+        PlanScope::paths(std::slice::from_ref(&loose), None),
+    );
+    let season = scoped
+        .iter()
+        .find(|p| p.entity.path.is_none())
+        .expect("the loose episode's virtual season is planned");
+    assert_eq!(season.entity.index_number, Some(2));
+    let episode = scoped
+        .iter()
+        .find(|p| p.entity.path.as_deref() == Some(loose.as_str()))
+        .expect("the episode");
+    assert_eq!(
+        episode.entity.parent_id.as_deref(),
+        Some(season.entity.id.as_str())
+    );
+    assert!(episode.ancestors.contains(&season.id));
+    assert_eq!(
+        canon(scoped),
+        canon(filtered(&full, std::slice::from_ref(&loose), None))
+    );
+    // The series' own scan plans every virtual season it holds.
+    let series = format!("{root}/tv/Flat Show");
+    let scoped = scanner.plan_paths(
+        &folders,
+        PlanScope::paths(std::slice::from_ref(&series), None),
+    );
+    assert_eq!(
+        scoped.iter().filter(|p| p.entity.path.is_none()).count(),
+        full.iter()
+            .filter(
+                |p| p.entity.path.is_none() && p.entity.series_name.as_deref() == Some("Flat Show")
+            )
+            .count(),
     );
 }
 

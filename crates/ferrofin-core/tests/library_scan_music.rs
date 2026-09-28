@@ -383,6 +383,61 @@ async fn a_new_album_fetches_only_itself() {
     );
 }
 
+/// The library monitor's scan of a new track in an existing album (the
+/// watcher, a webhook): the album is the nearest existing item, so it — and
+/// only it — refreshes, its music pass included; its artist above it is
+/// context only: no provider is asked about it and its row is not written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_track_reported_by_the_watcher_refreshes_only_its_album() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    fx.scan().await;
+    fx.music.take();
+    let (album, artist) = (fx.row(fx.album_id()).await, fx.row(fx.artist_id()).await);
+
+    let track = fx.album_dir.join("03 - Freddie Freeloader.mp3");
+    std::fs::write(&track, b"").expect("track");
+    // The folder's mtime moves with the new file; make the drift unambiguous.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+    std::fs::File::open(&fx.album_dir)
+        .expect("album dir")
+        .set_modified(later)
+        .expect("touch");
+    let outcome = fx
+        .scanner
+        .scan_paths(&[track.to_string_lossy().into_owned()])
+        .await
+        .expect("scan");
+    assert_eq!(outcome.created, 1, "the track: {outcome:?}");
+    assert_eq!(outcome.updated, 1, "its album: {outcome:?}");
+    let asked = fx.music.take();
+    assert!(
+        !asked.is_empty(),
+        "the album's music refresh asked its providers"
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|l| !l.contains("/ws/2/artist") && !l.contains("artist-mb.php")),
+        "nothing about the artist: {asked:?}"
+    );
+    assert!(
+        searches(&asked).is_empty(),
+        "by the stored match: {asked:?}"
+    );
+    assert_ne!(
+        fx.row(fx.album_id()).await.date_last_refreshed,
+        album.date_last_refreshed,
+        "the album refreshed"
+    );
+    let artist_after = fx.row(fx.artist_id()).await;
+    assert_eq!(
+        artist_after.date_last_saved, artist.date_last_saved,
+        "the artist is not written"
+    );
+    assert_eq!(artist_after.date_last_refreshed, artist.date_last_refreshed);
+}
+
 /// "Replace all metadata" runs every music provider again — by the stored
 /// match, never a new search — and a locked album or artist stays out of it.
 #[tokio::test(flavor = "multi_thread")]

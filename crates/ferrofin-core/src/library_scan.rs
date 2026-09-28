@@ -59,8 +59,8 @@ use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{
-    ItemPersistenceService, ItemRepository, MediaStreamRepository, StoredImageMetadata,
-    StoredItemLinks,
+    ItemPathRow, ItemPersistenceService, ItemRepository, MediaStreamRepository,
+    StoredImageMetadata, StoredItemLinks,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use std::collections::HashMap;
@@ -1225,15 +1225,20 @@ pub type ScanProgress = dyn Fn(f64) + Send + Sync;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanPasses {
     /// Every post-scan pass — library validation's `RunPostScanTasks` (the
-    /// scheduled scan, `POST /Library/Refresh`, a library change, the
-    /// library monitor and the webhooks).
+    /// scheduled scan, `POST /Library/Refresh`, a library change).
     Library,
     /// Only what is scoped to the items this scan touched: the music
     /// refresh of the albums and artists among them, their album covers, and
     /// the children-derived columns of the folders it planned.
-    /// An item or folder refresh over the API: upstream's
-    /// `ProviderManager.RefreshItem` runs no post-scan task, so a refresh of
-    /// one movie never enriches every album in the database.
+    /// An item or folder refresh over the API, and the library monitor's
+    /// refresh of what a changed path belongs to (the watcher, the
+    /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
+    /// task, so a refresh of one movie never enriches every album in the
+    /// database. What a library-wide pass owes the items such a refresh
+    /// created (a new studio's artwork, a new year, a new by-name artist's
+    /// first refresh) is selected by the next library validation from what
+    /// is stored — each pass's persisted selection — never from this scan's
+    /// memory.
     Touched,
 }
 
@@ -1534,6 +1539,37 @@ fn log_scan_planned(items: usize, folders: usize, options: &MetadataRefreshOptio
     );
 }
 
+/// The `debug!` line a path-scoped scan (the library monitor, a webhook, a
+/// folder or item refresh) writes for each item it processed, naming why:
+/// `created`, a trigger of the refresh decision (`mtime`, `nfo`, `sidecar`,
+/// …, see [`RefreshReason`](crate::refresh_plan::RefreshReason)), `unchanged`
+/// for one it only validated, or `context` for a folder above the scanned
+/// items that it read and left alone. The pruning names each row it removed
+/// `pruned`. Per item, so `debug` (`LOGGING.md`).
+fn log_scoped_item(item: &Planned, reason: &'static str, saved: bool) {
+    tracing::debug!(
+        item_id = %item.id,
+        path = item.entity.path.as_deref().unwrap_or_default(),
+        reason,
+        saved,
+        "path-scoped scan item"
+    );
+}
+
+/// The `pruned` lines of a path-scoped scan ([`log_scoped_item`]'s), one per
+/// removed row.
+fn log_pruned(removed: &[(Uuid, Option<String>)]) {
+    for (id, path) in removed {
+        tracing::debug!(
+            item_id = %id,
+            path = path.as_deref().unwrap_or_default(),
+            reason = "pruned",
+            saved = false,
+            "path-scoped scan item"
+        );
+    }
+}
+
 /// What every item's refresh decision in one scan shares.
 struct RefreshContext<'a> {
     /// The options the scan refreshes the items in its scope with.
@@ -1600,7 +1636,7 @@ impl<'a> RefreshContext<'a> {
     /// season or an episode never does — `ApplySearchResult` hands them the
     /// result as their series' (`MetadataService.cs:272-293`).
     fn identified(&self, item: &Planned) -> Option<&'a RemoteSearchResult> {
-        let request = *self.request_for(item);
+        let request = *self.request_for(item, true);
         let series_child = matches!(
             item_type_lookup::kind_from_type_name(&item.entity.type_),
             Some(BaseItemKind::Episode | BaseItemKind::Season)
@@ -1619,13 +1655,32 @@ impl<'a> RefreshContext<'a> {
     }
 
     /// The options `item` refreshes with: the scan's, unless a path-scoped
-    /// scan planned it only for context ([`PathScope::covers`]).
-    fn request_for(&self, item: &Planned) -> &RefreshRequest<'a> {
-        if self.scope.is_none_or(|scope| scope.covers(item)) {
-            &self.request
-        } else {
+    /// scan planned it only for context ([`is_context`](Self::is_context)).
+    /// `exists` says whether it has a stored row.
+    fn request_for(&self, item: &Planned, exists: bool) -> &RefreshRequest<'a> {
+        if self.is_context(item, exists) {
             &self.context
+        } else {
+            &self.request
         }
+    }
+
+    /// Whether a path-scoped scan planned `item` only for context — a
+    /// folder above the scanned roots ([`PathScope::covers`]) that is
+    /// already stored. A folder above them that is not stored yet (its
+    /// child's is the first file of it the library sees) is created with
+    /// the scan's options: its first refresh.
+    fn is_context(&self, item: &Planned, exists: bool) -> bool {
+        exists && self.scope.is_some_and(|scope| !scope.covers(item))
+    }
+
+    /// Whether this scan's context items are carried for context only:
+    /// neither mode refreshes anything (`None`/`None`, upstream's folders
+    /// above a refreshed item, which no refresh of it ever touches), so an
+    /// existing one is read, never refreshed or written.
+    fn context_only(&self) -> bool {
+        self.context.options.metadata_refresh_mode == MetadataRefreshMode::None
+            && self.context.options.image_refresh_mode == MetadataRefreshMode::None
     }
 }
 
@@ -1645,13 +1700,30 @@ struct PathScope<'a> {
     /// Whether the rows under the roots whose files are gone are removed:
     /// a folder's validation removes them, an item's own refresh never does.
     prune: bool,
+    /// The path-less planned items that sit in a folder the scope covers —
+    /// a virtual season of a covered series — which have no path of their
+    /// own to be judged by. `None` before the plan is known.
+    pathless: Option<&'a std::collections::HashSet<Uuid>>,
 }
 
-impl PathScope<'_> {
+impl<'a> PathScope<'a> {
+    /// A scope over `roots` whose items at the roots refresh too, pruning
+    /// as `prune` says.
+    fn of(roots: &'a [String], prune: bool) -> Self {
+        Self {
+            roots,
+            roots_refreshed: true,
+            also: None,
+            prune,
+            pathless: None,
+        }
+    }
+
     /// Whether `item` is in scope: below a root, at one when the roots
-    /// refresh, or the extra item. The folders above the roots are context.
+    /// refresh, the extra item, or a path-less item in a covered folder.
+    /// The folders above the roots are context.
     fn covers(&self, item: &Planned) -> bool {
-        if self.also == Some(item.id) {
+        if self.also == Some(item.id) || self.pathless.is_some_and(|set| set.contains(&item.id)) {
             return true;
         }
         item.entity.path.as_deref().is_some_and(|path| {
@@ -1661,6 +1733,133 @@ impl PathScope<'_> {
                         || path.trim_end_matches('/') != root.trim_end_matches('/'))
             })
         })
+    }
+}
+
+/// The options of the folders a refresh carries for context only
+/// (`ScanRun::ancestors`): upstream never refreshes the folders above the
+/// item a refresh is for, so neither mode runs anything.
+static CONTEXT_ONLY: std::sync::LazyLock<MetadataRefreshOptions> =
+    std::sync::LazyLock::new(|| MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    });
+
+/// The path-less planned items (a virtual season) that sit in a folder
+/// `scope` covers, judged by their parent — the folder that holds them, which
+/// precedes them in plan order. A virtual season of a scanned series is
+/// refreshed with it; one planned above a scanned loose episode is context.
+fn covered_pathless(planned: &[Planned], scope: PathScope<'_>) -> std::collections::HashSet<Uuid> {
+    let mut covered: HashMap<Uuid, bool> = HashMap::with_capacity(planned.len());
+    let mut pathless = std::collections::HashSet::new();
+    for item in planned {
+        let in_scope = if item.entity.path.is_some() {
+            scope.covers(item)
+        } else {
+            let parent_covered = item
+                .entity
+                .parent_id
+                .as_deref()
+                .and_then(parse_id)
+                .is_some_and(|parent| covered.get(&parent).copied().unwrap_or(false));
+            if parent_covered {
+                pathless.insert(item.id);
+            }
+            parent_covered
+        };
+        covered.insert(item.id, in_scope);
+    }
+    pathless
+}
+
+/// The file stems of the items a sidecar at `path` may belong to: its name
+/// without its extension, cut before each `.`, `-` or `_` it holds, and
+/// whole — `Heat (1995).eng.srt` → `Heat (1995)`, `Heat (1995).eng`;
+/// `Heat (1995)-poster.jpg` → `Heat (1995)`, `Heat (1995)-poster`. So a
+/// sidecar belongs to an item whose stem it starts with, up to a separator
+/// (the naming rules' `<stem>.<lang>.srt`, `<stem>.nfo`, `<stem>-poster.jpg`,
+/// `<stem>.lrc`), and `Heat 2 (2027).nfo` is not `Heat (1995)`'s.
+fn sidecar_stems(path: &str) -> Vec<String> {
+    let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+    let mut stems: Vec<String> = stem
+        .char_indices()
+        .filter(|(at, c)| *at > 0 && matches!(c, '.' | '-' | '_'))
+        .map(|(at, _)| stem[..at].to_owned())
+        .collect();
+    stems.push(stem.to_owned());
+    stems.dedup();
+    stems
+}
+
+/// `roots` without the ones under another root — part of its subtree —
+/// or repeated.
+fn collapse_roots(mut roots: Vec<String>) -> Vec<String> {
+    // Shortest first, so every root's ancestors are known before it is.
+    roots.sort_by_key(String::len);
+    let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut collapsed = Vec::with_capacity(roots.len());
+    for root in roots {
+        let trimmed = trimmed_dir(&root);
+        let covered = Path::new(trimmed)
+            .ancestors()
+            .any(|at| at.to_str().is_some_and(|at| kept.contains(at)));
+        if !covered {
+            kept.insert(trimmed.to_owned());
+            collapsed.push(root);
+        }
+    }
+    collapsed
+}
+
+/// The pruning's cascade guard: takes out of `stale` every row that still
+/// holds a row this scan keeps, and returns how many it took out.
+///
+/// Deleting a row takes its `ParentId` descendants with it (the foreign key
+/// cascades), so a stale row whose child is kept — planned, under a folder
+/// that failed to list or an unavailable location, or kept because its file
+/// is still on disk — must stay: a virtual season whose loose episodes sit
+/// in a folder that failed to list is not removed with them unknown, as
+/// upstream removes a virtual season only when it has no episode left
+/// (`SeriesMetadataService.cs:172-207`). An extra (`OwnerId`) holds its owner
+/// only while this scan planned it (`live`: its stored row may still name the
+/// old owner — an undecodable one is rewritten by its file facts only) or it
+/// is unknown itself (under a folder that did not list): otherwise
+/// `delete_items` removes an owner's extras with it, as upstream's
+/// `DeleteItem` does. `children` are the rows under the stale ones
+/// ([`child_links`](ItemPersistenceService::child_links)); a row taken out
+/// holds its own parent in turn, to a fixed point.
+fn hold_back_kept_children(
+    stale: &mut std::collections::HashSet<Uuid>,
+    children: &[ferrofin_traits::persistence::ItemChildLink],
+    live: &std::collections::HashSet<Uuid>,
+    listed: impl Fn(Option<&str>) -> bool,
+) -> usize {
+    let mut held = 0;
+    loop {
+        let holders: Vec<Uuid> = children
+            .iter()
+            .filter(|child| !stale.contains(&child.id))
+            .flat_map(|child| {
+                let parent = child.parent_id.filter(|p| stale.contains(p));
+                let owner = child.owner_id.filter(|o| {
+                    stale.contains(o)
+                        && (live.contains(&child.id) || !listed(child.path.as_deref()))
+                });
+                parent.into_iter().chain(owner)
+            })
+            .collect();
+        let before = held;
+        for id in holders {
+            if stale.remove(&id) {
+                held += 1;
+            }
+        }
+        if held == before {
+            return held;
+        }
     }
 }
 
@@ -1884,6 +2083,10 @@ struct PlanCtx<'a> {
     scope: PlanScope<'a>,
     /// The directories that failed to list this pass.
     unlisted: std::cell::RefCell<Vec<String>>,
+    /// The library locations of the pass (without a trailing slash).
+    locations: std::collections::HashSet<String>,
+    /// The locations that listed empty or failed to list this pass.
+    inaccessible: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a> PlanCtx<'a> {
@@ -1893,7 +2096,40 @@ impl<'a> PlanCtx<'a> {
             naming,
             scope,
             unlisted: std::cell::RefCell::new(Vec::new()),
+            locations: std::collections::HashSet::new(),
+            inaccessible: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// This pass over the libraries `folders`, whose locations it watches
+    /// for an empty or unlistable one ([`PlanOutput::inaccessible`]).
+    fn with_locations(mut self, folders: &[VirtualFolderInfo]) -> Self {
+        self.locations = folders
+            .iter()
+            .flat_map(|f| f.locations.iter())
+            .map(|l| trimmed_dir(l).to_owned())
+            .collect();
+        self
+    }
+
+    /// Records that `dir` listed `empty` (or failed to list): a library
+    /// location that did is inaccessible.
+    fn listed_location(&self, dir: &str, empty: bool) {
+        let dir = trimmed_dir(dir);
+        if empty && self.locations.contains(dir) {
+            let mut inaccessible = self.inaccessible.borrow_mut();
+            if !inaccessible.iter().any(|d| d == dir) {
+                inaccessible.push(dir.to_owned());
+            }
+        }
+    }
+}
+
+/// `dir` without its trailing slashes (`/` stays `/`).
+fn trimmed_dir(dir: &str) -> &str {
+    match dir.trim_end_matches('/') {
+        "" if dir.starts_with('/') => "/",
+        dir => dir,
     }
 }
 
@@ -1906,6 +2142,13 @@ struct PlanOutput {
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
     /// is unknown, so nothing at or under them is removed this scan.
     unlisted: Vec<String>,
+    /// The library locations that listed empty or failed to list — upstream
+    /// skips such a library folder (`Folder.IsLibraryFolderAccessible`,
+    /// `Folder.cs:400-415`, `DirectoryService.IsAccessible`: it has any
+    /// entry): an NFS mount that dropped leaves an empty mountpoint, which
+    /// must not read as "everything was deleted". Nothing under one is
+    /// removed this scan.
+    inaccessible: Vec<String>,
 }
 
 impl PlanCtx<'_> {
@@ -1920,17 +2163,16 @@ impl PlanCtx<'_> {
         }
     }
 
-    /// Adds `item` to the plan when the scope keeps it. A path-less item (a
-    /// virtual season) is kept only by a full plan: a scoped plan keeps what
-    /// its paths name.
+    /// Adds `item` to the plan when the scope keeps it. A path-less item — a
+    /// virtual season, the one kind planned without a path — is kept as
+    /// well: [`plan_loose_episodes`](LibraryScanner::plan_loose_episodes)
+    /// groups only the loose episodes the scope keeps, so each virtual
+    /// season it emits is the parent of a kept episode, exactly as the full
+    /// plan emits it.
     fn emit(&self, out: &mut Vec<Planned>, item: Planned) {
-        let kept = match self.scope.roots {
-            None => true,
-            Some(_) => item
-                .entity
-                .path
-                .as_deref()
-                .is_some_and(|path| self.scope.keeps(path)),
+        let kept = match (self.scope.roots, item.entity.path.as_deref()) {
+            (None, _) | (Some(_), None) => true,
+            (Some(_), Some(path)) => self.scope.keeps(path),
         };
         if kept {
             out.push(item);
@@ -2730,8 +2972,9 @@ impl LibraryScanner {
             .await
     }
 
-    /// Scans `target` as `run` says: every library, one library, or the items
-    /// at or under some paths ([`scan_paths`](Self::scan_paths)), refreshing
+    /// Scans `target` as `run` says: every library, one library, the items
+    /// at or under some paths, or what the library monitor's changed paths
+    /// belong to ([`scan_paths`](Self::scan_paths)), refreshing
     /// them with `run.options`, and stopping between two items once
     /// `run.cancel` is cancelled (the item in progress always finishes, and
     /// the rest of the pass — pruning, the post-scan passes — is skipped).
@@ -2747,14 +2990,10 @@ impl LibraryScanner {
             ScanTarget::All => self.scan_libraries(None, run).await,
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
             ScanTarget::Paths(paths) => {
-                let scope = PathScope {
-                    roots: paths,
-                    roots_refreshed: true,
-                    also: None,
-                    prune: true,
-                };
-                self.scan_scoped(scope, None, run).await
+                self.scan_scoped(PathScope::of(paths, true), None, paths.len(), run)
+                    .await
             }
+            ScanTarget::Changed(paths) => Box::pin(self.scan_changed(paths, run)).await,
             ScanTarget::Items(paths) => {
                 // `RefreshSingleItem`: the items at the paths, which remove
                 // nothing when their file is gone.
@@ -2773,25 +3012,20 @@ impl LibraryScanner {
                 // a kept item in `plan_movies`), covered by
                 // `plan_paths_tests`, plus a prune of only the `ExtraType`
                 // rows under that folder.
-                let scope = PathScope {
-                    roots: paths,
-                    roots_refreshed: true,
-                    also: None,
-                    prune: false,
-                };
-                self.scan_scoped(scope, None, run).await
+                self.scan_scoped(PathScope::of(paths, false), None, paths.len(), run)
+                    .await
             }
             ScanTarget::Artist { id, path, folders } => {
                 // `RefreshArtist`: the artist folders' children, and the
                 // artist itself — never the other artists of those folders.
                 let scope = PathScope {
-                    roots: folders,
                     roots_refreshed: false,
                     also: Some(*id),
-                    prune: true,
+                    ..PathScope::of(folders, true)
                 };
                 let mut outcome = if path.is_some() || !folders.is_empty() {
-                    self.scan_scoped(scope, path.as_deref(), run).await?
+                    self.scan_scoped(scope, path.as_deref(), folders.len(), run)
+                        .await?
                 } else {
                     ScanOutcome::default()
                 };
@@ -2909,6 +3143,7 @@ impl LibraryScanner {
             let part = self.plan_in(library, &all_folders, PlanScope::ALL);
             plan.items.extend(part.items);
             plan.unlisted.extend(part.unlisted);
+            plan.inaccessible.extend(part.inaccessible);
         }
         if run.cancel.is_cancelled() {
             return Ok(ScanOutcome::default());
@@ -2916,23 +3151,21 @@ impl LibraryScanner {
         self.run_scan(&folders, &all_folders, plan, None, run).await
     }
 
-    /// Scans only the items touched by the given `changed` filesystem paths —
-    /// the path-scoped ingest behind the library monitor's watcher/webhook
-    /// reports, so a single new file is resolved and persisted without
-    /// re-walking (or re-enriching) the whole library.
+    /// Scans the library monitor's reported `changed` filesystem paths —
+    /// the path-scoped ingest behind its watcher/webhook reports
+    /// ([`ScanTarget::Changed`]), so a single new file is resolved and
+    /// persisted without re-walking (or re-enriching) the whole library.
     ///
-    /// Per changed path, only the items **at or under** the path (the
-    /// new/changed media) plus its **ancestor** items (series/season/album
-    /// directories, so a file in a brand-new season folder brings its
-    /// hierarchy with it) are planned ([`plan_paths`](Self::plan_paths)): the
-    /// walk descends only the directories leading to the path, never the rest
-    /// of the library. Deleted-item pruning runs restricted to the
-    /// changed paths, so a reported deletion removes exactly the vanished
-    /// rows. Paths outside every library are ignored.
-    ///
-    /// Every item refreshes with the `MetadataRefreshOptions` constructor
-    /// defaults (the library monitor's `ChangedExternally` refresh); see
-    /// [`scan_paths_with`](Self::scan_paths_with).
+    /// Each changed path refreshes the nearest existing item at or above it
+    /// with the `MetadataRefreshOptions` constructor defaults (the monitor's
+    /// `ChangedExternally` refresh) and validates that item's subtree — new
+    /// items are created, gone ones pruned — as
+    /// [`changed_roots`](Self::changed_roots) resolves them; the walk
+    /// descends only the directories leading to those items and their
+    /// subtrees ([`plan_paths`](Self::plan_paths)), never the rest of the
+    /// library. The folders above them are carried for context only, and
+    /// only the touched items' closing passes run ([`ScanPasses::Touched`]).
+    /// Paths outside every library are ignored.
     ///
     /// # Errors
     /// Propagates the item-store failure exactly as [`scan`](Self::scan) does.
@@ -2942,12 +3175,7 @@ impl LibraryScanner {
     }
 
     /// [`scan_paths`](Self::scan_paths) with refresh `options` for the items
-    /// at or under a changed path. The ancestors the scan carries along for
-    /// context (a new episode's season and series) take the defaults, as the
-    /// library monitor's refresh does; a folder refresh, whose ancestors
-    /// upstream never refreshes, runs through
-    /// [`scan_target`](Self::scan_target) with `ScanRun::ancestors` set to
-    /// `None`/`None`.
+    /// the changed paths refresh.
     ///
     /// # Errors
     /// See [`scan_paths`](Self::scan_paths).
@@ -2956,38 +3184,234 @@ impl LibraryScanner {
         changed: &[String],
         options: &MetadataRefreshOptions,
     ) -> Result<ScanOutcome, ServiceError> {
-        let scope = PathScope {
-            roots: changed,
-            roots_refreshed: true,
-            also: None,
-            prune: true,
+        let run = ScanRun {
+            ancestors: &CONTEXT_ONLY,
+            ..ScanRun::uncancelled(options).with_passes(ScanPasses::Touched)
         };
-        self.scan_scoped(scope, None, ScanRun::uncancelled(options))
+        self.scan_target(&ScanTarget::Changed(changed.to_vec()), run)
             .await
+    }
+
+    /// The library monitor's half of [`scan_target`](Self::scan_target)
+    /// ([`ScanTarget::Changed`]): the changed paths become the subtrees of
+    /// the items they refresh ([`changed_roots`](Self::changed_roots)),
+    /// which are scanned like a folder's.
+    async fn scan_changed(
+        &self,
+        changed: &[String],
+        run: ScanRun<'_>,
+    ) -> Result<ScanOutcome, ServiceError> {
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let roots = self.changed_roots(&folders, changed).await;
+        self.scan_scoped(PathScope::of(&roots, true), None, changed.len(), run)
+            .await
+    }
+
+    /// Port of `FileRefresher.ProcessPathChanges` (`FileRefresher.cs:
+    /// 135-208`): each changed path maps to the subtree of the item it
+    /// refreshes.
+    ///
+    /// Upstream refreshes, per path, the nearest existing item at or above
+    /// it (`GetAffectedBaseItem`: `FindByPath` of the path, then of each
+    /// folder above it; an item whose file is gone gives way to the
+    /// nearest one above it that is still on disk) with the default
+    /// options, and that refresh validates the item's children
+    /// (`ProviderManager.RefreshItem` → `Folder.ValidateChildren`). So a new
+    /// episode refreshes its season, a deleted one its season, a new season
+    /// folder its series, a changed file itself; nothing above that item is
+    /// refreshed. Here that item's path is the root of the scan: it and its
+    /// subtree take the scan's options, and its pruning.
+    ///
+    /// One case is narrower than upstream, as the owner requires a changed
+    /// path never to rescan its library (`PLAN_SCAN_CHANGE_DETECTION` Phase
+    /// 6W): a path with no stored item above it short of the library.
+    /// Upstream's nearest item there is the library's own folder, whose
+    /// refresh validates the whole library; here the root is the nearest
+    /// folder at or above the path that is still on disk (a new movie's
+    /// folder, a movie folder whose sidecar changed, a new series' season
+    /// folder — whose series is then new too, and is created with the
+    /// scan's options), or the path itself when only the library's location
+    /// is above it (a new file at the library root). The library's own items
+    /// (`AggregateFolder`, `CollectionFolder`, `UserRootFolder`) and its
+    /// locations are never roots, unless the location itself is what
+    /// changed.
+    ///
+    /// Roots under another root are dropped; a lookup the item store cannot
+    /// answer scans the changed paths themselves.
+    async fn changed_roots(
+        &self,
+        folders: &[VirtualFolderInfo],
+        changed: &[String],
+    ) -> Vec<String> {
+        let locations: Vec<&str> = folders
+            .iter()
+            .flat_map(|f| f.locations.iter())
+            .map(|l| match l.trim_end_matches('/') {
+                "" => "/",
+                l => l,
+            })
+            .collect();
+        // Each changed path with the path itself and the folders above it,
+        // nearest first, up to (not including) its library's location.
+        let mut chains: Vec<(&String, Vec<String>)> = Vec::with_capacity(changed.len());
+        let mut candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in changed.iter().filter(|p| seen.insert(p.as_str())) {
+            let location = locations
+                .iter()
+                .filter(|loc| path_is_under(path, loc))
+                .max_by_key(|loc| loc.len());
+            let mut chain = Vec::new();
+            if let Some(location) = location {
+                for at in Path::new(path.trim_end_matches('/')).ancestors() {
+                    let Some(at) = at.to_str() else { break };
+                    let normalized = match at.trim_end_matches('/') {
+                        "" => "/",
+                        at => at,
+                    };
+                    if normalized == *location || !path_is_under(at, location) {
+                        break;
+                    }
+                    chain.push(at.to_owned());
+                }
+            }
+            candidates.extend(chain.iter().cloned());
+            chains.push((path, chain));
+        }
+        let candidates: Vec<String> = candidates.into_iter().collect();
+        let stored = match self.persistence.items_at_paths(&candidates).await {
+            Ok(Some(rows)) => rows,
+            Ok(None) => return changed.to_vec(),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not look up the items changed paths belong to; scanning the paths themselves"
+                );
+                return changed.to_vec();
+            }
+        };
+        let items: std::collections::HashSet<&str> = stored
+            .iter()
+            .filter(|row| {
+                !matches!(
+                    item_type_lookup::kind_from_type_name(&row.item_type),
+                    Some(
+                        BaseItemKind::AggregateFolder
+                            | BaseItemKind::CollectionFolder
+                            | BaseItemKind::UserRootFolder
+                    )
+                )
+            })
+            .filter_map(|row| row.path.as_deref())
+            .collect();
+        let mut roots: Vec<String> = Vec::with_capacity(chains.len());
+        // The sidecars directly in a library location, by folder: each
+        // with the stems of the items it may belong to.
+        let mut sidecars: HashMap<&str, Vec<(&String, Vec<String>)>> = HashMap::new();
+        for (path, chain) in &chains {
+            let nearest = chain
+                .iter()
+                .find(|at| items.contains(at.as_str()) && self.file_system.path_exists(at));
+            let (root, via) = match nearest {
+                Some(item) => (item, "nearest existing item"),
+                None => match chain
+                    .iter()
+                    .find(|at| self.file_system.directory_exists(at))
+                {
+                    Some(folder) => (folder, "nearest existing folder"),
+                    None => (*path, "changed path"),
+                },
+            };
+            tracing::debug!(path = %path, root = %root, via, "changed path refreshes");
+            roots.push(root.clone());
+            // Nothing between it and the library, and it is no item and no
+            // folder: a sidecar (or a file the library does not resolve)
+            // beside the library's loose items.
+            if nearest.is_none()
+                && chain.len() == 1
+                && !items.contains(path.as_str())
+                && !self.file_system.directory_exists(path)
+                && let Some(dir) = Path::new(path.as_str()).parent().and_then(|d| d.to_str())
+            {
+                let stems = sidecar_stems(path);
+                if !stems.is_empty() {
+                    sidecars.entry(dir).or_default().push((path, stems));
+                }
+            }
+        }
+        roots.extend(self.sidecar_owners(&sidecars));
+        collapse_roots(roots)
+    }
+
+    /// The items the sidecars in `sidecars` belong to, for
+    /// [`changed_roots`](Self::changed_roots): per library folder, the
+    /// entries of its listing whose file stem is one of the sidecar's stems
+    /// ([`sidecar_stems`]), compared ignoring case as upstream's external
+    /// file matching does (`MediaInfoResolver.cs:259`). Upstream reaches
+    /// them by validating the whole library folder (`FileRefresher.cs:
+    /// 182-208` finds no item nearer); here only they are rooted, so the
+    /// library is never walked for a subtitle, an NFO or an image beside one
+    /// of its items — one listing of the folder, which the scan's plan lists
+    /// anyway.
+    fn sidecar_owners(&self, sidecars: &HashMap<&str, Vec<(&String, Vec<String>)>>) -> Vec<String> {
+        let mut owners = Vec::new();
+        for (dir, files) in sidecars {
+            let entries = match self.file_system.try_get_file_system_entries(dir) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::debug!(%err, path = %dir, "could not list the folder of changed sidecars");
+                    continue;
+                }
+            };
+            for (sidecar, stems) in files {
+                let stems: Vec<String> = stems.iter().map(|s| s.to_lowercase()).collect();
+                for entry in &entries {
+                    if entry.path == **sidecar {
+                        continue;
+                    }
+                    let stem = Path::new(&entry.path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_lowercase);
+                    if stem.is_some_and(|stem| stems.contains(&stem)) {
+                        tracing::debug!(
+                            path = %sidecar,
+                            root = %entry.path,
+                            via = "item the sidecar belongs to",
+                            "changed path refreshes"
+                        );
+                        owners.push(entry.path.clone());
+                    }
+                }
+            }
+        }
+        owners
     }
 
     /// The path-scoped half of [`scan_target`](Self::scan_target): plans the
     /// libraries holding `scope.roots` (or `also_path`, the extra item's own
     /// folder) and keeps the items at or under a root, the folders above
-    /// them, and the item at `also_path`.
+    /// them, and the item at `also_path`. `changed` is how many paths the
+    /// request named, for the log.
     async fn scan_scoped(
         &self,
         scope: PathScope<'_>,
         also_path: Option<&str>,
+        changed: usize,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
-        let changed = scope.roots;
+        let roots = scope.roots;
         let folders = self.virtual_folders.get_virtual_folders().await?;
-        let affected = affected_libraries(&folders, changed, also_path);
+        let affected = affected_libraries(&folders, roots, also_path);
         if affected.is_empty() {
             if scope.prune {
                 tracing::debug!(
-                    paths = changed.len(),
+                    paths = roots.len(),
                     "changed paths match no library; nothing to scan"
                 );
             } else {
                 tracing::warn!(
-                    paths = ?changed,
+                    paths = ?roots,
                     "item refresh: the item's path is under no library location; nothing refreshed"
                 );
             }
@@ -2996,18 +3420,19 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             return Ok(ScanOutcome::default());
         }
-        // Only the changed paths, the folders above them and the item at
+        // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
-        let plan = self.plan_in(&affected, &folders, PlanScope::paths(changed, also_path));
+        let plan = self.plan_in(&affected, &folders, PlanScope::paths(roots, also_path));
         tracing::info!(
-            changed = changed.len(),
+            changed,
+            roots = roots.len(),
             items = plan.items.len(),
             plan_ms = started.elapsed().as_millis(),
             "path-scoped scan planned"
         );
         if !scope.prune {
-            for root in changed {
+            for root in roots {
                 let root = root.trim_end_matches('/');
                 if !plan.items.iter().any(|p| {
                     p.entity.path.as_deref().map(|p| p.trim_end_matches('/')) == Some(root)
@@ -3019,6 +3444,11 @@ impl LibraryScanner {
                 }
             }
         }
+        let pathless = covered_pathless(&plan.items, scope);
+        let scope = PathScope {
+            pathless: Some(&pathless),
+            ..scope
+        };
         self.run_scan(&affected, &folders, plan, Some(scope), run)
             .await
     }
@@ -3060,7 +3490,8 @@ impl LibraryScanner {
     ) -> Result<ScanOutcome, ServiceError> {
         let PlanOutput {
             items: planned,
-            unlisted,
+            mut unlisted,
+            inaccessible,
         } = plan;
         if let Some(first) = unlisted.first() {
             tracing::warn!(
@@ -3068,6 +3499,18 @@ impl LibraryScanner {
                 first = %first,
                 "could not list some library directories; nothing under them is removed this scan"
             );
+        }
+        // A location that lists empty is a mount that is not there, not a
+        // library whose every file was deleted: nothing under it is removed.
+        for location in inaccessible {
+            tracing::warn!(
+                path = %location,
+                "library location is empty or cannot be listed; treating it as unavailable, \
+                 nothing under it is removed this scan"
+            );
+            if !unlisted.contains(&location) {
+                unlisted.push(location);
+            }
         }
         let options = run.options;
         if let Some(touched) = run.touched {
@@ -3190,7 +3633,29 @@ impl LibraryScanner {
             }
             let plan = stored_rows
                 .plan(scanned)
-                .unwrap_or_else(|| self.plan_item(&refresh, None, item, None));
+                .unwrap_or_else(|| self.plan_item(&refresh, None, !is_new, item, None));
+            // A folder a path-scoped scan carries for context only — one
+            // above the items it refreshes — is read, never refreshed or
+            // written: upstream's refresh of an item never touches the
+            // folders above it. The children planned here take its stored
+            // series key.
+            if refresh.context_only()
+                && refresh.is_context(item, !is_new)
+                && let Stored::Existing(row) = stored
+            {
+                if let (Some(BaseItemKind::Series), Some(key)) = (
+                    item_type_lookup::kind_from_type_name(&row.type_),
+                    row.presentation_unique_key.as_ref(),
+                ) {
+                    series_keys.insert(item.id, key.clone());
+                }
+                log_scoped_item(item, "context", false);
+                outcome.unchanged += 1;
+                if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
+                    self.publish_refresh_progress(cf, pct).await;
+                }
+                continue;
+            }
             // A locked item's metadata and cast are user-owned: no NFO or
             // remote provider runs for it (`RefreshWithProviders` returns on
             // `IsLocked`), and its people are left alone. The scan-upsert's
@@ -3202,7 +3667,7 @@ impl LibraryScanner {
             // An album or artist whose refresh the music pass completes
             // after the walk leaves it the triggers of that refresh.
             let music = MusicKind::of_planned(&item.entity);
-            let request = *refresh.request_for(item);
+            let request = *refresh.request_for(item, !is_new);
             let music_pending = music.is_some_and(|kind| {
                 music::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
@@ -3228,6 +3693,14 @@ impl LibraryScanner {
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
+            if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
+                let reason = if refresh.is_context(item, !is_new) {
+                    "context"
+                } else {
+                    plan.reason.as_str()
+                };
+                log_scoped_item(item, reason, matches!(saved, ItemSaved::Saved));
+            }
             if let (Some(kind), false) =
                 (music, undecodable || matches!(saved, ItemSaved::Cancelled))
             {
@@ -3332,8 +3805,7 @@ impl LibraryScanner {
         if scope.is_some_and(|scope| !scope.prune) {
             return Vec::new();
         }
-        self.prune_deleted(folders, planned, scope.map(|scope| scope.roots), unlisted)
-            .await
+        self.prune_deleted(folders, planned, scope, unlisted).await
     }
 
     /// Between two items: the item refreshes waiting in `run`'s lane run
@@ -3458,10 +3930,13 @@ impl LibraryScanner {
         }
     }
 
-    /// The closing passes of an item or folder refresh ([`ScanPasses::Touched`]):
-    /// the music refresh of the albums and artists it refreshed, the album
-    /// covers this pass gathered, and the children-derived columns of the
-    /// folders it planned — never a pass over the whole database.
+    /// The closing passes of an item or folder refresh, and of the library
+    /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
+    /// albums and artists it refreshed, the album covers this pass gathered,
+    /// and the children-derived columns of the folders it planned — never a
+    /// pass over the whole database. (The folders planned for context
+    /// included: see the accepted divergence at
+    /// [`update_folder_aggregates`](Self::update_folder_aggregates).)
     async fn touched_passes(
         &self,
         planned: &[Planned],
@@ -3594,7 +4069,9 @@ impl LibraryScanner {
         let stored_row = stored.row();
         // The options this item refreshes with (the scan's, or the defaults
         // for an ancestor a path-scoped scan carries along).
-        let request = *state.refresh.request_for(item);
+        let request = *state
+            .refresh
+            .request_for(item, !matches!(stored, Stored::New));
         let options = request.options;
         // Probe first so the item row is saved already carrying its duration and
         // size (the streams themselves are saved after, since they FK the row).
@@ -4073,6 +4550,7 @@ impl LibraryScanner {
             let mut plan = self.plan_item(
                 refresh,
                 window.get(item.id).row(),
+                !matches!(window.get(item.id), Stored::New),
                 item,
                 window.links(item.id),
             );
@@ -4726,7 +5204,7 @@ impl LibraryScanner {
             retired = stale.len(),
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
-        self.persistence.delete_items(&stale).await
+        self.persistence.delete_items(&stale).await.map(|_| ())
     }
 
     /// The children-derived columns of every folder this scan planned: the
@@ -4744,6 +5222,14 @@ impl LibraryScanner {
     /// is the one upstream would write at the folder's next full refresh,
     /// and it keeps an album's runtime right after a track is re-probed in
     /// place, which no folder refresh follows.
+    ///
+    /// ACCEPTED DIVERGENCE (flagged to the owner): on a library monitor's
+    /// scan ([`ScanTarget::Changed`]) the planned folders include the
+    /// context ones above the refreshed item, so Ferrofin keeps a series'
+    /// `DateLastMediaAdded` current on a watcher event — a new episode moves
+    /// its series' "date added" at once, that one column written — where
+    /// upstream updates it only on the series' own refresh
+    /// (`MetadataService.cs:404-411`), i.e. at the next library scan.
     async fn update_folder_aggregates(
         &self,
         planned: &[Planned],
@@ -5003,6 +5489,18 @@ impl LibraryScanner {
     /// by-name rows (genres, studios, artists, people) carry no `TopParentId`
     /// and are untouched. No-op without an item repository.
     ///
+    /// A path-scoped scan plans only its roots' subtrees, so only the rows
+    /// there may be stale: the rows at or under a root, and the path-less
+    /// ones (a virtual season) whose parent is one of those — read by path
+    /// and parent ([`items_in_scope`](ItemPersistenceService::items_in_scope)),
+    /// never every row of the library. A library scan reads the library's.
+    /// A virtual season is weighed like any row, so one whose series is
+    /// removed is removed — and counted and announced — with it, rather than
+    /// swept unannounced by the `ParentId` cascade. And no row goes while it
+    /// still holds one this scan keeps (the cascade guard,
+    /// [`hold_back_kept_children`]): a virtual season whose loose episodes
+    /// sit in a folder that failed to list stays, and so do they.
+    ///
     /// Safety: a library whose location is unreachable (unmounted network
     /// share, detached drive) walks as empty, which is indistinguishable from
     /// "everything was deleted" — such libraries are skipped with a warning
@@ -5018,7 +5516,7 @@ impl LibraryScanner {
         &self,
         folders: &[VirtualFolderInfo],
         planned: &[Planned],
-        scope: Option<&[String]>,
+        scope: Option<PathScope<'_>>,
         unlisted: &[String],
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
@@ -5034,13 +5532,6 @@ impl LibraryScanner {
             .iter()
             .filter_map(|p| p.entity.path.as_deref())
             .collect();
-        // A path-scoped scan plans only the items under its changed paths, so
-        // rows elsewhere in the library are absent from `planned` without being
-        // deleted — only rows at/under a changed path may be considered stale.
-        let in_scope = |row_path: Option<&str>| match scope {
-            None => true,
-            Some(paths) => row_path.is_some_and(|rp| paths.iter().any(|c| path_is_under(rp, c))),
-        };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -5073,47 +5564,34 @@ impl LibraryScanner {
                 );
                 continue;
             }
-            let existing = match items
-                .get_item_list(&InternalItemsQuery {
-                    top_parent_ids: vec![cf],
-                    recursive: true,
-                    ..Default::default()
-                })
+            let Some(existing) = self
+                .prune_candidates(items.as_ref(), cf, scope.map(|s| s.roots))
                 .await
-            {
-                Ok(rows) => rows,
-                Err(err) => {
-                    tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
-                    continue;
-                }
+            else {
+                continue;
             };
-            let mut kept_on_disk = 0_usize;
-            let stale: Vec<Uuid> = existing
-                .iter()
-                .filter(|row| in_scope(row.path.as_deref()) && listed(row.path.as_deref()))
-                .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
-                .filter(|(id, _)| !live.contains(id))
-                .filter(|(_, row)| {
-                    let keep = self.still_on_disk(row, &planned_paths);
-                    kept_on_disk += usize::from(keep);
-                    !keep
-                })
-                .map(|(id, _)| id)
-                .collect();
-            if kept_on_disk > 0 {
-                tracing::warn!(
-                    library = %cf,
-                    kept = kept_on_disk,
-                    "kept items no listing planned whose files are still on disk"
-                );
-            }
-            if stale.is_empty() {
+            let Some((ids, paths)) = self
+                .stale_rows(cf, &existing, &live, &planned_paths, &listed)
+                .await
+            else {
+                continue;
+            };
+            if ids.is_empty() {
                 continue;
             }
-            match self.persistence.delete_items(&stale).await {
-                Ok(()) => {
-                    tracing::info!(library = %cf, removed = stale.len(), "pruned items deleted from disk");
-                    removed.push((cf, stale));
+            // Exactly what went: the rows and everything the delete took
+            // with them (the extras `delete_items` removes with an owner).
+            match self.persistence.delete_items(&ids).await {
+                Ok(deleted) => {
+                    if scope.is_some() {
+                        let gone: Vec<(Uuid, Option<String>)> = deleted
+                            .iter()
+                            .map(|id| (*id, paths.get(id).cloned().flatten()))
+                            .collect();
+                        log_pruned(&gone);
+                    }
+                    tracing::info!(library = %cf, removed = deleted.len(), "pruned items deleted from disk");
+                    removed.push((cf, deleted));
                 }
                 Err(err) => {
                     tracing::warn!(%err, library = %cf, "failed to prune deleted items");
@@ -5121,6 +5599,179 @@ impl LibraryScanner {
             }
         }
         removed
+    }
+
+    /// Which of library `cf`'s candidate rows `existing` the pruning
+    /// deletes: those whose file is gone — not planned (`live`), known
+    /// (`listed`: not under a folder that failed to list, and a path-less
+    /// one only where its parent's folder is), and not still on disk — less
+    /// the ones still holding a row this scan keeps
+    /// ([`hold_back_kept_children`]). Returns the ids to delete and the paths
+    /// of the rows read, for the report; `None` when the rows under them
+    /// could not be read, when nothing is pruned.
+    async fn stale_rows(
+        &self,
+        cf: Uuid,
+        existing: &[ItemPathRow],
+        live: &std::collections::HashSet<Uuid>,
+        planned_paths: &std::collections::HashSet<&str>,
+        listed: &(dyn Fn(Option<&str>) -> bool + Sync),
+    ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
+        // A path-less row sits in its parent's folder: it is known only
+        // where that folder is — a parent that is unknown or has no path of
+        // its own leaves it unknown. And only a virtual season, which this
+        // scan plans, may be found gone: upstream's validation removes only
+        // a child that is `IsFileProtocol` (`Folder.cs:569`), so an adopted
+        // Jellyfin missing episode (no path) is never removed by a scan.
+        let paths: HashMap<Uuid, Option<&str>> = existing
+            .iter()
+            .map(|row| (row.id, row.path.as_deref()))
+            .collect();
+        let row_listed = |row: &ItemPathRow| match row.path.as_deref() {
+            Some(path) => listed(Some(path)),
+            None => {
+                item_type_lookup::kind_from_type_name(&row.item_type) == Some(BaseItemKind::Season)
+                    && row
+                        .parent_id
+                        .and_then(|parent| paths.get(&parent).copied().flatten())
+                        .is_some_and(|parent| listed(Some(parent)))
+            }
+        };
+        let mut kept_on_disk = 0_usize;
+        let mut stale: std::collections::HashSet<Uuid> = existing
+            .iter()
+            .filter(|row| row_listed(row) && !live.contains(&row.id))
+            .filter(|row| {
+                let keep = self.still_on_disk(&row.item_type, row.path.as_deref(), planned_paths);
+                kept_on_disk += usize::from(keep);
+                !keep
+            })
+            .map(|row| row.id)
+            .collect();
+        if kept_on_disk > 0 {
+            tracing::warn!(
+                library = %cf,
+                kept = kept_on_disk,
+                "kept items no listing planned whose files are still on disk"
+            );
+        }
+        if stale.is_empty() {
+            return Some((Vec::new(), HashMap::new()));
+        }
+        // What the deletes would take with them: never a row this scan keeps.
+        let ids: Vec<Uuid> = stale.iter().copied().collect();
+        let children = match self.persistence.child_links(&ids).await {
+            Ok(Some(children)) => children,
+            Ok(None) => {
+                tracing::debug!(
+                    library = %cf,
+                    "the item store cannot say what a prune would cascade to; nothing pruned"
+                );
+                return None;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    library = %cf,
+                    "failed to read what the prune would cascade to; nothing pruned"
+                );
+                return None;
+            }
+        };
+        let held = hold_back_kept_children(&mut stale, &children, live, listed);
+        if held > 0 {
+            tracing::warn!(
+                library = %cf,
+                held,
+                "kept items no listing planned that still hold items this scan keeps"
+            );
+        }
+        let ids: Vec<Uuid> = existing
+            .iter()
+            .map(|row| row.id)
+            .filter(|id| stale.contains(id))
+            .collect();
+        let mut paths: HashMap<Uuid, Option<String>> = existing
+            .iter()
+            .map(|row| (row.id, row.path.clone()))
+            .collect();
+        for child in &children {
+            paths.entry(child.id).or_insert_with(|| child.path.clone());
+        }
+        Some((ids, paths))
+    }
+
+    /// The stored rows of library `cf` the pruning weighs: those at or under
+    /// `roots` and their path-less children on a path-scoped scan (`roots`
+    /// given), every row of the library on a library scan. `None` when they
+    /// could not be read (logged): nothing of the library is pruned then.
+    async fn prune_candidates(
+        &self,
+        items: &dyn ItemRepository,
+        cf: Uuid,
+        roots: Option<&[String]>,
+    ) -> Option<Vec<ItemPathRow>> {
+        if let Some(roots) = roots {
+            match self.persistence.items_in_scope(cf, roots).await {
+                Ok(Some(rows)) => return Some(rows),
+                // A store that cannot answer: the library's rows, filtered
+                // to the scope below.
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
+                    return None;
+                }
+            }
+        }
+        let rows = match items
+            .get_item_list(&InternalItemsQuery {
+                top_parent_ids: vec![cf],
+                recursive: true,
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
+                return None;
+            }
+        };
+        let under = |path: Option<&str>| {
+            roots.is_none_or(|roots| {
+                path.is_some_and(|path| roots.iter().any(|root| path_is_under(path, root)))
+            })
+        };
+        let parents: std::collections::HashSet<&str> = rows
+            .iter()
+            .filter(|row| row.path.is_some() && under(row.path.as_deref()))
+            .map(|row| row.id.as_str())
+            .collect();
+        let in_scope = |row: &BaseItemEntity| match row.path.as_deref() {
+            Some(path) => under(Some(path)),
+            None => {
+                roots.is_none()
+                    || (item_type_lookup::kind_from_type_name(&row.type_)
+                        == Some(BaseItemKind::Season)
+                        && row
+                            .parent_id
+                            .as_deref()
+                            .is_some_and(|parent| parents.contains(parent)))
+            }
+        };
+        let kept: Vec<ItemPathRow> = rows
+            .iter()
+            .filter(|row| in_scope(row))
+            .filter_map(|row| {
+                Some(ItemPathRow {
+                    id: Uuid::parse_str(&row.id).ok()?,
+                    item_type: row.type_.clone(),
+                    path: row.path.clone(),
+                    parent_id: row.parent_id.as_deref().and_then(parse_id),
+                })
+            })
+            .collect();
+        Some(kept)
     }
 
     /// The backstop behind the pruning: a stale row of a kind the planner
@@ -5131,11 +5782,12 @@ impl LibraryScanner {
     /// with it.
     fn still_on_disk(
         &self,
-        row: &BaseItemEntity,
+        item_type: &str,
+        path: Option<&str>,
         planned_paths: &std::collections::HashSet<&str>,
     ) -> bool {
         let planner_kind = matches!(
-            item_type_lookup::kind_from_type_name(&row.type_),
+            item_type_lookup::kind_from_type_name(item_type),
             Some(
                 BaseItemKind::Movie
                     | BaseItemKind::Trailer
@@ -5154,7 +5806,7 @@ impl LibraryScanner {
             )
         );
         planner_kind
-            && row.path.as_deref().is_some_and(|path| {
+            && path.is_some_and(|path| {
                 !planned_paths.contains(path) && self.file_system.path_exists(path)
             })
     }
@@ -5230,6 +5882,7 @@ impl LibraryScanner {
         &self,
         refresh: &RefreshContext<'_>,
         stored: Option<&BaseItemEntity>,
+        exists: bool,
         item: &Planned,
         links: Option<&StoredItemLinks>,
     ) -> ItemRefreshPlan {
@@ -5248,7 +5901,7 @@ impl LibraryScanner {
         crate::refresh_plan::plan_item_refresh(
             state.as_ref(),
             &facts,
-            refresh.request_for(item),
+            refresh.request_for(item, exists),
             policy.options,
             refresh.now,
             backfill,
@@ -7743,7 +8396,7 @@ impl LibraryScanner {
         scope: PlanScope<'_>,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
-        let ctx = PlanCtx::new(&naming, scope);
+        let ctx = PlanCtx::new(&naming, scope).with_locations(plan_folders);
         let folders = key_folders;
         let mut out = Vec::new();
         for folder in plan_folders {
@@ -7794,16 +8447,23 @@ impl LibraryScanner {
         PlanOutput {
             items: out,
             unlisted: ctx.unlisted.into_inner(),
+            inaccessible: ctx.inaccessible.into_inner(),
         }
     }
 
     /// `dir`'s entries; a directory that fails to list is recorded as
-    /// unknown (see [`PlanOutput::unlisted`]) and resolves as empty.
+    /// unknown (see [`PlanOutput::unlisted`]) and resolves as empty, and a
+    /// library location that lists empty as inaccessible
+    /// ([`PlanOutput::inaccessible`]).
     fn list(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
         match self.file_system.try_get_file_system_entries(dir) {
-            Ok(entries) => entries,
+            Ok(entries) => {
+                ctx.listed_location(dir, entries.is_empty());
+                entries
+            }
             Err(err) => {
                 ctx.failed_to_list(dir, &err);
+                ctx.listed_location(dir, true);
                 Vec::new()
             }
         }
@@ -8328,8 +8988,9 @@ impl LibraryScanner {
             }
         }
         // A scoped plan groups only its own loose episodes: each one's virtual
-        // season follows from its own season number, and the virtual seasons
-        // themselves have no path, so a scoped plan keeps none of them.
+        // season follows from its own season number, so the scoped plan
+        // emits exactly the virtual seasons of the episodes it keeps, as the
+        // full plan does for them (same id, row and ancestors).
         self.plan_loose_episodes(
             &loose,
             cf,
@@ -16129,6 +16790,7 @@ mod tests {
             roots: &roots,
             roots_refreshed: false,
             also: Some(artist),
+            pathless: None,
         };
         let at = |id: u128, path: &str| super::Planned {
             id: uuid::Uuid::from_u128(id),
@@ -16175,12 +16837,7 @@ mod tests {
                 options: &defaults,
                 force_save: false,
             },
-            scope: Some(super::PathScope {
-                prune: true,
-                roots: &roots,
-                roots_refreshed: true,
-                also: None,
-            }),
+            scope: Some(super::PathScope::of(&roots, true)),
             now: chrono::Utc::now(),
             policies: &std::collections::HashMap::new(),
             outside: super::FetcherPolicy::default(),
@@ -16197,17 +16854,30 @@ mod tests {
             },
             ancestors: Vec::new(),
         };
-        assert!(refresh.request_for(&at("/tv/Show/Season 01")).force_save);
         assert!(
             refresh
-                .request_for(&at("/tv/Show/Season 01/Show S01E01.mkv"))
+                .request_for(&at("/tv/Show/Season 01"), true)
                 .force_save
         );
         assert!(
-            !refresh.request_for(&at("/tv/Show")).force_save,
+            refresh
+                .request_for(&at("/tv/Show/Season 01/Show S01E01.mkv"), true)
+                .force_save
+        );
+        assert!(
+            !refresh.request_for(&at("/tv/Show"), true).force_save,
             "the series is context"
         );
-        assert!(!refresh.request_for(&at("/tv/Show/Season 010")).force_save);
+        assert!(
+            !refresh
+                .request_for(&at("/tv/Show/Season 010"), true)
+                .force_save
+        );
+        assert!(
+            refresh.request_for(&at("/tv/Show"), false).force_save,
+            "a folder above the roots that is not stored yet is created with the scan's options"
+        );
+        assert!(!refresh.context_only(), "the defaults refresh the context");
     }
 
     /// Phase 3L: a rescan whose providers run (Default mode's
@@ -20478,8 +21148,9 @@ mod tests {
     }
 
     // A file landing in a brand-new season folder brings its ancestor
-    // hierarchy (series + season rows) with it, while sibling seasons and
-    // episodes stay untouched by the plan.
+    // hierarchy (series + season rows) with it. The series is the nearest
+    // existing item, so its subtree is validated: its other season and
+    // episode are planned and judged, but not written.
     #[tokio::test]
     async fn scan_paths_creates_the_new_hierarchy_around_a_changed_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -20529,9 +21200,12 @@ mod tests {
             super::ScanOutcome {
                 created: 2,
                 updated: 1,
+                unchanged: 2,
                 ..Default::default()
             },
-            "the new episode and season are created; the existing series ancestor is re-saved"
+            "the new episode and season are created; the series — the nearest existing item, \
+             whose folder changed — refreshes, and its other season and episode are validated \
+             unchanged"
         );
         assert_eq!(count_type_like(&db, "%TV.Episode").await, 2);
         assert_eq!(count_type_like(&db, "%TV.Season").await, 2);
@@ -20552,6 +21226,90 @@ mod tests {
         assert_eq!(count_type_like(&db, "%TV.Series").await, 2);
         let outcome = scanner.scan_all().await.unwrap();
         assert_eq!((outcome.created, outcome.updated), (0, 0), "{outcome:?}");
+    }
+
+    /// The cascade guard, to its fixed point: a kept episode holds its
+    /// stale virtual season and that season's stale series; a stale chain
+    /// with nothing kept under it goes whole; an extra holds its owner only
+    /// while it is unknown itself.
+    #[test]
+    fn the_prune_holds_back_every_row_above_a_kept_one() {
+        use ferrofin_traits::persistence::ItemChildLink;
+        let id = uuid::Uuid::from_u128;
+        let link = |n: u128, parent: Option<u128>, owner: Option<u128>, path: &str| ItemChildLink {
+            id: id(n),
+            parent_id: parent.map(id),
+            owner_id: owner.map(id),
+            path: (!path.is_empty()).then(|| path.to_owned()),
+        };
+        let listed = |path: Option<&str>| path.is_none_or(|p| !p.starts_with("/unlisted"));
+        // Series 1 → virtual season 2 → episode 3 (kept); series 4 →
+        // virtual season 5 → episode 6 (stale); movie 7 with a stale extra
+        // 8, movie 9 with a kept extra 10 on disk, movie 11 with an extra 12
+        // under a folder that did not list.
+        let children = vec![
+            link(2, Some(1), None, ""),
+            link(3, Some(2), None, "/tv/Flat/Batch2/e.mkv"),
+            link(5, Some(4), None, ""),
+            link(6, Some(5), None, "/tv/Gone/e.mkv"),
+            link(8, None, Some(7), "/movies/A/trailers/t.mkv"),
+            link(10, None, Some(9), "/movies/B/trailers/t.mkv"),
+            link(12, None, Some(11), "/unlisted/C/trailers/t.mkv"),
+        ];
+        let mut stale: std::collections::HashSet<uuid::Uuid> =
+            [1, 2, 4, 5, 6, 7, 8, 9, 11].into_iter().map(id).collect();
+        // Extra 14 of movie 13 is planned: it holds its owner.
+        let children = [
+            children,
+            vec![link(14, None, Some(13), "/movies/D/trailers/t.mkv")],
+        ]
+        .concat();
+        stale.insert(id(13));
+        let live: std::collections::HashSet<uuid::Uuid> = [id(14)].into_iter().collect();
+        let held = super::hold_back_kept_children(&mut stale, &children, &live, listed);
+        let mut left: Vec<u128> = stale.iter().map(uuid::Uuid::as_u128).collect();
+        left.sort_unstable();
+        assert_eq!(left, vec![4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            held, 4,
+            "the season and series above the kept episode, movies 11 and 13"
+        );
+    }
+
+    /// The stems a sidecar may belong to: cut at each separator, and whole.
+    #[test]
+    fn a_sidecars_stems_are_its_name_cut_at_each_separator() {
+        let stems = |path: &str| super::sidecar_stems(path);
+        assert_eq!(
+            stems("/movies/Heat (1995).eng.srt"),
+            ["Heat (1995)", "Heat (1995).eng"]
+        );
+        assert_eq!(stems("/movies/Heat (1995).nfo"), ["Heat (1995)"]);
+        assert_eq!(
+            stems("/movies/Heat (1995)-poster.jpg"),
+            ["Heat (1995)", "Heat (1995)-poster"]
+        );
+        assert_eq!(
+            stems("/music/01_Song.lrc"),
+            ["01", "01_Song"],
+            "an underscore separates too"
+        );
+        assert_eq!(
+            stems("/movies/S.W.A.T. (2017).en.srt"),
+            [
+                "S",
+                "S.W",
+                "S.W.A",
+                "S.W.A.T",
+                "S.W.A.T. (2017)",
+                "S.W.A.T. (2017).en"
+            ]
+        );
+        assert!(
+            !stems("/movies/Heat 2 (2027).nfo").contains(&"Heat".to_owned()),
+            "a space is no separator: another title"
+        );
+        assert!(stems("/").is_empty());
     }
 
     #[test]

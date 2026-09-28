@@ -165,6 +165,51 @@ impl ScanRequest {
         }
     }
 
+    /// The library monitor's settled change batch — the disk watcher and
+    /// the *arr webhooks: `FileRefresher`'s `ChangedExternally` refresh
+    /// (`FileRefresher.cs:135-208`, `BaseItem.cs:2275-2278`), the default
+    /// options for the item each changed path refreshes, nothing for the
+    /// folders above it (a refresh never touches them), and no post-scan
+    /// task (`ProviderManager.RefreshItem` runs none).
+    fn changed(paths: Vec<String>) -> Self {
+        Self {
+            scope: ScanTarget::Changed(paths),
+            options: MetadataRefreshOptions::default(),
+            ancestors: MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::None,
+                image_refresh_mode: MetadataRefreshMode::None,
+                ..MetadataRefreshOptions::default()
+            },
+            trigger: "watcher",
+            passes: ScanPasses::Touched,
+            priority: false,
+        }
+    }
+
+    /// Whether this queued request does everything `other` asks for, so
+    /// `other` may join it: the same options (a replace never widens, a
+    /// default never swallows one) in the same lane, over a scope that
+    /// covers `other`'s — a full scan any, a library or artist scan an
+    /// identical one — with closing passes that include `other`'s (the
+    /// library's include the touched items'). A scan narrower than a
+    /// library must also treat the folders it carries for context alike; a
+    /// library's validation refreshes every item with its options, so a
+    /// full scan covers a path-scoped request's context folders too.
+    fn covers(&self, other: &Self) -> bool {
+        let scope = match (&self.scope, &other.scope) {
+            (ScanTarget::All, _) => true,
+            (ScanTarget::Library(queued), ScanTarget::Library(new)) => queued == new,
+            (queued @ ScanTarget::Artist { .. }, new @ ScanTarget::Artist { .. }) => queued == new,
+            _ => false,
+        };
+        let whole_libraries = matches!(self.scope, ScanTarget::All | ScanTarget::Library(_));
+        scope
+            && self.options == other.options
+            && self.priority == other.priority
+            && (self.passes == other.passes || self.passes == ScanPasses::Library)
+            && (whole_libraries || self.ancestors == other.ancestors)
+    }
+
     /// Whether two requests refresh alike, so that one may cover the other.
     fn refreshes_like(&self, other: &Self) -> bool {
         self.options == other.options
@@ -295,23 +340,29 @@ impl std::fmt::Debug for ScanQueue {
 impl ScanQueue {
     /// Queues `request` and returns the ticket its caller waits on (`None`
     /// for a request nobody waits for). A request coalesces only with a
-    /// queued one that refreshes alike ([`ScanRequest::refreshes_like`]),
-    /// so no request ever runs with another's options — a "Replace all
-    /// metadata" on one library never widens to every library, and a
-    /// default scan never swallows it:
+    /// queued one that does everything it asks ([`ScanRequest::covers`]),
+    /// or that refreshes alike ([`ScanRequest::refreshes_like`]) when their
+    /// paths union, so no request ever runs with another's options — a
+    /// "Replace all metadata" on one library never widens to every library,
+    /// and a default scan never swallows it:
     ///
-    /// - a full scan covers a queued library, path or artist scan: it takes
-    ///   the place of the earliest one and the waiters of all of them;
-    /// - a library, path or artist scan joins a queued full scan (which will
-    ///   see its files), and a library or artist scan an identical queued
-    ///   one;
-    /// - path scans union their paths;
+    /// - a full scan covers a queued library, path, changed-path or artist
+    ///   scan: it takes the place of the earliest one and the waiters of all
+    ///   of them;
+    /// - a library, path, changed-path or artist scan joins a queued full
+    ///   scan (which will see its files), and a library or artist scan an
+    ///   identical queued one;
+    /// - folder path scans union their paths, and so do the library
+    ///   monitor's changed-path scans — never with each other;
     /// - a library scan never becomes a full one, and path scans never join
-    ///   a library scan.
+    ///   a library scan: a watcher or webhook report queued behind a
+    ///   library scan runs after it, scoped (by then its item is current,
+    ///   so it is nearly free).
     ///
     /// Everything else queues after what is already there. The running scan
     /// is never joined: it may already be past the files a new request is
-    /// about.
+    /// about, so a report that arrives while a scan runs queues a scoped
+    /// rerun behind it.
     fn enqueue(&mut self, request: ScanRequest, waiting: bool) -> Option<u64> {
         let ticket = waiting.then(|| {
             let ticket = self.next_ticket;
@@ -332,17 +383,7 @@ impl ScanQueue {
         }
         // A queued scan that already covers this request: a full scan covers
         // anything, a library or artist scan an identical one.
-        let covers = |queued: &ScanTarget| match (queued, &request.scope) {
-            (ScanTarget::All, _) => true,
-            (ScanTarget::Library(queued), ScanTarget::Library(new)) => queued == new,
-            (queued @ ScanTarget::Artist { .. }, new @ ScanTarget::Artist { .. }) => queued == new,
-            _ => false,
-        };
-        if let Some(pending) = self
-            .pending
-            .iter_mut()
-            .find(|p| p.request.refreshes_like(&request) && covers(&p.request.scope))
-        {
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.request.covers(&request)) {
             pending.waiters.add(ticket);
             return ticket;
         }
@@ -355,7 +396,7 @@ impl ScanQueue {
                 let mut at = None;
                 let mut kept = VecDeque::with_capacity(self.pending.len() + 1);
                 for pending in self.pending.drain(..) {
-                    if pending.request.refreshes_like(&request) {
+                    if request.covers(&pending.request) {
                         at.get_or_insert(kept.len());
                         waiters.absorb(pending.waiters);
                     } else {
@@ -366,14 +407,22 @@ impl ScanQueue {
                 kept.insert(at, PendingScan { request, waiters });
                 self.pending = kept;
             }
-            ScanTarget::Paths(ref paths) => {
-                if let Some(pending) = self.pending.iter_mut().find(|p| {
-                    p.request.refreshes_like(&request)
-                        && matches!(p.request.scope, ScanTarget::Paths(_))
-                }) {
-                    if let ScanTarget::Paths(queued) = &mut pending.request.scope {
+            ScanTarget::Paths(ref paths) | ScanTarget::Changed(ref paths) => {
+                let same_kind = |queued: &ScanTarget| {
+                    std::mem::discriminant(queued) == std::mem::discriminant(&request.scope)
+                };
+                if let Some(pending) = self
+                    .pending
+                    .iter_mut()
+                    .find(|p| p.request.refreshes_like(&request) && same_kind(&p.request.scope))
+                {
+                    if let ScanTarget::Paths(queued) | ScanTarget::Changed(queued) =
+                        &mut pending.request.scope
+                    {
+                        let mut known: std::collections::HashSet<String> =
+                            queued.iter().cloned().collect();
                         for path in paths {
-                            if !queued.contains(path) {
+                            if known.insert(path.clone()) {
                                 queued.push(path.clone());
                             }
                         }
@@ -512,6 +561,7 @@ fn scope_label(scope: &ScanTarget) -> &'static str {
         ScanTarget::All => "all",
         ScanTarget::Library(_) => "library",
         ScanTarget::Paths(_) => "paths",
+        ScanTarget::Changed(_) => "changed",
         ScanTarget::Items(_) => "items",
         ScanTarget::Artist { .. } => "artist",
     }
@@ -1082,17 +1132,11 @@ impl FerrofinLibraryManager {
 
 #[async_trait]
 impl crate::library_monitor::LibraryScanTrigger for FerrofinLibraryManager {
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        // Reached via the filesystem watcher / Radarr-Sonarr webhooks: the
-        // `ChangedExternally` refresh, with the default options
-        // (`FileRefresher.cs:135-208`).
-        self.spawn_scan(ScanRequest::defaults("watcher", ScanTarget::All));
-        Ok(())
-    }
-
     async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
-        // The monitor's settled change batch: ingest just the touched paths.
-        self.spawn_scan(ScanRequest::defaults("watcher", ScanTarget::Paths(paths)));
+        // The monitor's settled change batch (the watcher, the Radarr/Sonarr
+        // webhooks): each path's `ChangedExternally` refresh, scoped to the
+        // item it refreshes (`FileRefresher.cs:135-208`).
+        self.spawn_scan(ScanRequest::changed(paths));
         Ok(())
     }
 }
@@ -3089,6 +3133,98 @@ mod tests {
         );
     }
 
+    fn changed(list: &[&str]) -> ScanTarget {
+        ScanTarget::Changed(list.iter().map(|p| (*p).to_owned()).collect())
+    }
+
+    /// The library monitor's request (the watcher, the *arr webhooks):
+    /// `ChangedExternally`'s default refresh of what the paths belong to,
+    /// nothing for the folders above it, and only the touched items'
+    /// closing passes — never a full scan.
+    #[test]
+    fn a_watcher_report_is_a_changed_path_scan_of_the_default_options() {
+        let request = ScanRequest::changed(vec!["/m/a.mkv".to_owned()]);
+        assert_eq!(request.scope, changed(&["/m/a.mkv"]));
+        assert_eq!(request.options, MetadataRefreshOptions::default());
+        assert_eq!(request.ancestors, none_none());
+        assert_eq!(request.passes, ScanPasses::Touched);
+        assert_eq!(request.trigger, "watcher");
+        assert!(!request.priority);
+    }
+
+    /// A watcher report never escalates: beside a queued library scan it
+    /// queues on its own (no full scan appears), reports union among
+    /// themselves only, and a folder refresh's path scan never joins them.
+    #[test]
+    fn changed_path_scans_union_and_never_turn_a_library_scan_into_a_full_one() {
+        let mut queue = ScanQueue::default();
+        let lib = ScanTarget::Library(Uuid::from_u128(1));
+        queue.enqueue(
+            request(lib.clone(), MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(ScanRequest::changed(vec!["/m/a".to_owned()]), false);
+        queue.enqueue(
+            ScanRequest::folder_refresh(paths(&["/m/f"]), MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/b".to_owned(), "/m/a".to_owned()]),
+            false,
+        );
+        // A library scan arriving after the report does not swallow it either.
+        let other = ScanTarget::Library(Uuid::from_u128(2));
+        queue.enqueue(
+            request(other.clone(), MetadataRefreshOptions::default()),
+            false,
+        );
+        assert_eq!(
+            scopes(&queue),
+            vec![
+                (lib, true),
+                (changed(&["/m/a", "/m/b"]), true),
+                (paths(&["/m/f"]), true),
+                (other, true),
+            ]
+        );
+        assert_eq!(queue.pending[1].waiters.detached, 2);
+        assert!(
+            queue
+                .pending
+                .iter()
+                .all(|p| p.request.scope != ScanTarget::All),
+            "no request escalated into a full scan"
+        );
+    }
+
+    /// A report that arrives while a full scan is still queued joins it (the
+    /// full scan will see the file); a full scan queued after reports takes
+    /// them over. A full scan of other options covers neither.
+    #[test]
+    fn a_queued_full_scan_covers_changed_path_scans() {
+        let mut queue = ScanQueue::default();
+        queue.enqueue(ScanRequest::changed(vec!["/m/a".to_owned()]), false);
+        queue.enqueue(request(ScanTarget::All, replace_all()), false);
+        let full = queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            true,
+        );
+        assert_eq!(
+            scopes(&queue),
+            vec![(ScanTarget::All, true), (ScanTarget::All, false)],
+            "the default full scan took the report's place"
+        );
+        let late = queue.enqueue(ScanRequest::changed(vec!["/m/z".to_owned()]), false);
+        assert_eq!(late, None);
+        assert_eq!(
+            queue.pending.len(),
+            2,
+            "the late report joined the full scan"
+        );
+        assert_eq!(queue.pending[0].waiters.tickets, vec![full.unwrap()]);
+        assert_eq!(queue.pending[0].waiters.detached, 2);
+    }
+
     #[test]
     fn a_withdrawn_request_leaves_the_queue_unless_someone_else_wants_it() {
         let mut queue = ScanQueue::default();
@@ -3252,6 +3388,37 @@ mod tests {
             count(BaseItemKind::Movie).await,
             0,
             "the movie library must not be scanned"
+        );
+    }
+
+    /// `LibraryScanTrigger::queue_scan_paths` has no full-scan default any
+    /// more; the manager's queues the reported paths as a changed-path scan.
+    /// A report that arrives while a full scan RUNS is not folded into it
+    /// (the scan may be past its files): it queues and runs, scoped, after.
+    #[tokio::test]
+    async fn a_report_during_a_running_full_scan_runs_after_it_scoped() {
+        use crate::library_monitor::LibraryScanTrigger;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let waiter = spawn_scheduled(&mgr);
+        runner.started(1).await;
+        mgr.queue_scan_paths(vec!["/media/tv/Show/Season 1/e.mkv".to_owned()])
+            .await
+            .expect("queued");
+        until_queued(&mgr, 1, 0).await;
+        runner.release(2 * GatedRunner::ITEMS);
+        waiter.await.expect("joined");
+        until_idle(&mgr).await;
+        assert_eq!(
+            runner.runs(),
+            vec![
+                default_run(ScanTarget::All),
+                Run {
+                    ancestors: none_none(),
+                    ..default_run(changed(&["/media/tv/Show/Season 1/e.mkv"]))
+                },
+            ]
         );
     }
 

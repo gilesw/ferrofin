@@ -25,7 +25,8 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{
-    FolderAggregate, ItemPersistenceService, StoredImageMetadata, StoredItemLinks,
+    FolderAggregate, ItemChildLink, ItemPathRow, ItemPersistenceService, StoredImageMetadata,
+    StoredItemLinks,
 };
 use std::collections::HashMap;
 
@@ -1385,69 +1386,116 @@ pub(crate) fn scan_save_changes_row(saved: &BaseItemEntity, stored: &BaseItemEnt
 
 #[async_trait]
 impl ItemPersistenceService for FerrofinItemPersistenceService {
-    async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
-        let mut touched_parents: Vec<Uuid> = Vec::new();
-        for id in ids {
-            let id_db = guid_to_db(*id);
-            if id_db == PLACEHOLDER_ID {
-                // Never delete the UserData placeholder row.
-                continue;
-            }
-            // Containers whose membership shrinks need their Data JSON
-            // re-synced after the delete (captured before the edges go).
-            let parents: Vec<String> = sqlx::query_scalar(
-                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" = ?1"#,
-            )
-            .bind(&id_db)
-            .fetch_all(self.db.pool())
+    async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        // Upstream's `ItemPersistenceService.DeleteItem`
+        // (`ItemPersistenceService.cs:51-157`): the whole closure — the
+        // items, their `ParentId` descendants and the extras they own
+        // (`OwnerId`), to a fixed point — in one transaction.
+        let given: Vec<String> = ids
+            .iter()
+            .map(|id| guid_to_db(*id))
+            .filter(|id| id != PLACEHOLDER_ID)
+            .collect();
+        if given.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
+        // `OwnerId`, and `LinkedChildren` (the item as a playlist or
+        // collection and as a member). The closure holds every row either
+        // points at, and the links are cleared below, so nothing dangles at
+        // commit; deferring the checks to it lets the rows go in any order.
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-            touched_parents.extend(parents.iter().filter_map(|p| Uuid::parse_str(p).ok()));
-            // Two BaseItems FKs have no `ON DELETE CASCADE`: `LinkedChildren`
-            // (references the item as both parent and child) and, since 12.0,
-            // `OwnerId` (an extra's owner). Upstream deletes an item's extras
-            // with it (`LibraryManager.DeleteItem` includes `GetExtras()`), so
-            // the owned rows go first — their own child rows cascade — then
-            // the links, then the item; otherwise a FOREIGN KEY constraint
-            // (787) trips.
-            let extras: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "OwnerId" = ?1"#)
-                    .bind(&id_db)
-                    .fetch_all(self.db.pool())
-                    .await
-                    .map_err(db_err)?;
-            for extra in &extras {
-                sqlx::query(
-                    r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#,
-                )
-                .bind(extra)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-                sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(extra)
-                    .execute(self.db.writer())
-                    .await
-                    .map_err(db_err)?;
+        let mut closure: Vec<String> = Vec::new();
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chunk in given.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = format!(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({})"#,
+                numbered_placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&sql);
+            for id in chunk {
+                query = query.bind(id);
             }
-            sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1 OR "ChildId" = ?1"#)
-                .bind(&id_db)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-            sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&id_db)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
+            for id in query.fetch_all(&mut *tx).await.map_err(db_err)? {
+                if known.insert(id.clone()) {
+                    closure.push(id);
+                }
+            }
         }
-        touched_parents.sort_unstable();
-        touched_parents.dedup();
-        for parent in touched_parents {
-            // Deleted containers no-op inside (their row is gone).
-            crate::item_data::sync_container_data(&self.db, parent).await?;
+        let mut frontier = closure.clone();
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for chunk in frontier.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+                let sql = child_links_sql(chunk.len());
+                let mut query = sqlx::query_as::<
+                    _,
+                    (String, Option<String>, Option<String>, Option<String>),
+                >(&sql);
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                for (id, ..) in query.fetch_all(&mut *tx).await.map_err(db_err)? {
+                    // Only ids not seen yet go on, so ownership cycles end.
+                    if id != PLACEHOLDER_ID && known.insert(id.clone()) {
+                        next.push(id);
+                    }
+                }
+            }
+            closure.extend(next.iter().cloned());
+            frontier = next;
         }
-        Ok(())
+        // The containers whose membership shrinks, for their `Data` re-sync
+        // after the commit (the deleted ones among them no-op there).
+        let mut containers: Vec<String> = Vec::new();
+        for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let ids = numbered_placeholders(chunk.len());
+            let select = format!(
+                r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#
+            );
+            let mut query = sqlx::query_scalar::<_, String>(&select);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            containers.extend(query.fetch_all(&mut *tx).await.map_err(db_err)?);
+            for sql in [
+                format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
+                format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
+            ] {
+                let mut query = sqlx::query(&sql);
+                for id in chunk {
+                    query = query.bind(id);
+                }
+                query.execute(&mut *tx).await.map_err(db_err)?;
+            }
+        }
+        // Deepest first: a row's descendants were found after it.
+        for chunk in closure.rchunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = format!(
+                r#"DELETE FROM "BaseItems" WHERE "Id" IN ({})"#,
+                numbered_placeholders(chunk.len())
+            );
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            query.execute(&mut *tx).await.map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        containers.sort_unstable();
+        containers.dedup();
+        for container in containers.iter().filter(|c| !known.contains(*c)) {
+            if let Ok(container) = Uuid::parse_str(container) {
+                crate::item_data::sync_container_data(&self.db, container).await?;
+            }
+        }
+        Ok(closure
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
     }
 
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
@@ -2190,6 +2238,84 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         for (id, fields) in self.locked_fields_for_items(item_ids).await? {
             out.entry(id).or_default().locked_fields = fields;
         }
+        Ok(Some(out))
+    }
+
+    async fn items_at_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let mut out = Vec::new();
+        for chunk in paths.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = items_at_paths_sql(chunk.len());
+            let mut query = sqlx::query_as::<_, PathRow>(&sql);
+            for path in chunk {
+                query = query.bind(path);
+            }
+            out.extend(path_rows(
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?,
+            ));
+        }
+        Ok(Some(out))
+    }
+
+    async fn items_in_scope(
+        &self,
+        top_parent_id: Uuid,
+        roots: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let library = guid_to_db(top_parent_id);
+        let mut out = Vec::new();
+        // Three binds per root, after the library's.
+        for chunk in roots.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
+            for sql in [
+                items_under_roots_sql(chunk.len()),
+                pathless_children_sql(chunk.len()),
+            ] {
+                let mut query = sqlx::query_as::<_, PathRow>(&sql).bind(&library);
+                for root in chunk {
+                    let (exact, from, to) = path_prefix_range(root);
+                    query = query.bind(exact).bind(from).bind(to);
+                }
+                out.extend(path_rows(
+                    query.fetch_all(self.db.pool()).await.map_err(db_err)?,
+                ));
+            }
+        }
+        // Overlapping roots match a row more than once.
+        let mut seen = std::collections::HashSet::with_capacity(out.len());
+        out.retain(|row| seen.insert(row.id));
+        Ok(Some(out))
+    }
+
+    async fn child_links(
+        &self,
+        parents: &[Uuid],
+    ) -> Result<Option<Vec<ItemChildLink>>, ServiceError> {
+        let mut out: Vec<ItemChildLink> = Vec::new();
+        for chunk in parents.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let sql = child_links_sql(chunk.len());
+            let mut query =
+                sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(&sql);
+            for parent in chunk {
+                query = query.bind(guid_to_db(*parent));
+            }
+            let parse = |id: Option<String>| id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+            for (id, parent, owner, path) in
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?
+            {
+                if let Ok(id) = Uuid::parse_str(&id) {
+                    out.push(ItemChildLink {
+                        id,
+                        parent_id: parse(parent),
+                        owner_id: parse(owner),
+                        path,
+                    });
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::with_capacity(out.len());
+        out.retain(|row| seen.insert(row.id));
         Ok(Some(out))
     }
 
@@ -3114,6 +3240,110 @@ fn numbered_placeholders(n: usize) -> String {
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// One `(Id, Type, Path, ParentId)` row of the path-scoped reads.
+type PathRow = (String, String, Option<String>, Option<String>);
+
+/// [`PathRow`]s as [`ItemPathRow`]s; a row whose id does not parse is no
+/// item the scan can act on.
+fn path_rows(rows: Vec<PathRow>) -> impl Iterator<Item = ItemPathRow> {
+    rows.into_iter()
+        .filter_map(|(id, item_type, path, parent)| {
+            Some(ItemPathRow {
+                id: Uuid::parse_str(&id).ok()?,
+                item_type,
+                path,
+                parent_id: parent.as_deref().and_then(|p| Uuid::parse_str(p).ok()),
+            })
+        })
+}
+
+/// The binds that match a path at or under `root`, component-wise:
+/// `(root, root + "/", root + "0")` — the root itself, then the half-open
+/// range of every path that starts with `root/` (`'0'` is the byte after
+/// `'/'`, and a `BINARY` comparison orders paths bytewise), so `/tv/Show`
+/// matches `/tv/Show/e.mkv` but neither `/tv/Show (2019)` nor `/tv/Show2`.
+/// A trailing slash is not part of the root.
+pub(crate) fn path_prefix_range(root: &str) -> (String, String, String) {
+    let root = root.trim_end_matches('/');
+    (root.to_owned(), format!("{root}/"), format!("{root}0"))
+}
+
+/// [`ItemPersistenceService::items_at_paths`] over `n` paths: a batched
+/// `FindByPath`, each path an equality seek on `IX_BaseItems_Path`;
+/// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
+pub(crate) fn items_at_paths_sql(n: usize) -> String {
+    format!(
+        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems" WHERE "Path" IN ({})"#,
+        numbered_placeholders(n)
+    )
+}
+
+/// [`ItemPersistenceService::items_in_scope`]'s rows at or under `n` roots
+/// of the library bound as `?1`, three binds per root after it
+/// ([`path_prefix_range`]): one `IX_BaseItems_Path` seek per root and range
+/// (SQLite's multi-index `OR`), the library a filter on the rows found. The
+/// `+` keeps the planner off the `TopParentId` indexes, which would walk
+/// every row of the library; `EXPLAIN QUERY PLAN` pinned by
+/// `the_path_scoped_reads_seek_by_path`.
+pub(crate) fn items_under_roots_sql(n: usize) -> String {
+    let terms = root_terms(n);
+    format!(
+        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems"
+            WHERE +"TopParentId" = ?1 AND ({terms})"#
+    )
+}
+
+/// The `Path` terms of `n` roots bound from `?2` on, three binds each
+/// ([`path_prefix_range`]): the root itself, or the range under it.
+fn root_terms(n: usize) -> String {
+    (0..n)
+        .map(|i| {
+            let at = 2 + 3 * i;
+            format!(
+                r#""Path" = ?{at} OR ("Path" >= ?{} AND "Path" < ?{})"#,
+                at + 1,
+                at + 2
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// [`ItemPersistenceService::items_in_scope`]'s path-less rows of the
+/// library bound as `?1` whose parent is at or under one of the `n` roots
+/// bound after it (three binds each, as [`items_under_roots_sql`]) — the
+/// virtual seasons (`Season` rows with no path) a scan of a series plans
+/// and so may find gone, which the `ParentId` cascade would otherwise
+/// delete unannounced with it. No other path-less row: upstream's
+/// validation removes only a child that is `IsFileProtocol`
+/// (`Folder.cs:569`), so an adopted Jellyfin missing episode (a virtual
+/// `Episode` with no path) is never weighed. The parents are found by the
+/// roots' `IX_BaseItems_Path` seeks and their children by
+/// `IX_BaseItems_ParentId`, never the `NULL` end of `IX_BaseItems_Path` or a
+/// `Type` index (every season in the database) — the `+`s pin it;
+/// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
+pub(crate) fn pathless_children_sql(n: usize) -> String {
+    let terms = root_terms(n);
+    let season = stored_type_name(BaseItemKind::Season).unwrap_or_default();
+    format!(
+        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems"
+            WHERE +"TopParentId" = ?1 AND +"Path" IS NULL AND +"Type" = '{season}'
+              AND "ParentId" IN (SELECT "Id" FROM "BaseItems" WHERE {terms})"#
+    )
+}
+
+/// [`ItemPersistenceService::child_links`] over `n` parent ids (binds
+/// `?1..?n`, each used for both columns): one `IX_BaseItems_ParentId` and
+/// one `IX_BaseItems_OwnerId` seek per id (SQLite's multi-index `OR`);
+/// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
+pub(crate) fn child_links_sql(n: usize) -> String {
+    let ids = numbered_placeholders(n);
+    format!(
+        r#"SELECT "Id", "ParentId", "OwnerId", "Path" FROM "BaseItems"
+            WHERE "ParentId" IN ({ids}) OR "OwnerId" IN ({ids})"#
+    )
 }
 
 /// [`ItemPersistenceService::folder_run_time_sums`] over `n` folder ids
@@ -6501,5 +6731,296 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// The path-scoped scan's reads seek by path (and a path-less row by its
+    /// parent) — never a walk of `BaseItems` or of the library's
+    /// `TopParentId` rows: the library monitor's changed-path lookup
+    /// (`FindByPath`), and the pruning of a watcher/webhook or folder scan,
+    /// whose rows are the scanned roots' only.
+    #[tokio::test]
+    async fn the_path_scoped_reads_seek_by_path() {
+        let db = test_db().await;
+        // Up to the largest chunk each read binds: 166 roots (three binds
+        // each), 500 paths and parent ids.
+        for n in [1, 3, 166] {
+            let plan = query_plan(&db, &super::items_under_roots_sql(n), 1 + 3 * n).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan (n={n}), got: {plan:?}"
+            );
+            let seeks: Vec<&String> = plan.iter().filter(|s| s.starts_with("SEARCH")).collect();
+            assert!(
+                !seeks.is_empty()
+                    && seeks.iter().all(|s| s.contains("IX_BaseItems_Path")
+                        && (s.contains("Path=?") || s.contains("Path>? AND Path<?"))),
+                "each root and range an IX_BaseItems_Path seek (n={n}), got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TopParentId")),
+                "never through a TopParentId index (n={n}), got: {plan:?}"
+            );
+
+            let plan = query_plan(&db, &super::pathless_children_sql(n), 1 + 3 * n).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan (n={n}), got: {plan:?}"
+            );
+            assert!(
+                plan.iter().any(|s| s.starts_with("SEARCH")
+                    && s.contains("IX_BaseItems_ParentId")
+                    && s.contains("ParentId=?")),
+                "the children by IX_BaseItems_ParentId (n={n}), got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .filter(|s| s.starts_with("SEARCH"))
+                    .all(|s| s.contains("IX_BaseItems_ParentId")
+                        || (s.contains("IX_BaseItems_Path")
+                            && (s.contains("Path=?") || s.contains("Path>? AND Path<?")))),
+                "the parents by the roots' IX_BaseItems_Path seeks (n={n}), got: {plan:?}"
+            );
+        }
+        for n in [1, 3, 500] {
+            let plan = query_plan(&db, &super::items_at_paths_sql(n), n).await;
+            assert!(
+                plan.iter()
+                    .all(|s| s.starts_with("SEARCH") && s.contains("IX_BaseItems_Path")),
+                "every path an IX_BaseItems_Path seek (n={n}), got: {plan:?}"
+            );
+            let plan = query_plan(&db, &super::child_links_sql(n), n).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan (n={n}), got: {plan:?}"
+            );
+            let seeks: Vec<&String> = plan.iter().filter(|s| s.starts_with("SEARCH")).collect();
+            assert!(
+                seeks
+                    .iter()
+                    .any(|s| s.contains("IX_BaseItems_ParentId") && s.contains("ParentId=?"))
+                    && seeks
+                        .iter()
+                        .any(|s| s.contains("IX_BaseItems_OwnerId") && s.contains("OwnerId=?"))
+                    && seeks.iter().all(|s| s.contains("IX_BaseItems_ParentId")
+                        || s.contains("IX_BaseItems_OwnerId")),
+                "the children by ParentId and OwnerId (n={n}), got: {plan:?}"
+            );
+        }
+    }
+
+    /// `items_in_scope` returns the library's rows at or under the roots
+    /// (component-wise: not a sibling whose name starts alike, whatever byte
+    /// follows the prefix, nor one differing in case) and the path-less
+    /// children of those rows — nothing else of the library, and nothing of
+    /// another library under the same path. `child_links` returns the rows
+    /// under the given parents.
+    #[tokio::test]
+    async fn items_in_scope_reads_the_rows_under_the_roots_and_the_pathless_children() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (library, other) = (Uuid::from_u128(0x10), Uuid::from_u128(0x11));
+        let rows = [
+            (0x1, "/tv/Show", Some(library), None),
+            (0x2, "/tv/Show/Season 1", Some(library), Some(0x1)),
+            (0x3, "/tv/Show/Season 1/e1.mkv", Some(library), Some(0x2)),
+            (0x4, "/tv/Show (2019)", Some(library), None),
+            (0x5, "/tv/Show2/e.mkv", Some(library), None),
+            (0x6, "/tv/Other/e.mkv", Some(library), None),
+            (0x7, "/tv/Show/Season 1/e2.mkv", Some(other), None),
+            (0x8, "", Some(library), Some(0x1)),
+            (0x9, "", Some(library), Some(0x6)),
+            (0xA, "/tv/Show-2/e.mkv", Some(library), None),
+            (0xB, "/tv/Show.2/e.mkv", Some(library), None),
+            (0xC, "/tv/Show0/e.mkv", Some(library), None),
+            (0xD, "/tv/show/e.mkv", Some(library), None),
+            (0xE, "/tv/Show/", Some(library), None),
+            (0xF, "/tv/Show\te.mkv", Some(library), None),
+        ];
+        let id = |n: u128| Uuid::from_u128(0x5C0_0000 + n);
+        for (n, path, top, parent) in rows {
+            let id = id(n);
+            let kind = if path.is_empty() {
+                BaseItemKind::Season
+            } else {
+                BaseItemKind::Episode
+            };
+            seed_item(&db, id, kind).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.path = (!path.is_empty()).then(|| path.to_owned());
+            row.top_parent_id = top.map(guid_to_db);
+            row.parent_id = parent.map(|p| guid_to_db(Uuid::from_u128(0x5C0_0000 + p)));
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let ids = |rows: Vec<ferrofin_traits::persistence::ItemPathRow>| {
+            let mut ids: Vec<u128> = rows
+                .into_iter()
+                .map(|r| r.id.as_u128() - 0x5C0_0000)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        let found = svc
+            .items_in_scope(
+                library,
+                &["/tv/Show/".to_owned(), "/tv/Show/Season 1".to_owned()],
+            )
+            .await
+            .unwrap()
+            .expect("answers");
+        assert_eq!(ids(found), vec![0x1, 0x2, 0x3, 0x8, 0xE]);
+
+        let children = svc
+            .child_links(&[id(0x1), id(0x2)])
+            .await
+            .unwrap()
+            .expect("answers");
+        let mut children: Vec<(u128, Option<u128>)> = children
+            .into_iter()
+            .map(|c| {
+                (
+                    c.id.as_u128() - 0x5C0_0000,
+                    c.parent_id.map(|p| p.as_u128() - 0x5C0_0000),
+                )
+            })
+            .collect();
+        children.sort_unstable();
+        assert_eq!(
+            children,
+            vec![(0x2, Some(0x1)), (0x3, Some(0x2)), (0x8, Some(0x1))]
+        );
+
+        let at = svc
+            .items_at_paths(&[
+                "/tv/Show/Season 1".to_owned(),
+                "/tv/Show/Season 1/e9.mkv".to_owned(),
+            ])
+            .await
+            .unwrap()
+            .expect("answers");
+        assert_eq!(ids(at), vec![0x2]);
+        assert_eq!(
+            super::path_prefix_range("/tv/Show/"),
+            (
+                "/tv/Show".to_owned(),
+                "/tv/Show/".to_owned(),
+                "/tv/Show0".to_owned()
+            )
+        );
+    }
+
+    /// A season with an episode in a playlist and a collection, the episode
+    /// owning an extra filed under the series (an adopted shape), the season
+    /// owning one too. Seeded parent to child; returns `(series, season,
+    /// episode, episode's extra, season's extra, playlist, collection)`.
+    async fn season_with_links(
+        db: &ferrofin_db::Database,
+    ) -> (Uuid, Uuid, Uuid, Uuid, Uuid, Uuid, Uuid) {
+        let ids: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+        let (series, season, episode, extra, season_extra, playlist, boxset) =
+            (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6]);
+        seed_item(db, series, BaseItemKind::Series).await;
+        for (id, kind, parent, owner) in [
+            (season, BaseItemKind::Season, series, None),
+            (episode, BaseItemKind::Episode, season, None),
+            (extra, BaseItemKind::Video, series, Some(episode)),
+            (season_extra, BaseItemKind::Video, series, Some(season)),
+        ] {
+            seed_item(db, id, kind).await;
+            let mut row = crate::test_support::fetch_item(db, id).await;
+            row.parent_id = Some(guid_to_db(parent));
+            row.owner_id = owner.map(guid_to_db);
+            row.extra_type = owner.map(|_| 1);
+            crate::test_support::save_item(db, &row).await;
+        }
+        seed_item(db, playlist, BaseItemKind::Playlist).await;
+        seed_item(db, boxset, BaseItemKind::BoxSet).await;
+        let links = FerrofinLinkedChildrenService::new(db.clone());
+        for container in [playlist, boxset] {
+            links
+                .upsert_linked_child(container, episode, 0)
+                .await
+                .expect("link");
+        }
+        (
+            series,
+            season,
+            episode,
+            extra,
+            season_extra,
+            playlist,
+            boxset,
+        )
+    }
+
+    async fn rows_and_links(db: &ferrofin_db::Database) -> (i64, i64) {
+        let rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("rows");
+        let links: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "LinkedChildren""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("links");
+        (rows, links)
+    }
+
+    /// Upstream's `DeleteItem` (`ItemPersistenceService.cs:51-157`): the
+    /// closure — the season, its episode (`ParentId`), the extras they own
+    /// (`OwnerId`) wherever those are filed — goes in one transaction, the
+    /// playlist and collection membership naming any of it first, and the
+    /// ids deleted are returned exactly. Before, the season went first, the
+    /// cascade reached the episode still named by `LinkedChildren` and by its
+    /// extra's `OwnerId`, and the delete failed on the foreign key.
+    #[tokio::test]
+    async fn delete_items_takes_the_whole_closure_in_one_transaction() {
+        let db = test_db().await;
+        let (series, season, episode, extra, season_extra, playlist, boxset) =
+            season_with_links(&db).await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (rows, links) = rows_and_links(&db).await;
+        assert_eq!(links, 2);
+
+        let mut deleted = svc
+            .delete_items(&[season, Uuid::new_v4()])
+            .await
+            .expect("delete");
+        deleted.sort_unstable();
+        let mut expected = vec![season, episode, extra, season_extra];
+        expected.sort_unstable();
+        assert_eq!(deleted, expected, "the closure, and no id without a row");
+        assert_eq!(rows_and_links(&db).await, (rows - 4, 0));
+        for kept in [series, playlist, boxset] {
+            assert!(
+                crate::test_support::fetch_item_opt(&db, kept)
+                    .await
+                    .is_some(),
+                "{kept} kept"
+            );
+        }
+        assert!(
+            svc.delete_items(&[season]).await.expect("again").is_empty(),
+            "nothing left to delete"
+        );
+    }
+
+    /// A failure part-way through the delete leaves everything as it was: no
+    /// row and no playlist or collection link half-deleted.
+    #[tokio::test]
+    async fn a_failure_mid_delete_rolls_the_whole_delete_back() {
+        let db = test_db().await;
+        let (_, season, _, extra, _, _, _) = season_with_links(&db).await;
+        let before = rows_and_links(&db).await;
+        sqlx::query(&format!(
+            r#"CREATE TRIGGER "TestFailDelete" BEFORE DELETE ON "BaseItems"
+               WHEN old."Id" = '{}' BEGIN SELECT RAISE(ABORT, 'injected'); END"#,
+            guid_to_db(extra)
+        ))
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        assert!(svc.delete_items(&[season]).await.is_err());
+        assert_eq!(rows_and_links(&db).await, before, "nothing half-deleted");
     }
 }

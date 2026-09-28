@@ -11,7 +11,8 @@ use rstest::rstest;
 
 use super::{
     FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
-    ProbeKind, RefreshRequest, SaveDecision, StoredState, decide_save, plan_item_refresh,
+    ProbeKind, RefreshReason, RefreshRequest, SaveDecision, StoredState, decide_save,
+    plan_item_refresh,
 };
 
 use MetadataRefreshMode::{Default, FullRefresh, None as NoRefresh, ValidationOnly};
@@ -801,4 +802,150 @@ fn refresh_metadata_local_image_validation_threw_leaves_refresh_date_alone() {
         },
     );
     assert!(!decision.stamp_refreshed);
+}
+
+// --- The reason a path-scoped scan logs for each item ---
+
+/// The first trigger that fired, one case per trigger, in the decision's
+/// ranking: no stored row, the options, the first and the required
+/// refresh, then the change monitors, then the backfill rule.
+#[rstest]
+#[case::new_item(
+    None,
+    video(),
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::New
+)]
+#[case::full_refresh(
+    Some(current()),
+    video(),
+    options(FullRefresh, FullRefresh),
+    false,
+    RefreshReason::Requested
+)]
+#[case::never_refreshed(
+    Some(StoredState { date_last_refreshed: None, ..current() }),
+    video(),
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::FirstRefresh
+)]
+#[case::moved_mtime(
+    Some(current()),
+    FileFacts { mtime: Some(mtime() + TimeDelta::seconds(5)), ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::Modified
+)]
+#[case::folder_without_runtime(
+    Some(StoredState { run_time_ticks: None, ..current() }),
+    FileFacts { probe: ProbeKind::None, supports_cumulative_run_time: true, ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::NoRuntime
+)]
+#[case::newer_nfo(
+    Some(current()),
+    FileFacts {
+        local_metadata: Some(LocalMetadataFile {
+            mtime: now(),
+            format: LocalMetadataFormat::Nfo,
+        }),
+        ..video()
+    },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::LocalMetadata
+)]
+#[case::changed_sidecars(
+    Some(current()),
+    FileFacts { sidecars_changed: true, ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::Sidecars
+)]
+#[case::missing_media_info(
+    Some(StoredState { run_time_ticks: None, total_bitrate: None, ..current() }),
+    video(),
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::MissingMediaInfo
+)]
+#[case::backfill(
+    Some(current()),
+    video(),
+    MetadataRefreshOptions::default(),
+    true,
+    RefreshReason::Backfill
+)]
+#[case::unchanged(
+    Some(current()),
+    video(),
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::Unchanged
+)]
+#[case::context_only(
+    Some(current()),
+    FileFacts { mtime: Some(mtime() + TimeDelta::seconds(5)), ..video() },
+    options(NoRefresh, NoRefresh),
+    false,
+    RefreshReason::Unchanged
+)]
+fn the_reason_names_the_first_trigger_that_fired(
+    #[case] stored: Option<StoredState>,
+    #[case] fs: FileFacts,
+    #[case] opts: MetadataRefreshOptions,
+    #[case] backfill: bool,
+    #[case] reason: RefreshReason,
+) {
+    let p = plan_with(stored.as_ref(), &fs, &opts, None, backfill);
+    assert_eq!(p.reason, reason);
+}
+
+#[test]
+fn an_elapsed_interval_is_the_reason_even_in_none_mode() {
+    let library = LibraryOptions {
+        automatic_refresh_interval_days: 7,
+        ..LibraryOptions::default()
+    };
+    let stored = StoredState {
+        date_last_refreshed: Some(now() - TimeDelta::days(8)),
+        ..current()
+    };
+    let p = plan_with(
+        Some(&stored),
+        &video(),
+        &options(NoRefresh, NoRefresh),
+        Some(&library),
+        false,
+    );
+    assert_eq!(p.reason, RefreshReason::Interval);
+    assert_eq!(p.reason.as_str(), "interval");
+}
+
+#[test]
+fn every_reason_has_a_distinct_log_name() {
+    let all = [
+        RefreshReason::New,
+        RefreshReason::Requested,
+        RefreshReason::FirstRefresh,
+        RefreshReason::Interval,
+        RefreshReason::Modified,
+        RefreshReason::NoRuntime,
+        RefreshReason::LocalMetadata,
+        RefreshReason::Sidecars,
+        RefreshReason::Lyrics,
+        RefreshReason::MissingMediaInfo,
+        RefreshReason::Backfill,
+        RefreshReason::Unchanged,
+    ];
+    let names: std::collections::HashSet<&str> = all.iter().map(|r| r.as_str()).collect();
+    assert_eq!(names.len(), all.len());
+    assert_eq!(RefreshReason::New.as_str(), "created");
+    assert_eq!(RefreshReason::Modified.as_str(), "mtime");
+    assert_eq!(RefreshReason::LocalMetadata.as_str(), "nfo");
+    assert_eq!(RefreshReason::Sidecars.as_str(), "sidecar");
+    assert_eq!(ItemRefreshPlan::IDLE.reason, RefreshReason::Unchanged);
 }

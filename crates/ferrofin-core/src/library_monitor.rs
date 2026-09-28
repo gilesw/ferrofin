@@ -4,7 +4,7 @@
 //! Port of `Emby.Server.Implementations.IO.LibraryMonitor`. The C# monitor wraps
 //! a set of `FileSystemWatcher`s over each library root and, on a debounce timer,
 //! feeds changed paths back into the library refresh pipeline. Two behaviors of
-//! that class carry over to this seam and the rest is deferred:
+//! that class live on this seam:
 //! - **self-suppression:** while the server itself is writing under a path
 //!   (metadata save, image download) it registers the path as "temporarily
 //!   ignored" so the resulting change events do not trigger a redundant refresh.
@@ -16,7 +16,8 @@
 //! `ReportFileSystemChanged` dispatches a real refresh: a non-suppressed change
 //! queues a (coalescing) **path-scoped** scan through the injected
 //! [`LibraryScanTrigger`] (the composition root passes the library manager), so
-//! only the items touched by the changed paths are re-resolved. Like the C# timer, a
+//! only the item each changed path belongs to — the nearest existing item at or
+//! above it, and its subtree — is refreshed. Like the C# timer, a
 //! burst of changes **debounces**: each report (re)arms a settle window of
 //! `LibraryMonitorDelay` seconds (read live from the injected configuration
 //! manager, or fixed via [`FerrofinLibraryMonitor::with_debounce`]) and the scan
@@ -81,35 +82,33 @@ const MAX_SETTLE_WINDOWS: u32 = 10;
 /// 20_000.
 const MAX_PENDING_PATHS: usize = 20_000;
 
-/// The narrow slice of the library manager the monitor needs: queue a rescan.
+/// The narrow slice of the library manager the monitor needs: refresh what
+/// changed.
 ///
-/// The monitor only ever asks "something changed — refresh"; depending on the
-/// whole [`LibraryManager`](ferrofin_traits::library::LibraryManager) would drag in
-/// ~50 unrelated methods. [`FerrofinLibraryManager`](crate::FerrofinLibraryManager)
-/// implements this, so the composition root passes the same instance.
+/// The monitor only ever asks "these paths changed — refresh them"; depending
+/// on the whole [`LibraryManager`](ferrofin_traits::library::LibraryManager)
+/// would drag in ~50 unrelated methods.
+/// [`FerrofinLibraryManager`](crate::FerrofinLibraryManager) implements this,
+/// so the composition root passes the same instance.
+///
+/// There is deliberately no way here to ask for a full library scan, and no
+/// default: a changed path refreshes the item it belongs to
+/// (`FileRefresher.ProcessPathChanges`), never the library, so every
+/// implementor says how it scopes the paths it is given.
 #[async_trait]
 pub trait LibraryScanTrigger: Send + Sync {
-    /// Queues a (coalescing) full library scan.
+    /// Queues a (coalescing) scan of the given changed filesystem paths: each
+    /// refreshes the nearest existing item at or above it and validates that
+    /// item's subtree
+    /// ([`ScanTarget::Changed`](ferrofin_traits::library::ScanTarget::Changed)).
     ///
     /// # Errors
     ///
     /// Returns a [`ServiceError`] if the scan cannot be queued.
-    async fn queue_library_scan(&self) -> Result<(), ServiceError>;
-
-    /// Queues a (coalescing) scan covering only the items touched by the given
-    /// changed filesystem paths. Defaults to a full scan so simple triggers
-    /// need not implement path scoping;
-    /// [`FerrofinLibraryManager`](crate::FerrofinLibraryManager) overrides it with
-    /// the real path-scoped ingest.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`ServiceError`] if the scan cannot be queued.
-    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
-        let _ = paths;
-        self.queue_library_scan().await
-    }
+    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError>;
 }
+
+fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 
 /// Supplies the filesystem roots the monitor should watch.
 ///
@@ -536,7 +535,7 @@ mod tests {
         assert!(monitor.report_file_system_changed("").await.is_err());
     }
 
-    /// A [`LibraryScanTrigger`] fake that counts `queue_library_scan` calls.
+    /// A [`LibraryScanTrigger`] fake that counts the scans it is asked for.
     #[derive(Default)]
     struct CountingLibrary {
         scans: std::sync::atomic::AtomicUsize,
@@ -544,7 +543,7 @@ mod tests {
 
     #[async_trait]
     impl LibraryScanTrigger for CountingLibrary {
-        async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        async fn queue_scan_paths(&self, _paths: Vec<String>) -> Result<(), ServiceError> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -570,9 +569,6 @@ mod tests {
 
     #[async_trait]
     impl LibraryScanTrigger for PathsLibrary {
-        async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-            panic!("the monitor must dispatch path-scoped, not full, scans");
-        }
         async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
             self.batches.lock().unwrap().push(paths);
             Ok(())
@@ -614,6 +610,26 @@ mod tests {
         let mut paths = batches[0].clone();
         paths.sort();
         assert_eq!(paths, vec!["/media/movies/a.mkv", "/media/movies/b.mkv"]);
+    }
+
+    /// An import of 1,000 files inside one settle window is one scan of
+    /// exactly those paths — never a library scan.
+    #[tokio::test(start_paused = true)]
+    async fn a_thousand_files_in_one_window_dispatch_one_scan_of_those_paths() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_secs(5));
+        for i in 0..1_000 {
+            monitor
+                .report_file_system_changed(&format!("/media/tv/Show/Season 9/Show S09E{i:04}.mkv"))
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let batches = library.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one settled batch");
+        assert_eq!(batches[0].len(), 1_000, "every reported path, once");
     }
 
     #[tokio::test(start_paused = true)]

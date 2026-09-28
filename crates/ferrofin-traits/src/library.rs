@@ -63,10 +63,24 @@ pub enum ScanTarget {
     /// (`ProviderManager.RefreshCollectionFolderChildren`).
     Library(Uuid),
     /// The items at or under these filesystem paths — a folder's subtree
-    /// (`Folder.ValidateChildren` on a series, season, album…), or the
-    /// changed paths the library monitor reports. Rows under the paths whose
-    /// files are gone are removed.
+    /// (`Folder.ValidateChildren` on a series, season, album…). Rows under
+    /// the paths whose files are gone are removed.
     Paths(Vec<String>),
+    /// The paths the library monitor reports as changed — the disk watcher
+    /// and the *arr webhooks (`FileRefresher.ProcessPathChanges`). Each path
+    /// refreshes the nearest existing item at or above it
+    /// (`BaseItem.ChangedExternally`, a `Default` refresh) and validates that
+    /// item's subtree: new items are created, the rows whose files are gone
+    /// are removed. The folders above that item are carried for context
+    /// only — never refreshed — and no library-wide closing pass runs.
+    ///
+    /// ACCEPTED DIVERGENCE (flagged to the owner): Ferrofin keeps a series'
+    /// `DateLastMediaAdded` current on a watcher event — the closing folder
+    /// aggregate pass writes that one column of a context series when a new
+    /// episode moves it — where upstream updates it only on the series' own
+    /// refresh (`MetadataService.cs:404-411`), i.e. at the next library
+    /// scan.
+    Changed(Vec<String>),
     /// The file items at these paths refreshing themselves
     /// (`ProviderManager.RefreshSingleItem`, a non-folder's `RefreshItem`):
     /// a movie's, an episode's, a track's refresh, or an Identify of one. A

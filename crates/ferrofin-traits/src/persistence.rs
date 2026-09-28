@@ -501,8 +501,19 @@ fn _assert_object_safe_item_repository(_: &dyn ItemRepository) {}
 /// [`BaseItemEntity`] rows; every method is `async` since it touches storage.
 #[async_trait]
 pub trait ItemPersistenceService: Send + Sync {
-    /// Deletes the items with the given ids.
-    async fn delete_items(&self, ids: &[Uuid]) -> Result<(), ServiceError>;
+    /// Deletes the items with the given ids and everything under them —
+    /// their `ParentId` descendants and the extras they own (`OwnerId`),
+    /// recursively — in one transaction, first clearing every
+    /// `LinkedChildren` row (playlist and collection membership) that names
+    /// any of them: upstream's `ItemPersistenceService.DeleteItem`. Either
+    /// all of it is deleted or none of it. Returns the ids deleted (ids with
+    /// no stored row, and the placeholder row, are not).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is deleted
+    /// then.
+    async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError>;
 
     /// Persists (inserts or updates) the given item rows.
     ///
@@ -742,6 +753,67 @@ pub trait ItemPersistenceService: Send + Sync {
         item_ids: &[Uuid],
     ) -> Result<Option<HashMap<Uuid, StoredItemLinks>>, ServiceError> {
         let _ = item_ids;
+        Ok(None)
+    }
+
+    /// The stored items whose `Path` is exactly one of `paths` — a batched
+    /// `LibraryManager.FindByPath`, which the library monitor asks for each
+    /// changed path and each folder above it to find the nearest existing
+    /// item (`FileRefresher.GetAffectedBaseItem`).
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then refreshes the changed paths
+    /// themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn items_at_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = paths;
+        Ok(None)
+    }
+
+    /// The stored items of the library whose `TopParentId` is
+    /// `top_parent_id` that a path-scoped scan's pruning weighs: those whose
+    /// `Path` is one of `roots` or lies under one (component-wise), and the
+    /// path-less ones (a virtual season) whose parent is one of those. Read
+    /// by path and parent — never every row of the library.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then reads the whole library as a
+    /// library scan does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn items_in_scope(
+        &self,
+        top_parent_id: Uuid,
+        roots: &[String],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = (top_parent_id, roots);
+        Ok(None)
+    }
+
+    /// The stored rows whose `ParentId` or `OwnerId` is one of `parents`:
+    /// what deleting those rows would take with them — the `ParentId`
+    /// cascade, and the extras `delete_items` removes with their owner. The
+    /// pruning reads them to keep a row that still has a child it keeps.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the pruning then removes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn child_links(
+        &self,
+        parents: &[Uuid],
+    ) -> Result<Option<Vec<ItemChildLink>>, ServiceError> {
+        let _ = parents;
         Ok(None)
     }
 
@@ -1390,6 +1462,36 @@ pub struct StoredItemLinks {
     /// Its locked metadata fields (`BaseItemMetadataFields`), which the scan's
     /// merge never overwrites.
     pub locked_fields: Vec<MetadataField>,
+}
+
+/// One stored item as a path-scoped scan reads it: enough to find the item
+/// a changed path belongs to ([`ItemPersistenceService::items_at_paths`])
+/// and to tell whether a row under a scanned path is gone
+/// ([`ItemPersistenceService::items_in_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemPathRow {
+    /// The item's id.
+    pub id: Uuid,
+    /// Its stored `Type` (the full type name).
+    pub item_type: String,
+    /// Its `Path`, `None` for a path-less item (a virtual season).
+    pub path: Option<String>,
+    /// Its `ParentId`: where a path-less item sits.
+    pub parent_id: Option<Uuid>,
+}
+
+/// One stored row under another, as
+/// [`ItemPersistenceService::child_links`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemChildLink {
+    /// The row's id.
+    pub id: Uuid,
+    /// Its `ParentId`.
+    pub parent_id: Option<Uuid>,
+    /// Its `OwnerId` (an extra's owner).
+    pub owner_id: Option<Uuid>,
+    /// Its `Path`.
+    pub path: Option<String>,
 }
 
 /// What a previous scan already recorded about one image file: the probed
