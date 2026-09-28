@@ -792,11 +792,56 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
-    /// The stored items of the library whose `TopParentId` is
-    /// `top_parent_id` that a path-scoped scan's pruning weighs: those whose
-    /// `Path` is one of `roots` or lies under one (component-wise), and the
-    /// path-less ones (a virtual season) whose parent is one of those. Read
-    /// by path and parent — never every row of the library.
+    /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
+    /// carry: the library itself, which is what every row Ferrofin writes
+    /// carries, and — on a database adopted from Jellyfin — the physical
+    /// folders its `PhysicalFolderIds` names, which is what Jellyfin wrote
+    /// (`BaseItem.GetTopParent`: the item's ancestor directly under the
+    /// `AggregateFolder`). An adopted row keeps the physical folder until a
+    /// scan saves it, so a library's rows are read by both until then. The
+    /// library id comes first; a native library answers it alone.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then scopes the library by its own id.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_top_parents(&self, library: Uuid) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        let _ = library;
+        Ok(None)
+    }
+
+    /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
+    /// library's, [`library_top_parents`](Self::library_top_parents)) that a
+    /// library scan's pruning weighs: every one of them but an owned
+    /// non-extra (a part or a version stored under its owner) and an
+    /// alternate version whose primary is in the same library — the rows a
+    /// library read lists. Only the columns the pruning needs, unordered.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then reads the library through the item
+    /// repository.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_items(
+        &self,
+        top_parent_ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        let _ = top_parent_ids;
+        Ok(None)
+    }
+
+    /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
+    /// library's, [`library_top_parents`](Self::library_top_parents)) that a
+    /// path-scoped scan's pruning weighs: those whose `Path` is one of
+    /// `roots` or lies under one (component-wise), and the path-less ones (a
+    /// virtual season) whose parent is one of those — less the rows
+    /// [`library_items`](Self::library_items) leaves out, so both prunes
+    /// weigh the same rows. Read by path and parent — never every row of the
+    /// library.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then reads the whole library as a
@@ -807,10 +852,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// [`ServiceError::Backend`] on a storage failure.
     async fn items_in_scope(
         &self,
-        top_parent_id: Uuid,
+        top_parent_ids: &[Uuid],
         roots: &[String],
     ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
-        let _ = (top_parent_id, roots);
+        let _ = (top_parent_ids, roots);
         Ok(None)
     }
 

@@ -2277,20 +2277,53 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(Some(out))
     }
 
+    async fn library_top_parents(&self, library: Uuid) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        Ok(Some(
+            crate::item_repository::library_top_parents_by_view(&self.db, &[library])
+                .await?
+                .remove(&library)
+                .unwrap_or_else(|| vec![library]),
+        ))
+    }
+
+    async fn library_items(
+        &self,
+        top_parent_ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
+        if top_parent_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let sql = library_items_sql(top_parent_ids.len());
+        let mut query = sqlx::query_as::<_, PathRow>(&sql);
+        for library in top_parent_ids {
+            query = query.bind(guid_to_db(*library));
+        }
+        Ok(Some(
+            path_rows(query.fetch_all(self.db.pool()).await.map_err(db_err)?).collect(),
+        ))
+    }
+
     async fn items_in_scope(
         &self,
-        top_parent_id: Uuid,
+        top_parent_ids: &[Uuid],
         roots: &[String],
     ) -> Result<Option<Vec<ItemPathRow>>, ServiceError> {
-        let library = guid_to_db(top_parent_id);
+        if top_parent_ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let libraries: Vec<String> = top_parent_ids.iter().copied().map(guid_to_db).collect();
         let mut out = Vec::new();
-        // Three binds per root, after the library's.
-        for chunk in roots.chunks(ferrofin_db::BATCH_BIND_CHUNK / 3) {
+        // Three binds per root, after the libraries'.
+        let per_chunk = (ferrofin_db::BATCH_BIND_CHUNK.saturating_sub(libraries.len()) / 3).max(1);
+        for chunk in roots.chunks(per_chunk) {
             for sql in [
-                items_under_roots_sql(chunk.len()),
-                pathless_children_sql(chunk.len()),
+                items_under_roots_sql(libraries.len(), chunk.len()),
+                pathless_children_sql(libraries.len(), chunk.len()),
             ] {
-                let mut query = sqlx::query_as::<_, PathRow>(&sql).bind(&library);
+                let mut query = sqlx::query_as::<_, PathRow>(&sql);
+                for library in &libraries {
+                    query = query.bind(library);
+                }
                 for root in chunk {
                     let (exact, from, to) = path_prefix_range(root);
                     query = query.bind(exact).bind(from).bind(to);
@@ -3335,27 +3368,73 @@ pub(crate) fn items_at_paths_sql(n: usize) -> String {
     )
 }
 
-/// [`ItemPersistenceService::items_in_scope`]'s rows at or under `n` roots
-/// of the library bound as `?1`, three binds per root after it
-/// ([`path_prefix_range`]): one `IX_BaseItems_Path` seek per root and range
-/// (SQLite's multi-index `OR`), the library a filter on the rows found. The
-/// `+` keeps the planner off the `TopParentId` indexes, which would walk
-/// every row of the library; `EXPLAIN QUERY PLAN` pinned by
-/// `the_path_scoped_reads_seek_by_path`.
-pub(crate) fn items_under_roots_sql(n: usize) -> String {
-    let terms = root_terms(n);
+/// The rows of a library — `TopParentId` one of the `libraries` top
+/// parents bound as `?1..?libraries` ([`ItemPersistenceService::library_top_parents`])
+/// — that its pruning weighs: every one but the placeholder, an owned
+/// non-extra (a part, or a version stored under its owner) and an alternate
+/// version whose primary is in the same library. Those are exactly the rows
+/// the item repository's library read leaves out (`translate_query`'s
+/// owner and `ALTERNATE_VERSION_HIDDEN` terms), so a row a library browse
+/// never lists is never weighed as gone either — not even when a planned
+/// item claims its path, which is the case for a version that shares its
+/// primary's file. "The same library" is the library's top-parent set, not
+/// the row's own `TopParentId`: on an adopted database a primary a scan
+/// saved carries the collection folder while its version may still carry
+/// Jellyfin's physical folder. `top_parent` is the `TopParentId` term's
+/// column expression, which the caller pins (`+`) or not. The outer table
+/// is aliased `bi`.
+fn prune_candidate_terms(libraries: usize, top_parent: &str) -> String {
+    let tops = numbered_placeholders(libraries);
     format!(
-        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems"
-            WHERE +"TopParentId" = ?1 AND ({terms})"#
+        r#"{top_parent} IN ({tops}) AND bi."Id" <> '{PLACEHOLDER_ID}'
+            AND (+bi."OwnerId" IS NULL
+                 OR +bi."OwnerId" = '00000000-0000-0000-0000-000000000000'
+                 OR +bi."ExtraType" IS NOT NULL)
+            AND (+bi."PrimaryVersionId" IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM "BaseItems" p
+                 WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IN ({tops})))"#
     )
 }
 
-/// The `Path` terms of `n` roots bound from `?2` on, three binds each
-/// ([`path_prefix_range`]): the root itself, or the range under it.
-fn root_terms(n: usize) -> String {
+/// [`ItemPersistenceService::library_items`] over the `libraries` top
+/// parents bound as `?1..?libraries`: the library's rows by a `TopParentId`
+/// index seek per top parent, the other terms a filter on the rows found (an
+/// alternate's primary a primary-key probe), unordered — the pruning needs
+/// no order, and sorting some 20,000 rows spilled to a temp file on every
+/// scan. `EXPLAIN QUERY PLAN` pinned by `the_library_read_seeks_by_top_parent`.
+pub(crate) fn library_items_sql(libraries: usize) -> String {
+    let terms = prune_candidate_terms(libraries, r#"bi."TopParentId""#);
+    format!(
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi WHERE {terms}"#
+    )
+}
+
+/// [`ItemPersistenceService::items_in_scope`]'s rows at or under `n` roots
+/// of the library whose `libraries` top parents
+/// ([`ItemPersistenceService::library_top_parents`]) are bound as
+/// `?1..?libraries`, three binds per root after them
+/// ([`path_prefix_range`]): one `IX_BaseItems_Path` seek per root and range
+/// (SQLite's multi-index `OR`), the library and the candidate terms
+/// ([`prune_candidate_terms`], the same as the library scan's) a filter on
+/// the rows found. The `+` keeps the planner off the `TopParentId` indexes,
+/// which would walk every row of the library; `EXPLAIN QUERY PLAN` pinned by
+/// `the_path_scoped_reads_seek_by_path`.
+pub(crate) fn items_under_roots_sql(libraries: usize, n: usize) -> String {
+    let roots = root_terms(libraries, n);
+    let terms = prune_candidate_terms(libraries, r#"+bi."TopParentId""#);
+    format!(
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi
+            WHERE {terms} AND ({roots})"#
+    )
+}
+
+/// The `Path` terms of `n` roots bound after the `libraries` top parents,
+/// three binds each ([`path_prefix_range`]): the root itself, or the range
+/// under it.
+fn root_terms(libraries: usize, n: usize) -> String {
     (0..n)
         .map(|i| {
-            let at = 2 + 3 * i;
+            let at = libraries + 1 + 3 * i;
             format!(
                 r#""Path" = ?{at} OR ("Path" >= ?{} AND "Path" < ?{})"#,
                 at + 1,
@@ -3367,8 +3446,10 @@ fn root_terms(n: usize) -> String {
 }
 
 /// [`ItemPersistenceService::items_in_scope`]'s path-less rows of the
-/// library bound as `?1` whose parent is at or under one of the `n` roots
-/// bound after it (three binds each, as [`items_under_roots_sql`]) — the
+/// library whose `libraries` top parents are bound as `?1..?libraries` whose
+/// parent is at or under one of the `n` roots bound after them (three binds
+/// each, as [`items_under_roots_sql`]), less what [`prune_candidate_terms`]
+/// leaves out — the
 /// virtual seasons (`Season` rows with no path) a scan of a series plans
 /// and so may find gone, which the `ParentId` cascade would otherwise
 /// delete unannounced with it. No other path-less row: upstream's
@@ -3379,13 +3460,14 @@ fn root_terms(n: usize) -> String {
 /// `IX_BaseItems_ParentId`, never the `NULL` end of `IX_BaseItems_Path` or a
 /// `Type` index (every season in the database) — the `+`s pin it;
 /// `EXPLAIN QUERY PLAN` pinned by `the_path_scoped_reads_seek_by_path`.
-pub(crate) fn pathless_children_sql(n: usize) -> String {
-    let terms = root_terms(n);
+pub(crate) fn pathless_children_sql(libraries: usize, n: usize) -> String {
+    let roots = root_terms(libraries, n);
+    let terms = prune_candidate_terms(libraries, r#"+bi."TopParentId""#);
     let season = stored_type_name(BaseItemKind::Season).unwrap_or_default();
     format!(
-        r#"SELECT "Id", "Type", "Path", "ParentId" FROM "BaseItems"
-            WHERE +"TopParentId" = ?1 AND +"Path" IS NULL AND +"Type" = '{season}'
-              AND "ParentId" IN (SELECT "Id" FROM "BaseItems" WHERE {terms})"#
+        r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi
+            WHERE {terms} AND +bi."Path" IS NULL AND +bi."Type" = '{season}'
+              AND bi."ParentId" IN (SELECT "Id" FROM "BaseItems" WHERE {roots})"#
     )
 }
 
@@ -6949,22 +7031,35 @@ mod tests {
     /// parent) — never a walk of `BaseItems` or of the library's
     /// `TopParentId` rows: the library monitor's changed-path lookup
     /// (`FindByPath`), and the pruning of a watcher/webhook or folder scan,
-    /// whose rows are the scanned roots' only.
+    /// whose rows are the scanned roots' only. The same whether the library
+    /// is read by its collection folder alone (a native library) or with
+    /// the physical folders an adopted one's rows may still carry.
     #[tokio::test]
     async fn the_path_scoped_reads_seek_by_path() {
         let db = test_db().await;
+        // An alternate version's primary is a primary-key probe of `p`
+        // (`prune_candidate_terms`), never a walk.
+        let primary_probe = |s: &String| {
+            s.starts_with("SEARCH p ") && s.contains("sqlite_autoindex_BaseItems_1 (Id=?)")
+        };
         // Up to the largest chunk each read binds: 166 roots (three binds
-        // each), 500 paths and parent ids.
-        for n in [1, 3, 166] {
-            let plan = query_plan(&db, &super::items_under_roots_sql(n), 1 + 3 * n).await;
+        // each, after the library's top parents), 500 paths and parent ids.
+        for (tops, roots) in [(1, 1), (1, 3), (1, 166), (2, 1), (2, 3), (2, 166), (4, 165)] {
+            let binds = tops + 3 * roots;
+            let n = format!("{tops} top parents, {roots} roots");
+            let plan = query_plan(&db, &super::items_under_roots_sql(tops, roots), binds).await;
             assert!(
                 !plan.iter().any(|s| s.starts_with("SCAN")),
                 "no scan (n={n}), got: {plan:?}"
             );
-            let seeks: Vec<&String> = plan.iter().filter(|s| s.starts_with("SEARCH")).collect();
+            let seeks: Vec<&String> = plan
+                .iter()
+                .filter(|s| s.starts_with("SEARCH") && !primary_probe(s))
+                .collect();
             assert!(
                 !seeks.is_empty()
-                    && seeks.iter().all(|s| s.contains("IX_BaseItems_Path")
+                    && seeks.iter().all(|s| s.starts_with("SEARCH bi ")
+                        && s.contains("IX_BaseItems_Path")
                         && (s.contains("Path=?") || s.contains("Path>? AND Path<?"))),
                 "each root and range an IX_BaseItems_Path seek (n={n}), got: {plan:?}"
             );
@@ -6973,7 +7068,7 @@ mod tests {
                 "never through a TopParentId index (n={n}), got: {plan:?}"
             );
 
-            let plan = query_plan(&db, &super::pathless_children_sql(n), 1 + 3 * n).await;
+            let plan = query_plan(&db, &super::pathless_children_sql(tops, roots), binds).await;
             assert!(
                 !plan.iter().any(|s| s.starts_with("SCAN")),
                 "no scan (n={n}), got: {plan:?}"
@@ -6986,11 +7081,15 @@ mod tests {
             );
             assert!(
                 plan.iter()
-                    .filter(|s| s.starts_with("SEARCH"))
+                    .filter(|s| s.starts_with("SEARCH") && !primary_probe(s))
                     .all(|s| s.contains("IX_BaseItems_ParentId")
                         || (s.contains("IX_BaseItems_Path")
                             && (s.contains("Path=?") || s.contains("Path>? AND Path<?")))),
                 "the parents by the roots' IX_BaseItems_Path seeks (n={n}), got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TEMP B-TREE")),
+                "no sort (n={n}), got: {plan:?}"
             );
         }
         for n in [1, 3, 500] {
@@ -7016,6 +7115,43 @@ mod tests {
                     && seeks.iter().all(|s| s.contains("IX_BaseItems_ParentId")
                         || s.contains("IX_BaseItems_OwnerId")),
                 "the children by ParentId and OwnerId (n={n}), got: {plan:?}"
+            );
+        }
+    }
+
+    /// The library scan's prune read (`library_items`) seeks each top parent
+    /// by a `TopParentId` index and filters the rest — an alternate's
+    /// primary a primary-key probe — with no sort: ordering some 20,000
+    /// rows, as the item repository's library read did, spilled to a temp
+    /// file on every scan (0.2 MB → 20.1 MB written by an unchanged
+    /// rescan).
+    #[tokio::test]
+    async fn the_library_read_seeks_by_top_parent() {
+        let db = test_db().await;
+        for tops in [1, 2, 4] {
+            let plan = query_plan(&db, &super::library_items_sql(tops), tops).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("SCAN")),
+                "no scan ({tops} top parents), got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TEMP B-TREE")),
+                "no sort ({tops} top parents), got: {plan:?}"
+            );
+            let seeks: Vec<&String> = plan.iter().filter(|s| s.starts_with("SEARCH")).collect();
+            assert!(
+                seeks
+                    .iter()
+                    .any(|s| s.starts_with("SEARCH bi ") && s.contains("(TopParentId=?")),
+                "the library by a TopParentId seek ({tops} top parents), got: {plan:?}"
+            );
+            assert!(
+                seeks.iter().all(
+                    |s| (s.starts_with("SEARCH bi ") && s.contains("(TopParentId=?"))
+                        || (s.starts_with("SEARCH p ")
+                            && s.contains("sqlite_autoindex_BaseItems_1 (Id=?)"))
+                ),
+                "nothing else sought ({tops} top parents), got: {plan:?}"
             );
         }
     }
@@ -7072,16 +7208,13 @@ mod tests {
             ids
         };
 
+        let roots = ["/tv/Show/".to_owned(), "/tv/Show/Season 1".to_owned()];
         let found = svc
-            .items_in_scope(
-                library,
-                &["/tv/Show/".to_owned(), "/tv/Show/Season 1".to_owned()],
-            )
+            .items_in_scope(&[library], &roots)
             .await
             .unwrap()
             .expect("answers");
         assert_eq!(ids(found), vec![0x1, 0x2, 0x3, 0x8, 0xE]);
-
         let children = svc
             .child_links(&[id(0x1), id(0x2)])
             .await
@@ -7119,6 +7252,105 @@ mod tests {
                 "/tv/Show0".to_owned()
             )
         );
+    }
+
+    /// `items_in_scope` over an adopted library's top parents — its
+    /// collection folder and its physical folder — reads the rows under the
+    /// roots that carry either (one a scan saved, and an episode and a
+    /// virtual season that still carry Jellyfin's physical folder), and
+    /// still nothing of another library under the same path; over the
+    /// collection folder alone, only the saved one; over none, nothing.
+    #[tokio::test]
+    async fn items_in_scope_reads_an_adopted_library_by_each_top_parent() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (library, physical, other) = (
+            Uuid::from_u128(0x20),
+            Uuid::from_u128(0x21),
+            Uuid::from_u128(0x22),
+        );
+        let id = |n: u128| Uuid::from_u128(0x5C1_0000 + n);
+        for (n, path, top, parent) in [
+            (0x1, "/tv/Show", library, None),
+            (0x2, "/tv/Show/Season 1/e1.mkv", physical, Some(0x1)),
+            (0x3, "", physical, Some(0x1)),
+            (0x4, "/tv/Show/Season 1/e2.mkv", other, Some(0x1)),
+        ] {
+            let kind = if path.is_empty() {
+                BaseItemKind::Season
+            } else {
+                BaseItemKind::Episode
+            };
+            seed_item(&db, id(n), kind).await;
+            let mut row = crate::test_support::fetch_item(&db, id(n)).await;
+            row.path = (!path.is_empty()).then(|| path.to_owned());
+            row.top_parent_id = Some(guid_to_db(top));
+            row.parent_id = parent.map(|p| guid_to_db(id(p)));
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let found = |tops: Vec<Uuid>| {
+            let svc = &svc;
+            async move {
+                let mut ids: Vec<u128> = svc
+                    .items_in_scope(&tops, &["/tv/Show".to_owned()])
+                    .await
+                    .unwrap()
+                    .expect("answers")
+                    .into_iter()
+                    .map(|r| r.id.as_u128() - 0x5C1_0000)
+                    .collect();
+                ids.sort_unstable();
+                ids
+            }
+        };
+        assert_eq!(found(vec![library, physical]).await, vec![0x1, 0x2, 0x3]);
+        assert_eq!(found(vec![library]).await, vec![0x1]);
+        assert!(found(Vec::new()).await.is_empty());
+    }
+
+    /// `library_top_parents`: an adopted library (a collection folder whose
+    /// `Data` names `PhysicalFolderIds`, N-format as Jellyfin writes them)
+    /// answers itself first, then its physical folders; a native one (no
+    /// `PhysicalFolderIds`, only the `CollectionType` Ferrofin stamps) and an
+    /// id that is not a library answer themselves alone.
+    #[tokio::test]
+    async fn library_top_parents_is_the_library_and_its_physical_folders() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (adopted, native, physical, other) = (
+            Uuid::from_u128(0xA0),
+            Uuid::from_u128(0xA1),
+            Uuid::from_u128(0xA2),
+            Uuid::from_u128(0xA3),
+        );
+        seed_item(&db, adopted, BaseItemKind::CollectionFolder).await;
+        seed_item(&db, native, BaseItemKind::CollectionFolder).await;
+        seed_item(&db, physical, BaseItemKind::Folder).await;
+        seed_item(&db, other, BaseItemKind::Movie).await;
+        for (id, data) in [
+            (
+                adopted,
+                format!(
+                    r#"{{"CollectionType":"movies","PhysicalFolderIds":["{}"]}}"#,
+                    physical.simple()
+                ),
+            ),
+            (native, r#"{"CollectionType":"movies"}"#.to_owned()),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(data)
+                .execute(db.writer())
+                .await
+                .expect("stamp data");
+        }
+        let tops = |id| {
+            let svc = &svc;
+            async move { svc.library_top_parents(id).await.unwrap().expect("answers") }
+        };
+        assert_eq!(tops(adopted).await, vec![adopted, physical]);
+        assert_eq!(tops(native).await, vec![native]);
+        assert_eq!(tops(other).await, vec![other]);
     }
 
     /// A season with an episode in a playlist and a collection, the episode

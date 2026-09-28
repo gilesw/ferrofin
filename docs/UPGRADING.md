@@ -8,6 +8,46 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — a database adopted from Jellyfin shows its libraries and removes deleted media
+
+This applies only to a database adopted from a Jellyfin install (a
+`jellyfin.db.pre-ferrofin` copy sits next to the database). A database Ferrofin created
+itself is not affected.
+
+Jellyfin files each library item under the folder of its library location, while
+Ferrofin files the items it scans under the library itself. Earlier versions read an
+adopted library through Jellyfin's folders only. After Ferrofin's first scan, each library
+browsed empty (with empty counts, Latest and Next Up), and media deleted from disk was never
+removed. Ferrofin now reads every library through both, and a scan (including one started
+by the disk watcher or a `*arr` webhook) removes deleted media.
+
+**The first library scan after this upgrade removes the entries for media deleted from
+disk since Ferrofin first scanned the library (or since adoption, if it was never
+scanned), with their watched state, resume positions and favourites.** Ferrofin does not
+yet keep a deleted item's user data for when the file comes back, as Jellyfin does. So
+before that scan, make sure your media is where the libraries expect it: a file that was
+moved or renamed is removed, then added again as a new item without its watched state. A
+scan never removes anything under a library location that is missing, empty or cannot be
+listed (an unmounted drive or share), nor an entry whose file or folder is still on disk,
+unless the scan replaced it with a new entry for the same file.
+
+Two things you may notice once an adopted library browses again, both gaps in how
+Ferrofin's scan groups files (they are open work, not intended behaviour):
+
+- **Alternate versions show as separate movies.** Jellyfin lists a movie with several
+  versions (`Movie (2010) - 1080p.mkv` beside `Movie (2010) - 2160p.mkv`) once, with a
+  version picker. Ferrofin does not group versions yet, so after its scan each file is a
+  movie of its own, and the movie count rises by one per extra version.
+- **A plain subfolder in a movie library shows as an empty folder.** Jellyfin lists a
+  folder that is not a movie's own (`Movies/Collection/Movie (2010)/…`) as a folder
+  holding its movies. Ferrofin's scan lists those movies at the top of the library
+  instead, and the folder Jellyfin created stays behind, empty, while its directory
+  exists.
+
+Adoption is still one-way: going back to Jellyfin means restoring the
+`jellyfin.db.pre-ferrofin` copy taken at adoption, which predates every change Ferrofin
+made.
+
 ## Unreleased — "Date added behavior for new content" is honoured
 
 **Dashboard → Libraries → Display → Date added behavior for new content** now decides how

@@ -56,7 +56,7 @@ use ferrofin_traits::persistence::{
 };
 
 use crate::db_error::db_err;
-use crate::item_repository::physical_folders_by_view;
+use crate::item_repository::library_top_parents_by_view;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::PLACEHOLDER_ID;
 
@@ -114,9 +114,11 @@ impl FerrofinNextUpService {
     /// The `TopParentId` values a set of scope parents stands for — C#
     /// `LibraryManager.GetNextUpSeriesKeys`'s `SetTopParentIdsOrAncestors`
     /// step, per parent (`GetTopParentIdsForQuery`): a collection folder
-    /// contributes its `PhysicalFolderIds`, anything else — a Live TV or
-    /// playlists view, a physical folder, or any id on a Ferrofin-written
-    /// database where the view IS the top parent — contributes itself.
+    /// contributes its `PhysicalFolderIds` and itself (what the rows a
+    /// Ferrofin scan saved carry, `library_top_parents_by_view`), anything
+    /// else — a Live TV or playlists view, a physical folder, or any id on a
+    /// Ferrofin-written database where the view IS the top parent —
+    /// contributes itself.
     ///
     /// The manager hands over the user's library folders (3–7 ids), and this
     /// list must stay that small: the keys statement's `TopParentId IN (…)`
@@ -125,7 +127,7 @@ impl FerrofinNextUpService {
     /// against the retired `CROSS JOIN` shape, which walked it once per
     /// `UserData` row, is what made the statement 10 M index probes and 1.4 s.
     async fn top_parent_ids(&self, parents: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
-        let by_view = physical_folders_by_view(&self.db, parents).await?;
+        let by_view = library_top_parents_by_view(&self.db, parents).await?;
         let mut out = Vec::with_capacity(parents.len());
         for id in parents {
             match by_view.get(id) {

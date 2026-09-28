@@ -66,6 +66,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   earlier version (on its first boot of this one). Existing items otherwise keep their
   stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
+### Bug Fixes
+- A library on a database adopted from Jellyfin no longer browses empty after Ferrofin's
+  first scan, and media deleted from disk is removed from it again. Jellyfin files a
+  library's items under the library location's folder, Ferrofin under the library itself.
+  Browsing, counts, Latest, Next Up and the scan's removal of deleted media (including a
+  watcher or webhook event's) now read both. A scan never removes a library's own folders,
+  nor an entry whose file or folder is still on disk unless a new entry for the same file
+  replaced it. On an adopted database the first scan after upgrading removes the entries
+  for media deleted from disk since Ferrofin first scanned the library (or since adoption,
+  if it was never scanned), with their watched state. Until multi-version grouping is
+  ported, a movie's alternate versions (`Movie - 1080p.mkv` beside `Movie - 2160p.mkv`)
+  are listed as separate movies once the library is browsable again, and a plain
+  subfolder of a movie library shows as an empty folder. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
+
 ## [1.0.0] - 2026-09-05
 
 ### CI/CD

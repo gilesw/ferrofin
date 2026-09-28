@@ -609,8 +609,12 @@ impl ItemCountService for FerrofinItemCountService {
         // A Jellyfin library is virtual, so its children hang off its physical
         // folders and grouping on the raw `ParentId` would report 0 for every
         // library on an adopted database — the same translation the item
-        // repository does for a browse (`physical_folders_by_view`). Empty, and
-        // so a no-op, on a Ferrofin-written database.
+        // repository does for a browse. The library itself is counted too:
+        // a Ferrofin scan saves the rows it plans under the collection
+        // folder, so an adopted library's children are split between the two
+        // until every row is saved (`library_top_parents_by_view`; no row
+        // hangs off both, so the sum counts each once). Empty, and so a
+        // no-op, on a Ferrofin-written database.
         //
         // Two more translations come from the root pair. `Folder.GetChildren`
         // (Folder.cs:1348-1360) delegates the physical root's children to the
@@ -625,7 +629,8 @@ impl ItemCountService for FerrofinItemCountService {
         };
         let resolved_parents: Vec<Uuid> = parent_ids.iter().copied().map(as_user_root).collect();
         let by_view =
-            crate::item_repository::physical_folders_by_view(&self.db, &resolved_parents).await?;
+            crate::item_repository::library_top_parents_by_view(&self.db, &resolved_parents)
+                .await?;
         let counted: Vec<Uuid> = resolved_parents
             .iter()
             .flat_map(|p| match by_view.get(p) {
@@ -1328,6 +1333,8 @@ mod tests {
     /// Nothing carries a `CollectionFolder`'s id as `ParentId` on an adopted
     /// database, so grouping on the raw column reports 0 while the very same
     /// browse returns the items — the two would disagree in one response.
+    /// Until a Ferrofin scan saves the row, that is: then it hangs off the
+    /// collection folder itself, and the library counts both kinds.
     #[tokio::test]
     async fn a_jellyfin_library_counts_its_physical_folder_s_children() {
         let db = test_db().await;
@@ -1361,6 +1368,15 @@ mod tests {
             physical,
         )
         .await;
+        // A row a Ferrofin scan saved: under the collection folder itself.
+        seed_child_item(
+            &db,
+            Uuid::from_u128(0xE107),
+            BaseItemKind::Episode,
+            "c",
+            view,
+        )
+        .await;
         // An ordinary folder alongside it, to prove the translation is scoped.
         seed_named_item(&db, plain, BaseItemKind::Folder, "Other").await;
         seed_child_item(
@@ -1376,7 +1392,10 @@ mod tests {
             .get_child_count_batch(&[view, plain], None)
             .await
             .expect("child counts");
-        assert_eq!(counts[&view], 2, "the view counts through its folder");
+        assert_eq!(
+            counts[&view], 3,
+            "the view counts through its folder, and its own children"
+        );
         assert_eq!(counts[&plain], 1, "an ordinary parent counts its own");
     }
 

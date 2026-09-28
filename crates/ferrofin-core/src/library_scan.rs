@@ -5645,6 +5645,14 @@ impl LibraryScanner {
     /// by-name rows (genres, studios, artists, people) carry no `TopParentId`
     /// and are untouched. No-op without an item repository.
     ///
+    /// A row is keyed to a library by its `TopParentId`: the collection
+    /// folder, or — on a database adopted from Jellyfin, until a scan saves
+    /// the row — one of the physical folders the collection folder names
+    /// ([`ItemPersistenceService::library_top_parents`]); both are read. The
+    /// library's own folders are never removed ([`LibraryFolders`]), nor is
+    /// a row whose own file or folder is still on disk, whatever its kind
+    /// ([`Self::still_on_disk`]).
+    ///
     /// A path-scoped scan plans only its roots' subtrees, so only the rows
     /// there may be stale: the rows at or under a root, and the path-less
     /// ones (a virtual season) whose parent is one of those — read by path
@@ -5720,14 +5728,24 @@ impl LibraryScanner {
                 );
                 continue;
             }
+            // The library's rows carry the collection folder or, on a
+            // database adopted from Jellyfin, one of its physical folders —
+            // an adopted row keeps Jellyfin's `TopParentId` until a scan
+            // saves it — so both are read, or a deleted item that one scan
+            // saved would never be pruned, and one it did not save would
+            // escape a path-scoped scan.
+            let Some(top_parents) = self.library_top_parents(cf).await else {
+                continue;
+            };
             let Some(existing) = self
-                .prune_candidates(items.as_ref(), cf, scope.map(|s| s.roots))
+                .prune_candidates(items.as_ref(), &top_parents, scope.map(|s| s.roots))
                 .await
             else {
                 continue;
             };
+            let own = LibraryFolders::of(&top_parents, &folder.locations);
             let Some((ids, paths)) = self
-                .stale_rows(cf, &existing, &live, &planned_paths, &listed)
+                .stale_rows(cf, &existing, &live, &planned_paths, &listed, &own)
                 .await
             else {
                 continue;
@@ -5757,14 +5775,38 @@ impl LibraryScanner {
         removed
     }
 
+    /// The `TopParentId`s library `cf`'s rows carry
+    /// ([`ItemPersistenceService::library_top_parents`]), `cf` first; `cf`
+    /// alone from a store that cannot say. `None` when they could not be
+    /// read (logged): nothing of the library is pruned then.
+    async fn library_top_parents(&self, cf: Uuid) -> Option<Vec<Uuid>> {
+        match self.persistence.library_top_parents(cf).await {
+            Ok(Some(mut ids)) => {
+                if !ids.contains(&cf) {
+                    ids.insert(0, cf);
+                }
+                Some(ids)
+            }
+            Ok(None) => Some(vec![cf]),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    library = %cf,
+                    "failed to read the library's folders; nothing pruned"
+                );
+                None
+            }
+        }
+    }
+
     /// Which of library `cf`'s candidate rows `existing` the pruning
     /// deletes: those whose file is gone — not planned (`live`), known
     /// (`listed`: not under a folder that failed to list, and a path-less
-    /// one only where its parent's folder is), and not still on disk — less
-    /// the ones still holding a row this scan keeps
-    /// ([`hold_back_kept_children`]). Returns the ids to delete and the paths
-    /// of the rows read, for the report; `None` when the rows under them
-    /// could not be read, when nothing is pruned.
+    /// one only where its parent's folder is), not one of the library's own
+    /// folders (`own`), and not still on disk — less the ones still holding
+    /// a row this scan keeps ([`hold_back_kept_children`]). Returns the ids
+    /// to delete and the paths of the rows read, for the report; `None` when
+    /// the rows under them could not be read, when nothing is pruned.
     async fn stale_rows(
         &self,
         cf: Uuid,
@@ -5772,6 +5814,7 @@ impl LibraryScanner {
         live: &std::collections::HashSet<Uuid>,
         planned_paths: &std::collections::HashSet<&str>,
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
+        own: &LibraryFolders<'_>,
     ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
         // A path-less row sits in its parent's folder: it is known only
         // where that folder is — a parent that is unknown or has no path of
@@ -5794,12 +5837,19 @@ impl LibraryScanner {
             }
         };
         let mut kept_on_disk = 0_usize;
+        let mut kept_folders = 0_usize;
         let mut stale: std::collections::HashSet<Uuid> = existing
             .iter()
-            .filter(|row| row_listed(row) && !live.contains(&row.id))
+            .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = self.still_on_disk(&row.item_type, row.path.as_deref(), planned_paths);
-                kept_on_disk += usize::from(keep);
+                let keep = self.still_on_disk(row.path.as_deref(), planned_paths);
+                if keep {
+                    if planner_resolves(&row.item_type) {
+                        kept_on_disk += 1;
+                    } else {
+                        kept_folders += 1;
+                    }
+                }
                 !keep
             })
             .map(|row| row.id)
@@ -5809,6 +5859,15 @@ impl LibraryScanner {
                 library = %cf,
                 kept = kept_on_disk,
                 "kept items no listing planned whose files are still on disk"
+            );
+        }
+        if kept_folders > 0 {
+            // An adopted Jellyfin `Folder` row (a plain subfolder) is never
+            // planned, so it is kept this way on every scan: not news.
+            tracing::debug!(
+                library = %cf,
+                kept = kept_folders,
+                "kept rows of kinds no listing plans whose paths are still on disk"
             );
         }
         if stale.is_empty() {
@@ -5857,18 +5916,23 @@ impl LibraryScanner {
         Some((ids, paths))
     }
 
-    /// The stored rows of library `cf` the pruning weighs: those at or under
-    /// `roots` and their path-less children on a path-scoped scan (`roots`
-    /// given), every row of the library on a library scan. `None` when they
-    /// could not be read (logged): nothing of the library is pruned then.
+    /// The stored rows of the library whose rows carry `top_parents` (its
+    /// collection folder first, [`Self::library_top_parents`]) the pruning
+    /// weighs: those at or under `roots` and their path-less children on a
+    /// path-scoped scan (`roots` given), every row of the library on a
+    /// library scan — both less the owned non-extras and the alternate
+    /// versions a library read never lists
+    /// ([`ItemPersistenceService::library_items`]). `None` when they could
+    /// not be read (logged): nothing of the library is pruned then.
     async fn prune_candidates(
         &self,
         items: &dyn ItemRepository,
-        cf: Uuid,
+        top_parents: &[Uuid],
         roots: Option<&[String]>,
     ) -> Option<Vec<ItemPathRow>> {
+        let cf = top_parents.first().copied().unwrap_or_default();
         if let Some(roots) = roots {
-            match self.persistence.items_in_scope(cf, roots).await {
+            match self.persistence.items_in_scope(top_parents, roots).await {
                 Ok(Some(rows)) => return Some(rows),
                 // A store that cannot answer: the library's rows, filtered
                 // to the scope below.
@@ -5879,92 +5943,80 @@ impl LibraryScanner {
                 }
             }
         }
-        let rows = match items
-            .get_item_list(&InternalItemsQuery {
-                top_parent_ids: vec![cf],
-                recursive: true,
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(rows) => rows,
+        let rows = match self.persistence.library_items(top_parents).await {
+            Ok(Some(rows)) => rows,
+            // A store that cannot answer: the item repository's library
+            // read, which applies the same candidate terms.
+            Ok(None) => match items
+                .get_item_list(&InternalItemsQuery {
+                    top_parent_ids: top_parents.to_vec(),
+                    recursive: true,
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(rows) => rows
+                    .iter()
+                    .filter_map(|row| {
+                        Some(ItemPathRow {
+                            id: Uuid::parse_str(&row.id).ok()?,
+                            item_type: row.type_.clone(),
+                            path: row.path.clone(),
+                            parent_id: row.parent_id.as_deref().and_then(parse_id),
+                        })
+                    })
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
+                    return None;
+                }
+            },
             Err(err) => {
                 tracing::warn!(%err, library = %cf, "failed to list items for deleted-item prune");
                 return None;
             }
         };
-        let under = |path: Option<&str>| {
-            roots.is_none_or(|roots| {
-                path.is_some_and(|path| roots.iter().any(|root| path_is_under(path, root)))
-            })
+        let Some(roots) = roots else {
+            return Some(rows);
         };
-        let parents: std::collections::HashSet<&str> = rows
+        // A store that cannot read a scope: the library's rows, filtered to
+        // it.
+        let under = |path: &str| roots.iter().any(|root| path_is_under(path, root));
+        let parents: std::collections::HashSet<Uuid> = rows
             .iter()
-            .filter(|row| row.path.is_some() && under(row.path.as_deref()))
-            .map(|row| row.id.as_str())
+            .filter(|row| row.path.as_deref().is_some_and(under))
+            .map(|row| row.id)
             .collect();
-        let in_scope = |row: &BaseItemEntity| match row.path.as_deref() {
-            Some(path) => under(Some(path)),
-            None => {
-                roots.is_none()
-                    || (item_type_lookup::kind_from_type_name(&row.type_)
-                        == Some(BaseItemKind::Season)
-                        && row
-                            .parent_id
-                            .as_deref()
-                            .is_some_and(|parent| parents.contains(parent)))
-            }
-        };
-        let kept: Vec<ItemPathRow> = rows
-            .iter()
-            .filter(|row| in_scope(row))
-            .filter_map(|row| {
-                Some(ItemPathRow {
-                    id: Uuid::parse_str(&row.id).ok()?,
-                    item_type: row.type_.clone(),
-                    path: row.path.clone(),
-                    parent_id: row.parent_id.as_deref().and_then(parse_id),
+        Some(
+            rows.into_iter()
+                .filter(|row| match row.path.as_deref() {
+                    Some(path) => under(path),
+                    None => {
+                        item_type_lookup::kind_from_type_name(&row.item_type)
+                            == Some(BaseItemKind::Season)
+                            && row
+                                .parent_id
+                                .is_some_and(|parent| parents.contains(&parent))
+                    }
                 })
-            })
-            .collect();
-        Some(kept)
+                .collect(),
+        )
     }
 
-    /// The backstop behind the pruning: a stale row of a kind the planner
-    /// resolves whose own file or folder is still on disk, and whose path no
-    /// planned item claims (an item resolved anew at the same path, e.g. as
-    /// another kind, supersedes it), is not deleted — a listing that came
-    /// back short without an error must not take an item and its user data
-    /// with it.
+    /// The backstop behind the pruning: a stale row whose own file or
+    /// folder is still on disk, and whose path no planned item claims (an
+    /// item resolved anew at the same path, e.g. as another kind, supersedes
+    /// it), is not deleted, whatever its kind — a listing that came back
+    /// short without an error must not take an item and its user data with
+    /// it, and a row of a kind the planner never resolves (an adopted
+    /// Jellyfin `Folder` for a plain subfolder) is not "gone" because no
+    /// listing planned it.
     fn still_on_disk(
         &self,
-        item_type: &str,
         path: Option<&str>,
         planned_paths: &std::collections::HashSet<&str>,
     ) -> bool {
-        let planner_kind = matches!(
-            item_type_lookup::kind_from_type_name(item_type),
-            Some(
-                BaseItemKind::Movie
-                    | BaseItemKind::Trailer
-                    | BaseItemKind::Video
-                    | BaseItemKind::MusicVideo
-                    | BaseItemKind::Audio
-                    | BaseItemKind::AudioBook
-                    | BaseItemKind::Book
-                    | BaseItemKind::Photo
-                    | BaseItemKind::PhotoAlbum
-                    | BaseItemKind::Series
-                    | BaseItemKind::Season
-                    | BaseItemKind::Episode
-                    | BaseItemKind::MusicAlbum
-                    | BaseItemKind::MusicArtist
-            )
-        );
-        planner_kind
-            && path.is_some_and(|path| {
-                !planned_paths.contains(path) && self.file_system.path_exists(path)
-            })
+        path.is_some_and(|path| !planned_paths.contains(path) && self.file_system.path_exists(path))
     }
 
     /// Fills each image's pixel dimensions + blurhash via the image-processor seam, so the
@@ -8803,6 +8855,24 @@ impl LibraryScanner {
         }
         for entry in self.list(dir, ctx) {
             if entry.type_ == FileSystemEntryType::Directory {
+                // TODO(parity): a plain subfolder (`Movies/Collection/…`,
+                // not a title's own folder) is flattened: its movies are
+                // planned under the collection folder, and the folder itself
+                // is no item. Upstream it is a `Folder` (`FolderResolver.cs:
+                // 24-27`, the last-priority resolver for any directory no
+                // other resolver claims) and the parent of what is in it
+                // (`Folder.GetNonCachedChildren`, `Folder.cs:920-925`:
+                // `LibraryManager.ResolvePaths(children, …, this, …)`),
+                // so a folder view browses into it. On a database adopted
+                // from Jellyfin that `Folder` row survives the scan (the
+                // pruning keeps a row whose directory is still on disk) as
+                // an empty shell: the scan re-parents its movies to the
+                // collection folder. Un-defer path: resolve an unclaimed
+                // directory as a `Folder` planned under its parent folder
+                // (every library type's planner, not only this one), pass it
+                // down as the `ParentId` of what is planned in it while the
+                // `TopParentId` stays the library, and prove it with a
+                // `plan_paths` invariant case plus an adopted-library browse.
                 if ctx.scope.visits(&entry.path) {
                     self.collect_movie_plan(&entry.path, root, cf, ctx, out, extras, movies_by_dir);
                 }
@@ -10574,6 +10644,63 @@ fn affected_libraries(
         })
         .cloned()
         .collect()
+}
+
+/// A library's own folders, which the pruning never deletes: its
+/// collection folder and the physical folders its `PhysicalFolderIds` names
+/// (on a database adopted from Jellyfin, the rows its items hang off — the
+/// top parents [`LibraryScanner::library_top_parents`] reads), and any row
+/// at one of its locations. The scan plans none of them, and removing one
+/// would take the library's structure (and, by the `ParentId` cascade,
+/// anything still under it) with it.
+struct LibraryFolders<'a> {
+    /// The collection folder and its physical folders.
+    ids: std::collections::HashSet<Uuid>,
+    /// The library's locations, without trailing slashes.
+    locations: std::collections::HashSet<&'a str>,
+}
+
+impl<'a> LibraryFolders<'a> {
+    fn of(top_parents: &[Uuid], locations: &'a [String]) -> Self {
+        Self {
+            ids: top_parents.iter().copied().collect(),
+            locations: locations.iter().map(|l| trimmed_dir(l)).collect(),
+        }
+    }
+
+    /// Whether `row` is one of them.
+    fn holds(&self, row: &ItemPathRow) -> bool {
+        self.ids.contains(&row.id)
+            || row
+                .path
+                .as_deref()
+                .is_some_and(|path| self.locations.contains(trimmed_dir(path)))
+    }
+}
+
+/// Whether the planner resolves items of the stored `item_type` — a stale
+/// row of one of these kept because its file is still on disk means a
+/// listing came back short, which is worth a warning.
+fn planner_resolves(item_type: &str) -> bool {
+    matches!(
+        item_type_lookup::kind_from_type_name(item_type),
+        Some(
+            BaseItemKind::Movie
+                | BaseItemKind::Trailer
+                | BaseItemKind::Video
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Photo
+                | BaseItemKind::PhotoAlbum
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicArtist
+        )
+    )
 }
 
 /// The directories a plan pass could not list. Looked up by a path's

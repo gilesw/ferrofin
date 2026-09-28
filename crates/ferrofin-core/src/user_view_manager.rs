@@ -505,36 +505,25 @@ impl FerrofinUserViewManager {
 
     /// 12.1 `UserViewManager.HasVisibleChild`: whether any direct child of
     /// the folder — or of its physical folders, for a `CollectionFolder` that
-    /// has some — is visible to `user`. One key lookup per parent, ungrouped,
-    /// stored columns only.
+    /// has some — is visible to `user`. One key lookup, ungrouped, stored
+    /// columns only: the item repository's direct-children read of a
+    /// collection folder already takes its physical folders' children with
+    /// its own (`parent_physical_folder_ids`), which covers an adopted
+    /// library's rows whether they still hang off Jellyfin's physical folder
+    /// or a Ferrofin scan saved them under the collection folder.
     async fn has_visible_child(
         &self,
         folder: Uuid,
         user: &UserEntity,
     ) -> Result<bool, ServiceError> {
-        let mut parents = vec![folder];
-        if let Some(db) = &self.db {
-            let physical = crate::item_repository::physical_folders_by_view(db, &[folder])
-                .await?
-                .remove(&folder)
-                .unwrap_or_default();
-            if !physical.is_empty() {
-                parents = physical;
-            }
-        }
-        for parent in parents {
-            let query = InternalItemsQuery {
-                parent_id: parent,
-                user: Some(user.clone()),
-                group_by_presentation_unique_key: false,
-                limit: Some(1),
-                ..Default::default()
-            };
-            if !self.items.get_item_list(&query).await?.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let query = InternalItemsQuery {
+            parent_id: folder,
+            user: Some(user.clone()),
+            group_by_presentation_unique_key: false,
+            limit: Some(1),
+            ..Default::default()
+        };
+        Ok(!self.items.get_item_list(&query).await?.is_empty())
     }
 
     async fn user_entity(&self, user_id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
