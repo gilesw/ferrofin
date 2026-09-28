@@ -76,9 +76,15 @@ fn request_context(provider: &str, url: &reqwest::Url) -> String {
 /// backoff and jitter. Connection failures open the circuit after one attempt.
 /// State persists between calls, including after cancellation.
 /// This coordinates callers within one process, not other clients sharing its IP.
+///
+/// Every logical request (retries excluded) is counted on
+/// `ferrofin_metadata_provider_requests_total` under the limiter's bounded
+/// `provider` label ([`crate::metrics`]).
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     provider: Arc<str>,
+    /// The `provider` label of this limiter's request metrics.
+    metric_label: &'static str,
     settings: Settings,
     state: Arc<Mutex<RequestRate>>,
 }
@@ -87,11 +93,37 @@ impl RateLimiter {
     /// Creates an independent quota gate. Clone it to share cooldowns.
     #[must_use]
     pub fn new(provider: impl Into<Arc<str>>) -> Self {
+        let provider = provider.into();
         Self {
-            provider: provider.into(),
+            metric_label: crate::metrics::provider_label(&provider),
+            provider,
             settings: Settings::from_env(),
             state: Arc::default(),
         }
+    }
+
+    /// This gate — the same pacing, quota and cooldown state, shared with
+    /// every other clone — with its requests counted under the provider
+    /// `label` (bounded like every label: an unknown one is `other`). The
+    /// label only names the caller in the metrics; it never splits the gate.
+    #[must_use]
+    pub(crate) fn counted_as(&self, label: &str) -> Self {
+        Self {
+            metric_label: crate::metrics::provider_label(label),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `other` is a clone of this gate (shares its state).
+    #[cfg(test)]
+    pub(crate) fn shares_gate_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// The `provider` label its requests are counted under.
+    #[cfg(test)]
+    pub(crate) fn metric_label(&self) -> &'static str {
+        self.metric_label
     }
 
     /// Executes a GET with the caller's minimum interval and bounded retries.
@@ -137,14 +169,17 @@ impl RateLimiter {
     }
 
     /// [`execute`](Self::execute), counting a failed outcome into the
-    /// caller's [`count_request_failures`] scope.
+    /// caller's [`count_request_failures`] scope and the request into the
+    /// provider request metrics.
     async fn execute_observed(
         &self,
         http: reqwest::Client,
         request: reqwest::Request,
         interval: Duration,
     ) -> Result<reqwest::Response, RequestError> {
-        let result = self.execute(http, request, interval).await;
+        let mut sent = 0;
+        let result = self.execute(http, request, interval, &mut sent).await;
+        crate::metrics::request_finished(self.metric_label, request_result(&result, sent));
         let failed = match &result {
             Err(_) => true,
             Ok(response) => is_failure_status(response.status()),
@@ -155,11 +190,14 @@ impl RateLimiter {
         result
     }
 
+    /// Sends `request` with its retries; `sent` counts the attempts that
+    /// actually went out.
     async fn execute(
         &self,
         http: reqwest::Client,
         request: reqwest::Request,
         interval: Duration,
+        sent: &mut u32,
     ) -> Result<reqwest::Response, RequestError> {
         let attempts = if request.method() == reqwest::Method::GET {
             GET_ATTEMPTS
@@ -193,6 +231,10 @@ impl RateLimiter {
             attempt_request
                 .timeout_mut()
                 .get_or_insert(self.settings.timeout);
+            if *sent > 0 {
+                crate::metrics::retried(self.metric_label);
+            }
+            *sent += 1;
             let response = http.execute(attempt_request).await;
             match response {
                 Ok(resp) => {
@@ -289,6 +331,25 @@ impl RateLimiter {
                 None
             }
         }
+    }
+}
+
+/// The `result` label of one logical request ([`crate::metrics`]): `skipped`
+/// only when nothing was ever sent (an open circuit or a cooldown longer than
+/// the caller may wait). A request that went out and then gave up — say a
+/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`.
+fn request_result(
+    result: &Result<reqwest::Response, RequestError>,
+    sent: u32,
+) -> crate::metrics::RequestResult {
+    use crate::metrics::RequestResult;
+    match result {
+        Err(RequestError::Cooldown) if sent == 0 => RequestResult::Skipped,
+        Ok(response) if response.status().is_success() => RequestResult::Ok,
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+            RequestResult::NotFound
+        }
+        Ok(_) | Err(_) => RequestResult::Failed,
     }
 }
 
@@ -1113,6 +1174,100 @@ mod tests {
         assert!(
             rate.next.unwrap().saturating_duration_since(Instant::now()) > Duration::from_secs(15)
         );
+    }
+
+    /// The metric result of a request: a 429 whose `Retry-After` outlasts the
+    /// wait for its retry was sent, so it `failed`; the next request, never
+    /// sent because of that cooldown, was `skipped`.
+    #[tokio::test(start_paused = true)]
+    async fn a_sent_request_that_gives_up_on_a_cooldown_failed_the_next_one_skipped() {
+        use crate::metrics::RequestResult;
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let limiter = RateLimiter::new("test");
+        let http = reqwest::Client::new();
+        let mut sent = 0;
+        let first = limiter
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(first, Err(RequestError::Cooldown)));
+        assert_eq!(sent, 1);
+        assert_eq!(request_result(&first, sent), RequestResult::Failed);
+        let mut sent = 0;
+        let second = limiter
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(second, Err(RequestError::Cooldown)));
+        assert_eq!(request_result(&second, sent), RequestResult::Skipped);
+        assert_eq!(task.await.unwrap().len(), 1);
+        // Answers: a success, a 404, and a 503 that outlived its retries.
+        for (script, want, attempts) in [
+            (vec![(200, "")], RequestResult::Ok, 1),
+            (vec![(404, "")], RequestResult::NotFound, 1),
+            (
+                vec![(503, "Retry-After: 0\r\n"); 4],
+                RequestResult::Failed,
+                4,
+            ),
+        ] {
+            let (url, task) = scripted_server(script).await;
+            let limiter = RateLimiter::new("test");
+            let mut sent = 0;
+            let result = limiter
+                .execute(
+                    http.clone(),
+                    http.get(&url).build().unwrap(),
+                    Duration::ZERO,
+                    &mut sent,
+                )
+                .await;
+            assert_eq!(sent, attempts);
+            assert_eq!(request_result(&result, sent), want);
+            task.await.unwrap();
+        }
+    }
+
+    /// A clone counted under another label is the same gate: a cooldown the
+    /// server set through one holds the other back too.
+    #[tokio::test(start_paused = true)]
+    async fn a_relabelled_clone_shares_the_cooldown() {
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let artwork = RateLimiter::new("https://cdn.example").counted_as("image");
+        let subtitle = artwork.counted_as("opensubtitles");
+        let http = reqwest::Client::new();
+        let mut sent = 0;
+        let first = artwork
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(first, Err(RequestError::Cooldown)));
+        let mut sent = 0;
+        let second = subtitle
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(second, Err(RequestError::Cooldown)));
+        assert_eq!(sent, 0, "held back by the other label's cooldown");
+        assert_eq!(task.await.unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

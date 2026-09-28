@@ -32,6 +32,9 @@ thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+# Deep-internal scan metrics (docs/conventions/METRICS.md rule 8): the OTel API
+# only; the pipeline lives in ferrofin-metrics.
+opentelemetry.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 # The photo embedded-information provider (EXIF) runs during the scan.

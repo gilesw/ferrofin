@@ -38,7 +38,9 @@ use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, ScanTarget, image_type_allows_multiple};
+use ferrofin_traits::library::{
+    LibraryManager, ScanTarget, ScanTrigger, image_type_allows_multiple,
+};
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
@@ -112,8 +114,9 @@ struct ScanRequest {
     /// for a folder refresh (upstream validates a folder's subtree and never
     /// refreshes the folders above it).
     ancestors: MetadataRefreshOptions,
-    /// The `library_scan` span's `trigger` (`api`, `schedule`, `watcher`, …).
-    trigger: &'static str,
+    /// Why it runs: its `library_scan` span's `trigger`, and the label of the
+    /// scan metrics it records.
+    trigger: ScanTrigger,
     /// Its closing passes: the whole library's for library validation, only
     /// the touched items' for a refresh over the API.
     passes: ScanPasses,
@@ -125,7 +128,7 @@ struct ScanRequest {
 impl ScanRequest {
     /// A request refreshing with the `MetadataRefreshOptions` constructor
     /// defaults — every trigger but a refresh over the API.
-    fn defaults(trigger: &'static str, scope: ScanTarget) -> Self {
+    fn defaults(trigger: ScanTrigger, scope: ScanTarget) -> Self {
         Self {
             scope,
             options: MetadataRefreshOptions::default(),
@@ -147,7 +150,7 @@ impl ScanRequest {
                 ..MetadataRefreshOptions::default()
             },
             // A request over the API (`LOGGING.md`'s trigger vocabulary).
-            trigger: "api",
+            trigger: ScanTrigger::Api,
             // `RefreshItem` runs no post-scan task.
             passes: ScanPasses::Touched,
             priority: false,
@@ -165,13 +168,13 @@ impl ScanRequest {
         }
     }
 
-    /// The library monitor's settled change batch — the disk watcher and
-    /// the *arr webhooks: `FileRefresher`'s `ChangedExternally` refresh
-    /// (`FileRefresher.cs:135-208`, `BaseItem.cs:2275-2278`), the default
-    /// options for the item each changed path refreshes, nothing for the
-    /// folders above it (a refresh never touches them), and no post-scan
+    /// The library monitor's settled change batch — the disk watcher's or
+    /// the *arr webhooks' (`trigger`): `FileRefresher`'s `ChangedExternally`
+    /// refresh (`FileRefresher.cs:135-208`, `BaseItem.cs:2275-2278`), the
+    /// default options for the item each changed path refreshes, nothing for
+    /// the folders above it (a refresh never touches them), and no post-scan
     /// task (`ProviderManager.RefreshItem` runs none).
-    fn changed(paths: Vec<String>) -> Self {
+    fn changed(paths: Vec<String>, trigger: ScanTrigger) -> Self {
         Self {
             scope: ScanTarget::Changed(paths),
             options: MetadataRefreshOptions::default(),
@@ -180,7 +183,7 @@ impl ScanRequest {
                 image_refresh_mode: MetadataRefreshMode::None,
                 ..MetadataRefreshOptions::default()
             },
-            trigger: "watcher",
+            trigger,
             passes: ScanPasses::Touched,
             priority: false,
         }
@@ -292,6 +295,17 @@ enum ScanResult {
     Failed(String),
 }
 
+impl ScanResult {
+    /// The `result` label of the scan metrics.
+    fn metric_end(&self) -> crate::scan_metrics::ScanEnd {
+        match self {
+            Self::Completed => crate::scan_metrics::ScanEnd::Completed,
+            Self::Stopped => crate::scan_metrics::ScanEnd::Stopped,
+            Self::Failed(_) => crate::scan_metrics::ScanEnd::Failed,
+        }
+    }
+}
+
 /// The scan queue: at most one scan runs at a time, on the queue's own
 /// worker task, and the requests that arrive meanwhile wait their turn.
 #[derive(Default)]
@@ -353,7 +367,9 @@ impl ScanQueue {
     ///   scan (which will see its files), and a library or artist scan an
     ///   identical queued one;
     /// - folder path scans union their paths, and so do the library
-    ///   monitor's changed-path scans — never with each other;
+    ///   monitor's changed-path scans — never with each other. A watcher
+    ///   batch and a webhook batch join like any two (the trigger is a label
+    ///   only); the joined scan keeps the queued request's trigger;
     /// - a library scan never becomes a full one, and path scans never join
     ///   a library scan: a watcher or webhook report queued behind a
     ///   library scan runs after it, scoped (by then its item is current,
@@ -595,6 +611,8 @@ impl ScanWorker {
             done: false,
         };
         let started = std::time::Instant::now();
+        // `ferrofin_library_scan_in_progress` while the queue drains.
+        let _in_progress = crate::scan_metrics::ScanInProgress::enter();
         tracing::info!("library scan started");
         let mut total = crate::library_scan::ScanOutcome::default();
         loop {
@@ -628,13 +646,20 @@ impl ScanWorker {
             };
             let span = tracing::info_span!(
                 "library_scan_pass",
-                trigger = request.trigger,
+                trigger = request.trigger.as_str(),
                 scope = scope_label(&request.scope)
             );
+            let begun = std::time::Instant::now();
             let task = self.spawn_scan(&request, &cancel, &span);
             release.request = Some(request.clone());
             release.scan_task = Some(task.abort_handle());
             let (result, pass) = Self::finish(task, &request, span, waited).await;
+            crate::scan_metrics::scan_finished(
+                request.trigger,
+                result.metric_end(),
+                pass.as_ref(),
+                begun.elapsed(),
+            );
             release.request = None;
             release.scan_task = None;
             if let Some(pass) = pass {
@@ -823,7 +848,11 @@ impl PriorityLane for QueueLane {
             Err(err) => ScanResult::Failed(err.to_string()),
         };
         let mut queue = lock_queue(&self.queue);
-        let waited = queue.serving.remove(&refresh.key).is_some_and(|serving| {
+        let serving = queue.serving.remove(&refresh.key);
+        let trigger = serving
+            .as_ref()
+            .map_or(ScanTrigger::Api, |serving| serving.request.trigger);
+        let waited = serving.is_some_and(|serving| {
             let waited = !serving.waiters.tickets.is_empty();
             for ticket in serving.waiters.tickets {
                 queue.sinks.remove(&ticket);
@@ -832,6 +861,11 @@ impl PriorityLane for QueueLane {
             waited
         });
         drop(queue);
+        crate::scan_metrics::lane_refresh_finished(
+            trigger,
+            result.metric_end(),
+            outcome.as_ref().ok(),
+        );
         // Logged once, at the outermost layer: a caller waiting for the
         // refresh (Identify → Apply) reports its failure itself; a queued
         // one's is reported here.
@@ -1132,11 +1166,15 @@ impl FerrofinLibraryManager {
 
 #[async_trait]
 impl crate::library_monitor::LibraryScanTrigger for FerrofinLibraryManager {
-    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
+    async fn queue_scan_paths(
+        &self,
+        paths: Vec<String>,
+        trigger: ScanTrigger,
+    ) -> Result<(), ServiceError> {
         // The monitor's settled change batch (the watcher, the Radarr/Sonarr
         // webhooks): each path's `ChangedExternally` refresh, scoped to the
         // item it refreshes (`FileRefresher.cs:135-208`).
-        self.spawn_scan(ScanRequest::changed(paths));
+        self.spawn_scan(ScanRequest::changed(paths, trigger));
         Ok(())
     }
 }
@@ -1688,13 +1726,13 @@ impl LibraryManager for FerrofinLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults("api", ScanTarget::All));
+        self.spawn_scan(ScanRequest::defaults(ScanTrigger::Api, ScanTarget::All));
         Ok(())
     }
 
     async fn queue_library_scan_with_trigger(
         &self,
-        trigger: &'static str,
+        trigger: ScanTrigger,
     ) -> Result<(), ServiceError> {
         self.spawn_scan(ScanRequest::defaults(trigger, ScanTarget::All));
         Ok(())
@@ -1702,7 +1740,7 @@ impl LibraryManager for FerrofinLibraryManager {
 
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
         self.spawn_scan(ScanRequest::defaults(
-            "api",
+            ScanTrigger::Api,
             ScanTarget::Library(library_id),
         ));
         Ok(())
@@ -1756,10 +1794,11 @@ impl LibraryManager for FerrofinLibraryManager {
 
     async fn run_library_scan(
         &self,
+        trigger: ScanTrigger,
         progress: Option<ScanProgressSink>,
     ) -> Result<bool, ServiceError> {
         // The scan runs on the queue's worker; this future only waits for it.
-        self.run_scan(ScanRequest::defaults("schedule", ScanTarget::All), progress)
+        self.run_scan(ScanRequest::defaults(trigger, ScanTarget::All), progress)
             .await
     }
 
@@ -1818,12 +1857,13 @@ impl FerrofinLibraryManager {
     ) -> Option<u64> {
         let Some(runner) = &self.scanner else {
             tracing::debug!(
-                trigger = request.trigger,
+                trigger = request.trigger.as_str(),
                 "library scan queued (no scanner attached — no-op)"
             );
             return None;
         };
-        let trigger = request.trigger;
+        let request_trigger = request.trigger;
+        let trigger = request_trigger.as_str();
         let scope = scope_label(&request.scope);
         let (ticket, start, behind) = {
             let mut queue = lock_queue(&self.scan_queue);
@@ -1848,7 +1888,7 @@ impl FerrofinLibraryManager {
             );
         }
         if start {
-            self.start_worker(Arc::clone(runner), trigger);
+            self.start_worker(Arc::clone(runner), request_trigger);
         }
         ticket
     }
@@ -1857,13 +1897,13 @@ impl FerrofinLibraryManager {
     /// `library_scan` root span tagged with the trigger that started it — a
     /// scan is a background unit of work, never parented under the request
     /// span.
-    fn start_worker(&self, runner: Arc<dyn ScanRunner>, trigger: &'static str) {
+    fn start_worker(&self, runner: Arc<dyn ScanRunner>, trigger: ScanTrigger) {
         let worker = ScanWorker {
             runner,
             queue: Arc::clone(&self.scan_queue),
             progress: Arc::clone(&self.scan_progress),
         };
-        let span = tracing::info_span!(parent: None, "library_scan", trigger);
+        let span = tracing::info_span!(parent: None, "library_scan", trigger = trigger.as_str());
         let task = tokio::spawn(worker.drain().instrument(span));
         #[cfg(test)]
         {
@@ -2234,7 +2274,9 @@ mod tests {
     fn spawn_scheduled(mgr: &FerrofinLibraryManager) -> tokio::task::JoinHandle<()> {
         let mgr = mgr.clone();
         tokio::spawn(async move {
-            mgr.run_library_scan(None).await.expect("scan runs");
+            mgr.run_library_scan(ScanTrigger::Schedule, None)
+                .await
+                .expect("scan runs");
         })
     }
 
@@ -2251,7 +2293,9 @@ mod tests {
         let mgr = manager(&db).with_scan_runner(runner.clone());
 
         runner.release(GatedRunner::ITEMS);
-        mgr.run_library_scan(None).await.expect("scan runs");
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("scan runs");
         until_idle(&mgr).await;
         assert_eq!(runner.runs(), vec![default_run(ScanTarget::All)]);
 
@@ -2307,7 +2351,7 @@ mod tests {
         runner.release(GatedRunner::ITEMS);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            mgr.run_library_scan(None),
+            mgr.run_library_scan(ScanTrigger::Schedule, None),
         )
         .await
         .expect("the next scan is not wedged")
@@ -2691,7 +2735,7 @@ mod tests {
         runner.release(GatedRunner::ITEMS);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            mgr.run_library_scan(None),
+            mgr.run_library_scan(ScanTrigger::Schedule, None),
         )
         .await
         .expect("not wedged")
@@ -2748,25 +2792,37 @@ mod tests {
             Arc::new(move |percent| seen.lock().expect("seen").push(percent))
         };
         runner.release(GatedRunner::ITEMS);
-        assert!(mgr.run_library_scan(Some(sink)).await.expect("scan runs"));
+        assert!(
+            mgr.run_library_scan(ScanTrigger::Schedule, Some(sink))
+                .await
+                .expect("scan runs")
+        );
         assert_eq!(*seen.lock().expect("seen"), vec![48.0, 96.0]);
 
         runner
             .fail_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
         runner.release(GatedRunner::ITEMS);
-        let err = mgr.run_library_scan(None).await.expect_err("failed");
+        let err = mgr
+            .run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect_err("failed");
         assert!(err.to_string().contains("disk full"), "{err}");
 
         runner
             .panic_next
             .store(true, std::sync::atomic::Ordering::SeqCst);
         runner.release(GatedRunner::ITEMS);
-        let err = mgr.run_library_scan(None).await.expect_err("panicked");
+        let err = mgr
+            .run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect_err("panicked");
         assert!(err.to_string().contains("panicked"), "{err}");
 
         runner.release(GatedRunner::ITEMS);
-        mgr.run_library_scan(None).await.expect("scanning goes on");
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("scanning goes on");
         until_idle(&mgr).await;
     }
 
@@ -2930,7 +2986,9 @@ mod tests {
 
         mgr.queue_library_scan().await.expect("refused quietly");
         assert!(
-            !mgr.run_library_scan(None).await.expect("refused quietly"),
+            !mgr.run_library_scan(ScanTrigger::Schedule, None)
+                .await
+                .expect("refused quietly"),
             "a refused scan did not run to its end"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2974,7 +3032,7 @@ mod tests {
             scope,
             options,
             ancestors: MetadataRefreshOptions::default(),
-            trigger: "test",
+            trigger: ScanTrigger::Api,
             passes: ScanPasses::Library,
             priority: false,
         }
@@ -3143,12 +3201,12 @@ mod tests {
     /// closing passes — never a full scan.
     #[test]
     fn a_watcher_report_is_a_changed_path_scan_of_the_default_options() {
-        let request = ScanRequest::changed(vec!["/m/a.mkv".to_owned()]);
+        let request = ScanRequest::changed(vec!["/m/a.mkv".to_owned()], ScanTrigger::Watcher);
         assert_eq!(request.scope, changed(&["/m/a.mkv"]));
         assert_eq!(request.options, MetadataRefreshOptions::default());
         assert_eq!(request.ancestors, none_none());
         assert_eq!(request.passes, ScanPasses::Touched);
-        assert_eq!(request.trigger, "watcher");
+        assert_eq!(request.trigger, ScanTrigger::Watcher);
         assert!(!request.priority);
     }
 
@@ -3163,13 +3221,19 @@ mod tests {
             request(lib.clone(), MetadataRefreshOptions::default()),
             false,
         );
-        queue.enqueue(ScanRequest::changed(vec!["/m/a".to_owned()]), false);
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
         queue.enqueue(
             ScanRequest::folder_refresh(paths(&["/m/f"]), MetadataRefreshOptions::default()),
             false,
         );
         queue.enqueue(
-            ScanRequest::changed(vec!["/m/b".to_owned(), "/m/a".to_owned()]),
+            ScanRequest::changed(
+                vec!["/m/b".to_owned(), "/m/a".to_owned()],
+                ScanTrigger::Watcher,
+            ),
             false,
         );
         // A library scan arriving after the report does not swallow it either.
@@ -3197,13 +3261,52 @@ mod tests {
         );
     }
 
+    /// A webhook batch joins a queued watcher batch like any two reports
+    /// (the trigger never changes what runs); the joined scan keeps the
+    /// queued request's trigger.
+    #[test]
+    fn webhook_and_watcher_batches_join_under_the_queued_trigger() {
+        let mut queue = ScanQueue::default();
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/b".to_owned()], ScanTrigger::Webhook),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/c".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/d".to_owned()], ScanTrigger::Webhook),
+            false,
+        );
+        let queued: Vec<(ScanTarget, ScanTrigger)> = queue
+            .pending
+            .iter()
+            .map(|p| (p.request.scope.clone(), p.request.trigger))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![(
+                changed(&["/m/a", "/m/b", "/m/c", "/m/d"]),
+                ScanTrigger::Watcher
+            )]
+        );
+    }
+
     /// A report that arrives while a full scan is still queued joins it (the
     /// full scan will see the file); a full scan queued after reports takes
     /// them over. A full scan of other options covers neither.
     #[test]
     fn a_queued_full_scan_covers_changed_path_scans() {
         let mut queue = ScanQueue::default();
-        queue.enqueue(ScanRequest::changed(vec!["/m/a".to_owned()]), false);
+        queue.enqueue(
+            ScanRequest::changed(vec!["/m/a".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
         queue.enqueue(request(ScanTarget::All, replace_all()), false);
         let full = queue.enqueue(
             request(ScanTarget::All, MetadataRefreshOptions::default()),
@@ -3214,7 +3317,10 @@ mod tests {
             vec![(ScanTarget::All, true), (ScanTarget::All, false)],
             "the default full scan took the report's place"
         );
-        let late = queue.enqueue(ScanRequest::changed(vec!["/m/z".to_owned()]), false);
+        let late = queue.enqueue(
+            ScanRequest::changed(vec!["/m/z".to_owned()], ScanTrigger::Watcher),
+            false,
+        );
         assert_eq!(late, None);
         assert_eq!(
             queue.pending.len(),
@@ -3403,9 +3509,12 @@ mod tests {
         let mgr = manager(&db).with_scan_runner(runner.clone());
         let waiter = spawn_scheduled(&mgr);
         runner.started(1).await;
-        mgr.queue_scan_paths(vec!["/media/tv/Show/Season 1/e.mkv".to_owned()])
-            .await
-            .expect("queued");
+        mgr.queue_scan_paths(
+            vec!["/media/tv/Show/Season 1/e.mkv".to_owned()],
+            ScanTrigger::Watcher,
+        )
+        .await
+        .expect("queued");
         until_queued(&mgr, 1, 0).await;
         runner.release(2 * GatedRunner::ITEMS);
         waiter.await.expect("joined");
@@ -3473,9 +3582,12 @@ mod tests {
 
         // Report the episode's path (what the monitor dispatches after a settle
         // window): its hierarchy lands, the movie library is never planned.
-        mgr.queue_scan_paths(vec![episode.to_string_lossy().into_owned()])
-            .await
-            .expect("queued");
+        mgr.queue_scan_paths(
+            vec![episode.to_string_lossy().into_owned()],
+            ScanTrigger::Webhook,
+        )
+        .await
+        .expect("queued");
         let count = |kind| {
             let mgr = &mgr;
             async move {
@@ -3797,7 +3909,9 @@ mod tests {
         let db = test_db().await;
         let mgr = manager(&db);
         mgr.queue_library_scan().await.expect("queue");
-        mgr.run_library_scan(None).await.expect("run");
+        mgr.run_library_scan(ScanTrigger::Schedule, None)
+            .await
+            .expect("run");
         mgr.shutdown_scans().await;
     }
 

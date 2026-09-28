@@ -125,6 +125,7 @@ struct FileConfig {
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
+    metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
@@ -297,6 +298,20 @@ pub struct Config {
     /// out of the API `ServerConfiguration` so `/System/Configuration` stays
     /// byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
+
+    /// Bucket boundaries (seconds, ascending) of the library-scan duration
+    /// histograms (`ferrofin_library_scan_duration_seconds`,
+    /// `ferrofin_library_scan_pass_duration_seconds`). `None` = the default,
+    /// 1–2.5–5 per decade from 0.001 s to 5000 s
+    /// ([`ferrofin_core::scan_metrics::DEFAULT_DURATION_BUCKETS`]). Resolved
+    /// `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` env (comma-separated, e.g.
+    /// `0.01,0.1,1,10,100,1000`) > `metrics_scan_duration_buckets` in
+    /// `config.toml` (an array of numbers) > default. Only consulted when
+    /// `EnableMetrics` is set. Like the sampler interval, a bad value never
+    /// stops the server: the metrics install refuses a list that is empty,
+    /// non-finite, not above zero or not strictly increasing, warns, and uses
+    /// the default. A bootstrap knob only, never a `ServerConfiguration` field.
+    pub metrics_scan_duration_buckets: Option<Vec<f64>>,
 
     /// How long a graceful shutdown/restart waits for in-flight requests before
     /// the remaining connections are aborted, in seconds. Default 30 — ASP.NET's
@@ -587,6 +602,11 @@ impl Config {
                 .or(file.disable_extensions)
                 .unwrap_or(false),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
+            metrics_scan_duration_buckets: env
+                .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
+                .filter(|raw| !raw.trim().is_empty())
+                .map(|raw| parse_bucket_list(&raw))
+                .or(file.metrics_scan_duration_buckets),
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
@@ -694,6 +714,7 @@ impl Config {
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
+            metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
@@ -721,6 +742,15 @@ fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
     parse_var(env, "FERROFIN_METRICS_SAMPLE_INTERVAL")
         .or(file)
         .filter(|&s| s > 0)
+}
+
+/// Parses a comma-separated list of bucket boundaries (seconds). An entry
+/// that is not a number becomes `NaN`, so the metrics install refuses the
+/// whole list with a warning instead of silently installing a shorter one.
+fn parse_bucket_list(raw: &str) -> Vec<f64> {
+    raw.split(',')
+        .map(|entry| entry.trim().parse().unwrap_or(f64::NAN))
+        .collect()
 }
 
 /// Resolves the SQLite pool-size override: `FERROFIN_DB_POOL` env (integer or
@@ -1117,6 +1147,48 @@ mod tests {
             Config::load_from(cli(), &env).unwrap().enable_metrics,
             Some(false)
         );
+    }
+
+    #[test]
+    fn scan_duration_buckets_env_beats_file_and_defers_when_unset() {
+        assert_eq!(
+            Config::load_from(Cli::default(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            None,
+            "unset: the default buckets"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        // Integers and floats mix in the TOML array.
+        std::fs::write(&toml, "metrics_scan_duration_buckets = [0.5, 30, 3600]\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.5, 30.0, 3600.0])
+        );
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", " 0.1, 1 ,10");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .metrics_scan_duration_buckets,
+            Some(vec![0.1, 1.0, 10.0])
+        );
+        // A typo is kept as NaN for the install to refuse (with a warning),
+        // never dropped into a silently shorter list.
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SCAN_DURATION_BUCKETS", "0.1,1s,10");
+        let buckets = Config::load_from(cli(), &env)
+            .unwrap()
+            .metrics_scan_duration_buckets
+            .expect("set");
+        assert_eq!(buckets.len(), 3);
+        assert!(buckets[1].is_nan());
+        assert!(ferrofin_core::scan_metrics::validate_duration_buckets(&buckets).is_err());
     }
 
     #[test]

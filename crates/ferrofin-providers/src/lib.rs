@@ -24,6 +24,7 @@ pub mod local_xml;
 pub mod lrclib;
 pub mod mediainfo;
 pub mod metadata_merge;
+pub mod metrics;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;

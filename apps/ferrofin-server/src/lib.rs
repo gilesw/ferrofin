@@ -462,7 +462,8 @@ async fn serve_once(
             // the API `ServerConfiguration` so `/System/Configuration` stays
             // byte-identical to Jellyfin. `None`/0 → the sampler's 15 s default.
             let interval = config.metrics_sample_interval.unwrap_or(0);
-            enable_metrics_endpoint(&mut router, &wired.state, &db, interval, metrics)
+            let buckets = config.metrics_scan_duration_buckets.as_deref();
+            enable_metrics_endpoint(&mut router, &wired.state, &db, interval, buckets, metrics)
         })
         .flatten();
 
@@ -749,6 +750,7 @@ fn enable_metrics_endpoint(
     state: &ferrofin_api::AppState,
     db: &ferrofin_db::Database,
     sample_interval_seconds: u32,
+    scan_duration_buckets: Option<&[f64]>,
     process: &mut Option<ProcessMetrics>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if process.is_none() {
@@ -760,6 +762,7 @@ fn enable_metrics_endpoint(
         match ferrofin_metrics::init(route_labels, tokio::runtime::Handle::current()) {
             Ok(handle) => {
                 let gauges = metrics_wiring::register_gauges(&handle);
+                metrics_wiring::install_subsystem_instruments(scan_duration_buckets);
                 *process = Some(ProcessMetrics { handle, gauges });
                 tracing::info!("prometheus metrics enabled at /metrics");
             }

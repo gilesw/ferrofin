@@ -24,6 +24,13 @@
 //! dispatches only once the window lapses with no further changes. A zero
 //! delay dispatches immediately. Without a trigger attached (unit tests) a
 //! change is logged only.
+//!
+//! A report carries its source — the watcher's [`ScanTrigger::Watcher`], the
+//! *arr webhooks' [`ScanTrigger::Webhook`] — only as a label: both go through
+//! the same debounce and the same refresh, exactly as upstream sends both into
+//! one `ReportFileSystemChanged`. A settle window's batch is one scan, tagged
+//! with the source of the window's first report (its logs and metrics say
+//! who started it, not who else joined).
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -34,16 +41,20 @@ use tokio::time::Instant;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::LibraryMonitor;
+use ferrofin_traits::library::{LibraryMonitor, ScanTrigger};
 
 use crate::resolvers::FileSystemWatcher;
 
 /// The debounce accumulator: paths reported since the last dispatch, the
-/// settle deadline (re-armed by every report), and whether a worker task is
-/// currently waiting on that deadline.
+/// source of the window's first report, the settle deadline (re-armed by
+/// every report), and whether a worker task is currently waiting on that
+/// deadline.
 struct PendingChanges {
     /// Changed paths accumulated in the current settle window.
     paths: HashSet<String>,
+    /// Who reported the window's first path: the batch's scan carries it as
+    /// its trigger (a label only — the batch is one scan whoever joined it).
+    trigger: ScanTrigger,
     /// When the current window lapses (last report + delay, clamped by
     /// [`Self::hard_deadline`]).
     deadline: Instant,
@@ -101,11 +112,16 @@ pub trait LibraryScanTrigger: Send + Sync {
     /// refreshes the nearest existing item at or above it and validates that
     /// item's subtree
     /// ([`ScanTarget::Changed`](ferrofin_traits::library::ScanTarget::Changed)).
+    /// `trigger` is who reported them (the watcher or a webhook).
     ///
     /// # Errors
     ///
     /// Returns a [`ServiceError`] if the scan cannot be queued.
-    async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError>;
+    async fn queue_scan_paths(
+        &self,
+        paths: Vec<String>,
+        trigger: ScanTrigger,
+    ) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
@@ -193,6 +209,7 @@ impl FerrofinLibraryMonitor {
             refresh_target: None,
             pending: Arc::new(Mutex::new(PendingChanges {
                 paths: HashSet::new(),
+                trigger: ScanTrigger::Watcher,
                 deadline: Instant::now(),
                 hard_deadline: Instant::now(),
                 worker_running: false,
@@ -246,8 +263,10 @@ impl FerrofinLibraryMonitor {
     }
 
     /// Waits out the settle window (re-armed by each new report) and then
-    /// dispatches one scan for the whole batch. Runs on its own task; exactly
-    /// one worker is alive while changes are pending.
+    /// dispatches one scan for the whole batch, whichever sources reported
+    /// its paths, tagged with the source of the window's first report. Runs
+    /// on its own task; exactly one worker is alive while changes are
+    /// pending.
     async fn debounce_worker(self) {
         loop {
             let deadline = self
@@ -262,22 +281,25 @@ impl FerrofinLibraryMonitor {
                 () = tokio::time::sleep_until(deadline) => {}
                 () = self.flush.notified() => {}
             }
-            let paths = {
+            let (paths, trigger) = {
                 let mut pending = self.pending.lock().expect("pending set not poisoned");
                 // A report during the sleep pushed the deadline out — keep waiting.
                 if Instant::now() < pending.deadline {
                     continue;
                 }
                 pending.worker_running = false;
-                std::mem::take(&mut pending.paths)
+                (std::mem::take(&mut pending.paths), pending.trigger)
             };
             if !paths.is_empty() {
                 tracing::info!(
                     changes = paths.len(),
+                    trigger = trigger.as_str(),
                     "library changes settled; queueing scan"
                 );
                 if let Some(library) = &self.refresh_target
-                    && let Err(err) = library.queue_scan_paths(paths.into_iter().collect()).await
+                    && let Err(err) = library
+                        .queue_scan_paths(paths.into_iter().collect(), trigger)
+                        .await
                 {
                     tracing::warn!(%err, "failed to queue debounced library scan");
                 }
@@ -352,6 +374,19 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     }
 
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
+        self.report_change(path, ScanTrigger::Watcher).await
+    }
+
+    async fn report_webhook_change(&self, path: &str) -> Result<(), ServiceError> {
+        self.report_change(path, ScanTrigger::Webhook).await
+    }
+}
+
+impl FerrofinLibraryMonitor {
+    /// `ReportFileSystemChanged`: queues the refresh of what `path` belongs
+    /// to, debounced with every other report whatever its source. `trigger`
+    /// labels the batch's scan only when this is the window's first report.
+    async fn report_change(&self, path: &str, trigger: ScanTrigger) -> Result<(), ServiceError> {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
@@ -359,7 +394,11 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
             tracing::trace!(path, "change suppressed (server-initiated write)");
             return Ok(());
         }
-        tracing::debug!(path, "library filesystem change reported");
+        tracing::debug!(
+            path,
+            trigger = trigger.as_str(),
+            "library filesystem change reported"
+        );
         // Dispatch a path-scoped refresh: the scanner resolves and persists just
         // the items touched by the reported path (a deleted path prunes its
         // rows), so one new file does not re-walk the whole library. Overlapping
@@ -367,7 +406,9 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         let delay = self.debounce_delay().await;
         if delay.is_zero() {
             if let Some(library) = &self.refresh_target {
-                library.queue_scan_paths(vec![path.to_owned()]).await?;
+                library
+                    .queue_scan_paths(vec![path.to_owned()], trigger)
+                    .await?;
             }
             return Ok(());
         }
@@ -385,6 +426,7 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
             let now = Instant::now();
             if pending.paths.is_empty() {
                 pending.hard_deadline = now + delay * MAX_SETTLE_WINDOWS;
+                pending.trigger = trigger;
             }
             pending.paths.insert(path.to_owned());
             let previous = pending.deadline;
@@ -543,7 +585,11 @@ mod tests {
 
     #[async_trait]
     impl LibraryScanTrigger for CountingLibrary {
-        async fn queue_scan_paths(&self, _paths: Vec<String>) -> Result<(), ServiceError> {
+        async fn queue_scan_paths(
+            &self,
+            _paths: Vec<String>,
+            _trigger: ScanTrigger,
+        ) -> Result<(), ServiceError> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -565,14 +611,91 @@ mod tests {
     #[derive(Default)]
     struct PathsLibrary {
         batches: StdMutex<Vec<Vec<String>>>,
+        /// The trigger of each batch, in dispatch order.
+        triggers: StdMutex<Vec<ScanTrigger>>,
     }
 
     #[async_trait]
     impl LibraryScanTrigger for PathsLibrary {
-        async fn queue_scan_paths(&self, paths: Vec<String>) -> Result<(), ServiceError> {
+        async fn queue_scan_paths(
+            &self,
+            paths: Vec<String>,
+            trigger: ScanTrigger,
+        ) -> Result<(), ServiceError> {
             self.batches.lock().unwrap().push(paths);
+            self.triggers.lock().unwrap().push(trigger);
             Ok(())
         }
+    }
+
+    /// A webhook's report queues a webhook-triggered scan, the watcher's a
+    /// watcher-triggered one.
+    #[tokio::test]
+    async fn each_source_tags_its_scan() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        monitor
+            .report_webhook_change("/media/tv/Show/Season 1/e1.mkv")
+            .await
+            .expect("report");
+        monitor
+            .report_file_system_changed("/media/tv/Show/Season 1/e2.mkv")
+            .await
+            .expect("report");
+        assert_eq!(
+            *library.triggers.lock().unwrap(),
+            vec![ScanTrigger::Webhook, ScanTrigger::Watcher]
+        );
+    }
+
+    /// One settle window holding both sources' reports is one batch — the
+    /// source only labels it — tagged with the window's first reporter; a
+    /// path both reported is scanned once.
+    #[tokio::test(start_paused = true)]
+    async fn a_mixed_window_is_one_batch_tagged_with_its_first_reporter() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_secs(5));
+        monitor
+            .report_file_system_changed("/media/movies/a.mkv")
+            .await
+            .expect("report");
+        monitor
+            .report_webhook_change("/media/movies/a.mkv")
+            .await
+            .expect("report");
+        monitor
+            .report_webhook_change("/media/movies/b.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            *library.triggers.lock().unwrap(),
+            vec![ScanTrigger::Watcher]
+        );
+        let mut paths = {
+            let batches = library.batches.lock().unwrap();
+            assert_eq!(batches.len(), 1, "one settled batch");
+            batches[0].clone()
+        };
+        paths.sort();
+        assert_eq!(paths, vec!["/media/movies/a.mkv", "/media/movies/b.mkv"]);
+        // The next window starts over: its first reporter labels it.
+        monitor
+            .report_webhook_change("/media/movies/c.mkv")
+            .await
+            .expect("report");
+        monitor
+            .report_file_system_changed("/media/movies/d.mkv")
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            *library.triggers.lock().unwrap(),
+            vec![ScanTrigger::Watcher, ScanTrigger::Webhook]
+        );
     }
 
     #[tokio::test]

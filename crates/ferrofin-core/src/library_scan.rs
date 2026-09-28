@@ -844,6 +844,10 @@ impl ExternalProbeSeam {
 /// inline probe did — so one unreadable file never aborts a scan. The
 /// sidecars are then not looked for either: the item's stored streams are
 /// kept as they were, rather than replaced by externals alone.
+///
+/// The item's ffprobe run is counted on `ferrofin_media_probe_total` once it
+/// holds its slot (ok, failed, or cancelled when the task is aborted mid-run);
+/// the sidecar probes that follow it are not counted separately.
 fn spawn_probe(
     encoder: Arc<dyn MediaEncoder>,
     request: MediaInfoRequest,
@@ -856,9 +860,14 @@ fn spawn_probe(
             Some(slots) => Some(slots.acquire_owned().await.ok()?),
             None => None,
         };
+        let run = crate::scan_metrics::ProbeRun::start();
         let mut probed = match encoder.get_media_info_full(&request).await {
-            Ok(probed) => probed,
+            Ok(probed) => {
+                run.finish(crate::scan_metrics::ProbeResult::Ok);
+                probed
+            }
             Err(e) => {
+                run.finish(crate::scan_metrics::ProbeResult::Failed);
                 let path = request.media_source.path.as_deref();
                 tracing::warn!(error = %e, ?path, "media probe failed; item left unprobed");
                 return None;
@@ -2228,7 +2237,7 @@ impl PlanCtx<'_> {
 const POST_SCAN_PASSES: u32 = 9;
 
 /// How long each closing pass of one library validation took, logged once
-/// at its end.
+/// at its end and recorded on `ferrofin_library_scan_pass_duration_seconds`.
 #[derive(Debug, Default)]
 struct PassTimings {
     music: std::time::Duration,
@@ -2243,8 +2252,31 @@ struct PassTimings {
 }
 
 impl PassTimings {
-    /// One `info!` per scan with every pass's milliseconds.
+    /// One `info!` per scan with every pass's milliseconds, and each pass's
+    /// duration on the pass histogram (labels: [`crate::scan_metrics::SCAN_PASSES`]).
     fn log(&self, albums_and_artists: usize) {
+        let [
+            music,
+            album_covers,
+            years,
+            artists,
+            aggregates,
+            by_name_paths,
+            studios,
+            library_images,
+            dynamic_images,
+        ] = crate::scan_metrics::SCAN_PASSES;
+        crate::scan_metrics::passes_finished(&[
+            (music, self.music),
+            (album_covers, self.album_covers),
+            (years, self.years),
+            (artists, self.artists),
+            (aggregates, self.aggregates),
+            (by_name_paths, self.by_name_paths),
+            (studios, self.studios),
+            (library_images, self.library_images),
+            (dynamic_images, self.dynamic_images),
+        ]);
         let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
             albums_and_artists,

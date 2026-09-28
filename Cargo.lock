@@ -1527,6 +1527,8 @@ dependencies = [
  "ferrofin-naming",
  "ferrofin-traits",
  "ferrofin-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "quick-xml",
  "reqwest",
  "rstest",

@@ -53,6 +53,72 @@ use crate::providers::MetadataRefreshOptions;
 /// `IProgress<double>` a scheduled task hands its work.
 pub type ScanProgressSink = std::sync::Arc<dyn Fn(f64) + Send + Sync>;
 
+/// Why a library scan runs — the request that started it: the `trigger` field
+/// of its `library_scan` span and log lines (`docs/conventions/LOGGING.md`'s
+/// vocabulary) and the bounded `trigger` label of the library-scan metrics
+/// (`contrib/metrics/README.md`). A label only: requests that coalesce into
+/// one scan run as one, under the trigger of the request that scan runs as —
+/// the queued request the later ones joined, or a queued full scan that took
+/// over the pending requests it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScanTrigger {
+    /// A request over the API: `POST /Library/Refresh`, an item's or a
+    /// folder's refresh, a library change, and the "Scan Media Library" task
+    /// started from the dashboard ("Scan All Libraries").
+    Api,
+    /// The "Scan Media Library" task's own interval, daily or weekly trigger.
+    Schedule,
+    /// The "Scan Media Library" task's startup trigger.
+    Startup,
+    /// The filesystem watcher (real-time monitoring).
+    Watcher,
+    /// An *arr webhook: `POST /Library/Series/Added`, `/Library/Series/Updated`,
+    /// `/Library/Movies/Added`, `/Library/Movies/Updated`,
+    /// `/Library/Media/Updated`.
+    Webhook,
+}
+
+impl ScanTrigger {
+    /// Every trigger, in a fixed order (the metric label set).
+    pub const ALL: [Self; 5] = [
+        Self::Api,
+        Self::Schedule,
+        Self::Startup,
+        Self::Watcher,
+        Self::Webhook,
+    ];
+
+    /// The trigger's name in logs, spans and metric labels.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Schedule => "schedule",
+            Self::Startup => "startup",
+            Self::Watcher => "watcher",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    /// The scan trigger of a scheduled-task run started by `trigger` (the
+    /// task registry's `api` / `schedule` / `startup`). Anything else — a
+    /// run with no recorded trigger — is the task's own schedule.
+    #[must_use]
+    pub fn from_task_trigger(trigger: &str) -> Self {
+        match trigger {
+            "api" => Self::Api,
+            "startup" => Self::Startup,
+            _ => Self::Schedule,
+        }
+    }
+}
+
+impl std::fmt::Display for ScanTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a queued refresh scan covers — the item-less stand-in for the
 /// `Folder` a C# refresh validates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -852,14 +918,14 @@ pub trait LibraryManager: Send + Sync {
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a full library scan, tagging the run's root span with why it was
-    /// triggered (`api` / `schedule` / `startup` / `watcher`) for log↔trace
-    /// correlation. Defaults to the plain [`queue_library_scan`](Self::queue_library_scan)
-    /// so existing implementations need no change; the real manager overrides it
+    /// Queues a full library scan, tagging the run's root span, its log lines
+    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
+    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
+    /// existing implementations need no change; the real manager overrides it
     /// to record the `trigger`.
     async fn queue_library_scan_with_trigger(
         &self,
-        _trigger: &'static str,
+        _trigger: ScanTrigger,
     ) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
@@ -949,9 +1015,11 @@ pub trait LibraryManager: Send + Sync {
     /// itself finished in 0 ms with the scan still writing — which is what the
     /// dashboard, and anything that waits on the task, would then believe.
     ///
-    /// `progress`, when given, receives the scan's progress as it runs
-    /// (upstream's `IProgress<double>`: the items take 0–96 %, the closing
-    /// passes 96–100 %).
+    /// `trigger` is why the task ran (its schedule, its startup trigger, or
+    /// the dashboard over the API); the scan's span, log lines and metrics
+    /// carry it. `progress`, when given, receives the scan's progress as it
+    /// runs (upstream's `IProgress<double>`: the items take 0–96 %, the
+    /// closing passes 96–100 %).
     ///
     /// Returns `Ok(true)` once the scan ran to its end, and `Ok(false)` when
     /// it was stopped before it finished or refused because scanning has
@@ -966,9 +1034,10 @@ pub trait LibraryManager: Send + Sync {
     /// The scan failed (or panicked), so the task records `Failed`.
     async fn run_library_scan(
         &self,
+        trigger: ScanTrigger,
         progress: Option<ScanProgressSink>,
     ) -> Result<bool, ServiceError> {
-        let _ = progress;
+        let _ = (trigger, progress);
         self.queue_library_scan().await.map(|()| true)
     }
 
@@ -1688,8 +1757,19 @@ pub trait LibraryMonitor: Send + Sync {
         refresh_path: bool,
     ) -> Result<(), ServiceError>;
 
-    /// Signals that `path` changed on disk.
+    /// Signals that `path` changed on disk, as the filesystem watcher saw it
+    /// (a refresh it starts is labelled [`ScanTrigger::Watcher`]).
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError>;
+
+    /// Signals that `path` changed on disk, as an *arr webhook reported it
+    /// (`POST /Library/{Series,Movies}/…`, `POST /Library/Media/Updated`):
+    /// upstream's same `ReportFileSystemChanged` — the same debounce and the
+    /// same refresh as the watcher's — except that a refresh it starts is
+    /// labelled [`ScanTrigger::Webhook`] in logs and metrics. Defaults to
+    /// [`report_file_system_changed`](Self::report_file_system_changed).
+    async fn report_webhook_change(&self, path: &str) -> Result<(), ServiceError> {
+        self.report_file_system_changed(path).await
+    }
 }
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}

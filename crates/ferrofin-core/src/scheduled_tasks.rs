@@ -98,9 +98,21 @@ pub struct TaskProgress {
     percent: Arc<AtomicU64>,
     /// Set by [`stopped`](Self::stopped).
     stopped: Arc<AtomicBool>,
+    /// Why the run started (`api`, `schedule`, `startup`); empty for a
+    /// foreground [`run_now`](FerrofinTaskManager::run_now).
+    trigger: &'static str,
 }
 
 impl TaskProgress {
+    /// Why this run started: the registry's trigger tag (`api` for the
+    /// dashboard or `StartTask`, `schedule` for a configured trigger,
+    /// `startup` for a startup trigger), or `""` when it has none (a
+    /// foreground [`run_now`](FerrofinTaskManager::run_now)).
+    #[must_use]
+    pub fn trigger(&self) -> &'static str {
+        self.trigger
+    }
+
     /// Marks the run as stopped before its work finished, so it is recorded
     /// [`Cancelled`](TaskCompletionStatus::Cancelled) rather than
     /// `Completed` — upstream's `ExecuteAsync` throwing
@@ -763,6 +775,10 @@ impl FerrofinTaskManager {
     /// follow the task by itself.
     fn queue_with_trigger(&self, key: &str, trigger: &'static str) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key)?;
+        let progress = TaskProgress {
+            trigger,
+            ..progress
+        };
         let this = self.clone();
         let key_owned = key.to_owned();
         let start = Utc::now();
@@ -1206,14 +1222,17 @@ impl ScheduledTask for RefreshLibraryTask {
         // report `Completed` in 0 ms with the scan still writing — the
         // dashboard showed "Scan Media Library" idle while it ran, and
         // `LastExecutionResult.EndTimeUtc` advanced before a single item had
-        // been re-read. `run_library_scan` tags the run `schedule` so its own
-        // root trace still records the origin. The scan's progress is the
-        // task's (the dashboard's "Scan Media Library" bar), and a scan that
-        // failed fails the task.
+        // been re-read. The scan carries the task run's own trigger (its
+        // schedule, its startup trigger, or the dashboard's "Scan All
+        // Libraries" over the API), so its root trace, its log lines and its
+        // metrics record the origin. The scan's progress is the task's (the
+        // dashboard's "Scan Media Library" bar), and a scan that failed fails
+        // the task.
         let sink = progress.clone();
+        let trigger = ferrofin_traits::library::ScanTrigger::from_task_trigger(progress.trigger());
         let finished = self
             .library
-            .run_library_scan(Some(Arc::new(move |percent| sink.report(percent))))
+            .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent))))
             .await?;
         // Stopped (the host shutting down) or refused (already shut down):
         // cancelled, not completed.
@@ -1319,6 +1338,63 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    /// A task recording the trigger each of its runs saw.
+    struct TriggerTask {
+        seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for TriggerTask {
+        fn key(&self) -> &str {
+            "trigger"
+        }
+        fn name(&self) -> &str {
+            "Trigger Task"
+        }
+        fn description(&self) -> &str {
+            "records its trigger"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+            self.seen.lock().unwrap().push(progress.trigger());
+            Ok(())
+        }
+    }
+
+    /// A run started over the API sees `api` (what the "Scan Media Library"
+    /// task hands its scan as the trigger); a foreground run sees none.
+    #[tokio::test]
+    async fn a_run_sees_the_trigger_that_started_it() {
+        use ferrofin_traits::library::ScanTrigger;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(TriggerTask {
+            seen: Arc::clone(&seen),
+        }));
+        mgr.run_now("trigger").await.expect("run");
+        mgr.queue("trigger").expect("queued");
+        for _ in 0..500 {
+            if seen.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(*seen.lock().unwrap(), vec!["", "api"]);
+        assert_eq!(ScanTrigger::from_task_trigger("api"), ScanTrigger::Api);
+        assert_eq!(
+            ScanTrigger::from_task_trigger("startup"),
+            ScanTrigger::Startup
+        );
+        assert_eq!(
+            ScanTrigger::from_task_trigger("schedule"),
+            ScanTrigger::Schedule
+        );
+        assert_eq!(ScanTrigger::from_task_trigger(""), ScanTrigger::Schedule);
     }
 
     /// A minimal task whose key, name, hidden and configurable flags are set by

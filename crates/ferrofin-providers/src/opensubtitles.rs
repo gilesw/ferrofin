@@ -444,7 +444,10 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .http
             .get(&dl.link)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send_limited(&crate::image_download::limiter_for(&dl.link))
+            .send_limited(&crate::image_download::limiter_for(
+                &dl.link,
+                "opensubtitles",
+            ))
             .await
             .map_err(request_err)?
             .error_for_status()
