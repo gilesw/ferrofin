@@ -74,12 +74,12 @@ pub enum ScanTarget {
     /// are removed. The folders above that item are carried for context
     /// only — never refreshed — and no library-wide closing pass runs.
     ///
-    /// ACCEPTED DIVERGENCE (flagged to the owner): Ferrofin keeps a series'
-    /// `DateLastMediaAdded` current on a watcher event — the closing folder
-    /// aggregate pass writes that one column of a context series when a new
-    /// episode moves it — where upstream updates it only on the series' own
-    /// refresh (`MetadataService.cs:404-411`), i.e. at the next library
-    /// scan.
+    /// ACCEPTED DIVERGENCE (approved by the owner on 2026-09-27): Ferrofin
+    /// keeps a series' `DateLastMediaAdded` current on a watcher event — the
+    /// closing folder aggregate pass writes that one column of a context
+    /// series when a new episode moves it — where upstream updates it only
+    /// on the series' own refresh (`MetadataService.cs:404-411`), i.e. at
+    /// the next library scan.
     Changed(Vec<String>),
     /// The file items at these paths refreshing themselves
     /// (`ProviderManager.RefreshSingleItem`, a non-folder's `RefreshItem`):

@@ -8,6 +8,42 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — "Date added behavior for new content" is honoured
+
+**Dashboard → Libraries → Display → Date added behavior for new content** now decides how
+a new item's date added (`DateCreated`, what "Date Added" sorts and "Recently added"
+read) is set. Earlier versions ignored it and always used the file's creation time.
+
+- **Use file creation date** (the default, unchanged behaviour): a new file is dated by
+  its creation time on disk. On Linux that is the file's birth time where the
+  filesystem records one (ext4, btrfs, XFS, tmpfs), else the older of its change and
+  modification times. A copy (`cp`, a download client's move across filesystems) is born
+  when it is written, whatever its modification time says; a rename within a
+  filesystem keeps its birth time. As in Jellyfin, a file whose modification time
+  changes is re-dated to its creation time at the next scan.
+- **Use date scanned into the library**: a new item is dated by the moment Ferrofin
+  first detects it, whether a library scan or the disk watcher / a `*arr` webhook
+  found it. Its series' date added moves with it at once.
+
+Existing items keep their stored date: switching the setting re-dates nothing, and a
+rescan never moves an unchanged item's date in either mode. The setting applies from the
+next scan or watcher event, without a restart.
+
+A date an item's own metadata supplies still wins, whichever the setting, and now also on
+an item already in the library: an `.nfo` `<dateadded>` is applied whenever the `.nfo`
+is read again (after it is edited), and a photo's EXIF date whenever the photo file
+changes. Earlier versions applied either one only when the item was first added.
+
+**If you adopted a Jellyfin install with an earlier Ferrofin, check this setting after
+upgrading.** Adopting a Jellyfin install now imports its `metadata.xml`, and the import
+also runs on the first boot of this version for an install adopted earlier, as long as its
+configuration directory still holds Jellyfin's `metadata.xml` and the setting was never
+saved in Ferrofin. If "Use date scanned into the library" was chosen in Jellyfin, this
+version starts dating new items by when it detects them, and the dashboard shows that
+choice, without any action from you. Items already in the library keep their dates. To go
+back, choose **Use file creation date** under **Dashboard → Libraries → Display** and
+save.
+
 ## Unreleased — items without per-library fetcher choices follow the server-wide metadata options
 
 Scans and single-item refreshes (`POST /Items/{id}/Refresh`, Identify) now decide which

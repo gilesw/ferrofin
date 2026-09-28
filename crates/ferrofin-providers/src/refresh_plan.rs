@@ -26,8 +26,10 @@ use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 /// `BaseItemExtensions.HasChanged` (`BaseItemExtensions.cs:125-130`): a file
-/// has changed when `|DateModified − mtime|` exceeds one second.
-const FILE_CHANGE_TOLERANCE_MS: i64 = 1_000;
+/// has changed when `|DateModified − mtime|` exceeds one second. Public for
+/// the persistence layer, which applies the same rule in SQL to a row it
+/// cannot decode.
+pub const FILE_CHANGE_TOLERANCE_MS: i64 = 1_000;
 
 /// `BaseNfoProvider.HasChanged` (`BaseNfoProvider.cs:77-78`): "1 minute
 /// tolerance to avoid detecting our own file writes" — an NFO is newer only
@@ -284,8 +286,10 @@ fn drifted(a: DateTime<Utc>, b: DateTime<Utc>, tolerance_ms: i64) -> bool {
 
 /// `BaseItem.HasChanged(asOf)` against a stored `DateModified` that may be
 /// unset — upstream's `DateTime.MinValue`, which every real mtime differs
-/// from by far more than a second.
-fn file_changed(stored: Option<DateTime<Utc>>, mtime: DateTime<Utc>) -> bool {
+/// from by far more than a second. The probe's change monitor reads it, and
+/// so does the scan's `BeforeSaveInternal` re-dating of a changed file.
+#[must_use]
+pub fn file_changed(stored: Option<DateTime<Utc>>, mtime: DateTime<Utc>) -> bool {
     stored.is_none_or(|stored| drifted(stored, mtime, FILE_CHANGE_TOLERANCE_MS))
 }
 

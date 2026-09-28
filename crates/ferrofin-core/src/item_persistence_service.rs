@@ -1346,8 +1346,14 @@ fn columns_of(
 /// derivations) against the stored ones (as stored, no derivation):
 /// `PrimaryVersionId` is never written, `DateCreated` only fills a gap,
 /// `IsLocked` only rises, the never-cleared columns keep the stored value
-/// over a `NULL`, and a locked row keeps its user-owned columns.
-pub(crate) fn scan_save_changes_row(saved: &BaseItemEntity, stored: &BaseItemEntity) -> bool {
+/// over a `NULL`, and a locked row keeps its user-owned columns. With
+/// `writes_date_created` it evaluates [`scan_upsert_date_created_sql`]
+/// instead, whose `DateCreated` is never cleared but otherwise written.
+pub(crate) fn scan_save_changes_row(
+    saved: &BaseItemEntity,
+    stored: &BaseItemEntity,
+    writes_date_created: bool,
+) -> bool {
     let incoming = written_columns(saved);
     let current = columns_of(
         stored,
@@ -1368,7 +1374,8 @@ pub(crate) fn scan_save_changes_row(saved: &BaseItemEntity, stored: &BaseItemEnt
             let result = match *name {
                 // The save stamps it; that is not a change of the item.
                 "DateLastSaved" | "PrimaryVersionId" => old,
-                "DateCreated" if !is_null(old) => old,
+                "DateCreated" if writes_date_created && is_null(new) => old,
+                "DateCreated" if !writes_date_created && !is_null(old) => old,
                 "IsLocked" => {
                     if stored.is_locked {
                         old
@@ -1514,6 +1521,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     async fn save_scanned_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
             self.upsert_item(item, scan_upsert_sql()).await?;
+        }
+        Ok(())
+    }
+
+    async fn save_scanned_items_with_date_created(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<(), ServiceError> {
+        for item in items {
+            self.upsert_item(item, scan_upsert_date_created_sql())
+                .await?;
         }
         Ok(())
     }
@@ -2319,11 +2337,29 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(Some(out))
     }
 
-    async fn update_file_facts(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+    async fn update_file_facts(
+        &self,
+        item: &BaseItemEntity,
+        date_if_changed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        /// Milliseconds per day, for `julianday` differences.
+        const MS_PER_DAY: f64 = 86_400_000.0;
         let date_modified = opt_datetime_to_db(item.date_modified);
+        // `BaseItemExtensions.HasChanged`'s tolerance, in `julianday` days.
+        #[allow(clippy::cast_precision_loss)] // 1_000 is exact in an f64
+        let tolerance =
+            ferrofin_providers::refresh_plan::FILE_CHANGE_TOLERANCE_MS as f64 / MS_PER_DAY;
+        // Every `SET` expression reads the row as it was, so the re-date
+        // compares the new mtime with the `DateModified` it replaces. A stored
+        // value `julianday` cannot read compares as unchanged.
         let written = sqlx::query(
             r#"UPDATE "BaseItems"
                SET "Path" = ?2, "ParentId" = ?3, "TopParentId" = ?4,
+                   "DateCreated" = CASE
+                       WHEN ?8 IS NOT NULL AND ?5 IS NOT NULL
+                            AND ("DateModified" IS NULL
+                                 OR abs(julianday(?5) - julianday("DateModified")) > ?9)
+                       THEN ?8 ELSE "DateCreated" END,
                    "DateModified" = coalesce(?5, "DateModified"),
                    "Size" = coalesce(?6, "Size"),
                    "DateLastSaved" = ?7
@@ -2339,6 +2375,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .bind(date_modified)
         .bind(item.size)
         .bind(datetime_to_db(chrono::Utc::now()))
+        .bind(opt_datetime_to_db(date_if_changed))
+        .bind(tolerance)
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -2867,37 +2905,54 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 /// cannot drift between the two statements; the substitutions are asserted in
 /// `scan_upsert_preserves_unowned_columns`.
 fn scan_upsert_sql() -> &'static str {
-    static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let mut sql = UPSERT_SQL
-            .replace(
-                r#""DateCreated" = excluded."DateCreated","#,
-                r#""DateCreated" = coalesce("DateCreated", excluded."DateCreated"),"#,
-            )
-            .replace(r#""PrimaryVersionId" = excluded."PrimaryVersionId","#, "")
-            .replace(
-                r#""IsLocked" = excluded."IsLocked","#,
-                r#""IsLocked" = max("IsLocked", excluded."IsLocked"),"#,
-            );
-        for col in SCAN_NEVER_CLEARED_COLUMNS {
-            sql = sql.replace(
-                &format!(r#""{col}" = excluded."{col}""#),
-                &format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#),
-            );
-        }
-        for col in LOCKED_PRESERVED_COLUMNS {
-            let kept = if LOCKED_FILLABLE_COLUMNS.contains(col) {
-                format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
-            } else {
-                r#""IsLocked" = 1"#.to_owned()
-            };
-            sql = sql.replace(
-                &format!(r#""{col}" = excluded."{col}""#),
-                &format!(r#""{col}" = CASE WHEN {kept} THEN "{col}" ELSE excluded."{col}" END"#),
-            );
-        }
-        sql
-    });
+    static SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| build_scan_upsert_sql(false));
     &SQL
+}
+
+/// [`scan_upsert_sql`] whose `DateCreated` is set but never cleared
+/// (`coalesce(excluded, stored)`), like the other never-cleared columns: the
+/// save of a file re-dated by `BeforeSaveInternal`
+/// ([`ItemPersistenceService::save_scanned_items_with_date_created`]).
+fn scan_upsert_date_created_sql() -> &'static str {
+    static SQL: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| build_scan_upsert_sql(true));
+    &SQL
+}
+
+/// See [`scan_upsert_sql`]; `writes_date_created` keeps a stored
+/// `DateCreated` only over a `NULL` instead of always.
+fn build_scan_upsert_sql(writes_date_created: bool) -> String {
+    let date_created = if writes_date_created {
+        r#""DateCreated" = coalesce(excluded."DateCreated", "DateCreated"),"#
+    } else {
+        r#""DateCreated" = coalesce("DateCreated", excluded."DateCreated"),"#
+    };
+    let mut sql = UPSERT_SQL
+        .replace(r#""DateCreated" = excluded."DateCreated","#, date_created)
+        .replace(r#""PrimaryVersionId" = excluded."PrimaryVersionId","#, "")
+        .replace(
+            r#""IsLocked" = excluded."IsLocked","#,
+            r#""IsLocked" = max("IsLocked", excluded."IsLocked"),"#,
+        );
+    for col in SCAN_NEVER_CLEARED_COLUMNS {
+        sql = sql.replace(
+            &format!(r#""{col}" = excluded."{col}""#),
+            &format!(r#""{col}" = coalesce(excluded."{col}", "{col}")"#),
+        );
+    }
+    for col in LOCKED_PRESERVED_COLUMNS {
+        let kept = if LOCKED_FILLABLE_COLUMNS.contains(col) {
+            format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
+        } else {
+            r#""IsLocked" = 1"#.to_owned()
+        };
+        sql = sql.replace(
+            &format!(r#""{col}" = excluded."{col}""#),
+            &format!(r#""{col}" = CASE WHEN {kept} THEN "{col}" ELSE excluded."{col}" END"#),
+        );
+    }
+    sql
 }
 
 /// Fills in `BaseItems."SortName"` for rows written before the write path
@@ -5009,44 +5064,56 @@ mod tests {
         };
         let other = guid_to_db(other);
         let (mut checked, mut changed_cases) = (0, 0);
-        for column in &columns {
-            for locked in [false, true] {
-                for mode in ["null", "equal", "different"] {
-                    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
-                        .bind(guid_to_db(id))
-                        .execute(db.writer())
-                        .await
-                        .expect("reset");
-                    svc.save_items(std::slice::from_ref(&base))
-                        .await
-                        .expect("seed");
-                    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = ?1 WHERE "Id" = ?2"#)
-                        .bind(locked)
-                        .bind(guid_to_db(id))
-                        .execute(db.writer())
-                        .await
-                        .expect("lock");
-                    let stored = repo.retrieve_item(id).await.expect("read").expect("row");
-                    let mut incoming = base.clone();
-                    if mode != "equal" {
-                        vary(&mut incoming, column, mode == "null", &other);
+        for writes_date_created in [false, true] {
+            for column in &columns {
+                for locked in [false, true] {
+                    for mode in ["null", "equal", "different"] {
+                        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                            .bind(guid_to_db(id))
+                            .execute(db.writer())
+                            .await
+                            .expect("reset");
+                        svc.save_items(std::slice::from_ref(&base))
+                            .await
+                            .expect("seed");
+                        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = ?1 WHERE "Id" = ?2"#)
+                            .bind(locked)
+                            .bind(guid_to_db(id))
+                            .execute(db.writer())
+                            .await
+                            .expect("lock");
+                        let stored = repo.retrieve_item(id).await.expect("read").expect("row");
+                        let mut incoming = base.clone();
+                        if mode != "equal" {
+                            vary(&mut incoming, column, mode == "null", &other);
+                        }
+                        let predicted =
+                            super::scan_save_changes_row(&incoming, &stored, writes_date_created);
+                        let before = snapshot().await;
+                        if writes_date_created {
+                            svc.save_scanned_items_with_date_created(std::slice::from_ref(
+                                &incoming,
+                            ))
+                            .await
+                            .expect("scan save");
+                        } else {
+                            svc.save_scanned_items(std::slice::from_ref(&incoming))
+                                .await
+                                .expect("scan save");
+                        }
+                        let row_moved = snapshot().await != before;
+                        assert_eq!(
+                            row_moved, predicted,
+                            "column {column}, locked {locked}, incoming {mode}, \
+                         writes DateCreated {writes_date_created}"
+                        );
+                        checked += 1;
+                        changed_cases += usize::from(row_moved);
                     }
-                    let predicted = super::scan_save_changes_row(&incoming, &stored);
-                    let before = snapshot().await;
-                    svc.save_scanned_items(std::slice::from_ref(&incoming))
-                        .await
-                        .expect("scan save");
-                    let row_moved = snapshot().await != before;
-                    assert_eq!(
-                        row_moved, predicted,
-                        "column {column}, locked {locked}, incoming {mode}"
-                    );
-                    checked += 1;
-                    changed_cases += usize::from(row_moved);
                 }
             }
         }
-        assert_eq!(checked, columns.len() * 6);
+        assert_eq!(checked, columns.len() * 12);
         assert!(
             changed_cases > columns.len(),
             "the cases have teeth: {changed_cases} changed"
@@ -5111,9 +5178,9 @@ mod tests {
             .await
             .expect("save");
         let stored = repo.retrieve_item(id).await.expect("read").expect("row");
-        assert!(!super::scan_save_changes_row(&stored, &stored));
+        assert!(!super::scan_save_changes_row(&stored, &stored, false));
         assert!(
-            !super::scan_save_changes_row(&item, &stored),
+            !super::scan_save_changes_row(&item, &stored, false),
             "the row as built (no derived columns, full-precision mtime) \
              saves to the same stored values"
         );
@@ -5123,12 +5190,12 @@ mod tests {
             overview: Some("Reality is a simulation.".into()),
             ..item.clone()
         };
-        assert!(super::scan_save_changes_row(&renamed, &stored));
+        assert!(super::scan_save_changes_row(&renamed, &stored, false));
         let moved = ferrofin_db::entities::base_items::BaseItemEntity {
             date_modified: Some(at("2026-09-02T08:30:00Z")),
             ..item.clone()
         };
-        assert!(super::scan_save_changes_row(&moved, &stored));
+        assert!(super::scan_save_changes_row(&moved, &stored, false));
 
         // Guarded columns do not: a NULL never clears Size/DateModified/the
         // refresh dates, DateCreated only fills a gap, and DateLastSaved is
@@ -5141,15 +5208,111 @@ mod tests {
             date_last_saved: Some(at("2026-09-24T00:00:00Z")),
             ..item.clone()
         };
-        assert!(!super::scan_save_changes_row(&guarded, &stored));
+        assert!(!super::scan_save_changes_row(&guarded, &stored, false));
+        // The re-dating save writes the new DateCreated, and still never
+        // clears it.
+        assert!(super::scan_save_changes_row(&guarded, &stored, true));
+        let undated = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_created: None,
+            ..item.clone()
+        };
+        assert!(!super::scan_save_changes_row(&undated, &stored, true));
 
         // A locked row keeps its user-owned columns, but not the file facts.
         let locked = ferrofin_db::entities::base_items::BaseItemEntity {
             is_locked: true,
             ..stored.clone()
         };
-        assert!(!super::scan_save_changes_row(&renamed, &locked));
-        assert!(super::scan_save_changes_row(&moved, &locked));
+        assert!(!super::scan_save_changes_row(&renamed, &locked, false));
+        assert!(super::scan_save_changes_row(&moved, &locked, false));
+    }
+
+    /// An undecodable row's file-facts write carries `BeforeSaveInternal`'s
+    /// re-date: `DateCreated` moves to the given date when the new
+    /// `DateModified` drifted from the stored one by more than a second (an
+    /// unset one included), never within the second, and never without a
+    /// date to move to.
+    #[tokio::test]
+    async fn update_file_facts_redates_a_changed_file() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let id = Uuid::new_v4();
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: stored_type_name(BaseItemKind::Episode).unwrap().to_owned(),
+            name: Some("S01E01".into()),
+            path: Some("/tv/Show/S01E01.mkv".into()),
+            date_created: Some(at("2020-01-01T00:00:00Z")),
+            date_modified: Some(at("2020-01-05T00:00:00Z")),
+            ..Default::default()
+        };
+        svc.save_items(std::slice::from_ref(&row))
+            .await
+            .expect("seed");
+        let created = async || -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "DateCreated" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+        };
+        let born = at("2019-06-07T08:09:10Z");
+        let stat = |mtime: &str| ferrofin_db::entities::base_items::BaseItemEntity {
+            date_modified: Some(at(mtime)),
+            ..row.clone()
+        };
+
+        // Within the second: the mtime is written, the date stays.
+        assert!(
+            svc.update_file_facts(&stat("2020-01-05T00:00:00.500Z"), Some(born))
+                .await
+                .expect("write")
+        );
+        assert_eq!(
+            created().await,
+            ferrofin_db::store::opt_datetime_to_db(row.date_created)
+        );
+        // No date to move to (another rule, or a folder): it stays.
+        assert!(
+            svc.update_file_facts(&stat("2021-01-01T00:00:00Z"), None)
+                .await
+                .expect("write")
+        );
+        assert_eq!(
+            created().await,
+            ferrofin_db::store::opt_datetime_to_db(row.date_created)
+        );
+        // Drifted past the second: re-dated.
+        assert!(
+            svc.update_file_facts(&stat("2022-01-01T00:00:00Z"), Some(born))
+                .await
+                .expect("write")
+        );
+        assert_eq!(
+            created().await,
+            ferrofin_db::store::opt_datetime_to_db(Some(born))
+        );
+        // An unset stored DateModified counts as changed.
+        sqlx::query(r#"UPDATE "BaseItems" SET "DateModified" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("clear");
+        let later = at("2023-03-03T03:03:03Z");
+        assert!(
+            svc.update_file_facts(&stat("2022-01-01T00:00:00Z"), Some(later))
+                .await
+                .expect("write")
+        );
+        assert_eq!(
+            created().await,
+            ferrofin_db::store::opt_datetime_to_db(Some(later))
+        );
     }
 
     /// `BaseItemMetadataFields`: the editor's replace-all write (duplicates
@@ -5303,6 +5466,18 @@ mod tests {
         // catches it before the behavioral asserts do.
         let sql = super::scan_upsert_sql();
         assert!(sql.contains(r#"coalesce("DateCreated", excluded."DateCreated")"#));
+        // The re-dating variant differs in that one clause only.
+        let redated = super::scan_upsert_date_created_sql();
+        assert!(
+            redated.contains(r#""DateCreated" = coalesce(excluded."DateCreated", "DateCreated")"#)
+        );
+        assert_eq!(
+            redated.replace(
+                r#""DateCreated" = coalesce(excluded."DateCreated", "DateCreated")"#,
+                r#""DateCreated" = coalesce("DateCreated", excluded."DateCreated")"#,
+            ),
+            sql
+        );
         assert!(!sql.contains(r#""PrimaryVersionId" = excluded."PrimaryVersionId""#));
         assert!(sql.contains(r#""IsLocked" = max("IsLocked", excluded."IsLocked")"#));
         for col in super::SCAN_NEVER_CLEARED_COLUMNS {
@@ -5376,6 +5551,43 @@ mod tests {
             ferrofin_db::store::opt_datetime_to_db(Some(first_import)),
             "first-import DateCreated survives"
         );
+
+        // A file re-dated by `BeforeSaveInternal` writes its DateCreated,
+        // the merge link still kept; a NULL one keeps the stored date.
+        let created_at = async || -> Option<String> {
+            sqlx::query_scalar(r#"SELECT "DateCreated" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row")
+        };
+        let born = chrono::DateTime::parse_from_rfc3339("2025-06-07T08:09:10Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        item.date_created = Some(born);
+        svc.save_scanned_items_with_date_created(std::slice::from_ref(&item))
+            .await
+            .expect("re-dating save");
+        assert_eq!(
+            created_at().await,
+            ferrofin_db::store::opt_datetime_to_db(Some(born))
+        );
+        item.date_created = None;
+        svc.save_scanned_items_with_date_created(std::slice::from_ref(&item))
+            .await
+            .expect("re-dating save");
+        assert_eq!(
+            created_at().await,
+            ferrofin_db::store::opt_datetime_to_db(Some(born)),
+            "a NULL never clears it"
+        );
+        let pvid: Option<String> =
+            sqlx::query_scalar(r#"SELECT "PrimaryVersionId" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(pvid.as_deref(), Some("PRIMARY-ID"), "merge link survives");
 
         // Split/unmerge still clears the link through the full save.
         svc.save_items(std::slice::from_ref(&item))

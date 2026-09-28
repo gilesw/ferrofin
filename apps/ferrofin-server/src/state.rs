@@ -1043,6 +1043,14 @@ pub async fn build_app_state(
     .with_metadata_options({
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().metadata_options.clone()
+    })
+    // The `metadata` named configuration's "Date added behavior for new
+    // content" (Dashboard → Libraries → Display): whether a new item is
+    // dated by its file's creation time or by the moment the scan finds it.
+    // Read live, once per scan, from the document the dashboard saves.
+    .with_metadata_configuration({
+        let config_mgr = Arc::clone(&config_mgr);
+        move || config_mgr.metadata_configuration()
     });
     // Scan-progress log cadence (bootstrap knob); `None` keeps the 100-item default.
     if let Some(every) = config.scan_progress_every {

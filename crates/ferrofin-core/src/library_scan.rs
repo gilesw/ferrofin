@@ -1593,6 +1593,8 @@ struct RefreshContext<'a> {
     /// Plan indices of the earlier copies of an id the plan holds more than
     /// once ([`superseded_copies`]).
     superseded: std::collections::HashSet<usize>,
+    /// The date-added rule the plan was dated by ([`PlanOutput::date_added`]).
+    date_added: DateAdded,
     /// Stops the scan.
     cancel: &'a ScanCancel,
 }
@@ -1621,8 +1623,37 @@ impl<'a> RefreshContext<'a> {
             locked: &NO_LOCKS,
             externals: None,
             superseded: std::collections::HashSet::new(),
+            date_added: DateAdded::default(),
             cancel: run.cancel,
         }
+    }
+
+    /// The date a stored FILE item takes on this save in place of its
+    /// stored `DateCreated`, if any: `MetadataService.BeforeSaveInternal`
+    /// (`MetadataService.cs:372-398`) — when the file's modification time
+    /// drifted from the stored `DateModified` (`BaseItem.HasChanged`: by more
+    /// than a second, an unset one included) and "Use file creation date" is
+    /// on, `DateCreated` becomes the file's creation time. That is the
+    /// planner's date for `item` under that rule ([`LibraryScanner::
+    /// base_item`]). A folder never takes one: upstream reads no creation
+    /// time for a directory (`CreationTimeUtc` stays `MinValue`, which the
+    /// rule skips), and a path that could not be stat'ed has no mtime to
+    /// compare.
+    fn redated(&self, stored: &BaseItemEntity, item: &Planned) -> Option<DateTime<Utc>> {
+        let mtime = item.entity.date_modified?;
+        self.date_if_changed(item)
+            .filter(|_| ferrofin_providers::refresh_plan::file_changed(stored.date_modified, mtime))
+    }
+
+    /// The date [`redated`](Self::redated) gives `item` should its file have
+    /// changed: its creation time, for a file the planner stat'ed under "Use
+    /// file creation date"; `None` otherwise.
+    fn date_if_changed(&self, item: &Planned) -> Option<DateTime<Utc>> {
+        (self.date_added == DateAdded::FileCreation
+            && !item.entity.is_folder
+            && item.entity.date_modified.is_some())
+        .then_some(item.entity.date_created)
+        .flatten()
     }
 
     /// `item`'s library's fetcher policy.
@@ -2087,10 +2118,12 @@ struct PlanCtx<'a> {
     locations: std::collections::HashSet<String>,
     /// The locations that listed empty or failed to list this pass.
     inaccessible: std::cell::RefCell<Vec<String>>,
+    /// How the pass dates the items it resolves.
+    date_added: DateAdded,
 }
 
 impl<'a> PlanCtx<'a> {
-    /// A pass over `scope` with `naming`.
+    /// A pass over `scope` with `naming`, dating by the default rule.
     fn new(naming: &'a NamingOptions, scope: PlanScope<'a>) -> Self {
         Self {
             naming,
@@ -2098,7 +2131,14 @@ impl<'a> PlanCtx<'a> {
             unlisted: std::cell::RefCell::new(Vec::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
+            date_added: DateAdded::default(),
         }
+    }
+
+    /// This pass dating what it resolves by `rule`.
+    fn with_date_added(mut self, rule: DateAdded) -> Self {
+        self.date_added = rule;
+        self
     }
 
     /// This pass over the libraries `folders`, whose locations it watches
@@ -2149,6 +2189,9 @@ struct PlanOutput {
     /// must not read as "everything was deleted". Nothing under one is
     /// removed this scan.
     inaccessible: Vec<String>,
+    /// The date-added rule the pass dated its items by, which the scan's
+    /// saves apply too ([`RefreshContext::redated`]).
+    date_added: DateAdded,
 }
 
 impl PlanCtx<'_> {
@@ -2582,12 +2625,56 @@ pub struct LibraryScanner {
     /// library (a by-name artist). `None` (unit tests) gates nothing
     /// server-wide.
     metadata_options: Option<ServerMetadataOptions>,
+    /// Reads the `metadata` named configuration (`GetMetadataConfiguration()`),
+    /// live: how a new item's "date added" is stamped ([`DateAdded`]).
+    /// `None` (unit tests) keeps upstream's default, the file creation date.
+    metadata_configuration: Option<MetadataConfigurationReader>,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
 /// ([`LibraryScanner::with_metadata_options`]).
 type ServerMetadataOptions =
     Arc<dyn Fn() -> Vec<ferrofin_model::configuration::MetadataOptions> + Send + Sync>;
+
+/// A live reader of the `metadata` named configuration
+/// ([`LibraryScanner::with_metadata_configuration`]).
+type MetadataConfigurationReader =
+    Arc<dyn Fn() -> ferrofin_model::configuration::MetadataConfiguration + Send + Sync>;
+
+/// How one scan dates what it finds: `MetadataConfiguration.
+/// UseFileCreationTimeForDateAdded`, jellyfin-web's Dashboard → Libraries →
+/// Display "Date added behavior for new content", read once per plan pass
+/// ([`LibraryScanner::date_added`]) so the planner and the saves agree.
+///
+/// It decides a NEW item's `DateCreated` (`ResolverHelper.SetDateCreated`)
+/// and whether a stored file whose modification time drifted is re-dated
+/// (`MetadataService.BeforeSaveInternal`). A stored item keeps its date
+/// otherwise, whichever the rule: switching it re-dates nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DateAdded {
+    /// "Use file creation date" (`true`, the default): a new file is dated
+    /// by its creation time, a new folder by the moment it is resolved (a
+    /// directory has no creation time upstream), and a stored file whose
+    /// modification time drifted takes its creation time again.
+    #[default]
+    FileCreation,
+    /// "Use date scanned into the library" (`false`): every new item is
+    /// dated by the moment the scan resolves it — the first time Ferrofin
+    /// detects it, by a library scan, the disk watcher, a webhook or a
+    /// refresh alike — and a stored item is never re-dated.
+    Scanned,
+}
+
+impl DateAdded {
+    /// The rule `config` sets.
+    fn of(config: ferrofin_model::configuration::MetadataConfiguration) -> Self {
+        if config.use_file_creation_time_for_date_added {
+            Self::FileCreation
+        } else {
+            Self::Scanned
+        }
+    }
+}
 
 impl std::fmt::Debug for LibraryScanner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2634,7 +2721,31 @@ impl LibraryScanner {
             events: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             metadata_options: None,
+            metadata_configuration: None,
         }
+    }
+
+    /// Attaches the reader of the `metadata` named configuration, whose
+    /// "Date added behavior for new content" dates every new item
+    /// ([`DateAdded`]) — upstream reads it on every resolve
+    /// (`ResolverHelper.SetDateCreated`). Read once per plan pass, so a
+    /// changed setting applies from the next scan or watcher event without a
+    /// restart. Without a reader every scan uses upstream's default, the file
+    /// creation date.
+    #[must_use]
+    pub fn with_metadata_configuration(
+        mut self,
+        read: impl Fn() -> ferrofin_model::configuration::MetadataConfiguration + Send + Sync + 'static,
+    ) -> Self {
+        self.metadata_configuration = Some(Arc::new(read));
+        self
+    }
+
+    /// The date-added rule as configured now.
+    fn date_added(&self) -> DateAdded {
+        self.metadata_configuration
+            .as_ref()
+            .map_or_else(DateAdded::default, |read| DateAdded::of(read()))
     }
 
     /// Attaches the reader of the server-wide per-kind `MetadataOptions`, so
@@ -3133,14 +3244,19 @@ impl LibraryScanner {
         let all_folders = self.virtual_folders.get_virtual_folders().await?;
         // One library at a time (sync: `NamingOptions` never crosses an
         // await), serving the lane between two: the walk writes nothing, so
-        // a refresh served here needs nothing read again.
-        let mut plan = PlanOutput::default();
+        // a refresh served here needs nothing read again. Every library of
+        // the scan dates by the rule as it stood when the scan started.
+        let date_added = self.date_added();
+        let mut plan = PlanOutput {
+            date_added,
+            ..PlanOutput::default()
+        };
         for library in folders.chunks(1) {
             if run.cancel.is_cancelled() {
                 return Ok(ScanOutcome::default());
             }
             Box::pin(self.serve_lane(run)).await;
-            let part = self.plan_in(library, &all_folders, PlanScope::ALL);
+            let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
             plan.unlisted.extend(part.unlisted);
             plan.inaccessible.extend(part.inaccessible);
@@ -3423,7 +3539,12 @@ impl LibraryScanner {
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
-        let plan = self.plan_in(&affected, &folders, PlanScope::paths(roots, also_path));
+        let plan = self.plan_in(
+            &affected,
+            &folders,
+            PlanScope::paths(roots, also_path),
+            self.date_added(),
+        );
         tracing::info!(
             changed,
             roots = roots.len(),
@@ -3492,6 +3613,7 @@ impl LibraryScanner {
             items: planned,
             mut unlisted,
             inaccessible,
+            date_added,
         } = plan;
         if let Some(first) = unlisted.first() {
             tracing::warn!(
@@ -3565,6 +3687,7 @@ impl LibraryScanner {
             locked: &locked_items,
             externals: self.external_probe_seam(),
             superseded: superseded_copies(&planned),
+            date_added,
             ..RefreshContext::of(run)
         };
         // ffprobe dominates scan wall time and touches nothing but the file it
@@ -3935,7 +4058,7 @@ impl LibraryScanner {
     /// albums and artists it refreshed, the album covers this pass gathered,
     /// and the children-derived columns of the folders it planned — never a
     /// pass over the whole database. (The folders planned for context
-    /// included: see the accepted divergence at
+    /// included: see the owner-approved divergence at
     /// [`update_folder_aggregates`](Self::update_folder_aggregates).)
     async fn touched_passes(
         &self,
@@ -4052,8 +4175,14 @@ impl LibraryScanner {
             // Only the file facts are written, and only when they moved;
             // nothing else can be judged without the stored row (its plan
             // runs nothing, so no probe result waits for it either). A
-            // moved parent moves the ancestor closure with it.
-            let facts_moved = self.persistence.update_file_facts(&item.entity).await?;
+            // moved parent moves the ancestor closure with it. The
+            // `BeforeSaveInternal` re-date rides along: the statement moves
+            // `DateCreated` to the file's creation time when the stored
+            // `DateModified` it replaces drifted ([`RefreshContext::redated`]).
+            let facts_moved = self
+                .persistence
+                .update_file_facts(&item.entity, state.refresh.date_if_changed(item))
+                .await?;
             let ancestors_moved = ancestors_changed(links, item);
             if ancestors_moved {
                 self.persistence
@@ -4268,6 +4397,18 @@ impl LibraryScanner {
                 probe_ran,
             },
         );
+        // `BeforeSaveInternal`: a stored file that changed on disk is
+        // re-dated under "Use file creation date" (`RefreshContext::redated`).
+        let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
+        // A `DateCreated` a reader supplied this pass — an NFO `<dateadded>`,
+        // a photo's EXIF `DateTaken` — is merged onto the stored row as
+        // upstream's `MergeData` does on every refresh the reader runs in
+        // (`MetadataService.cs:1381`, `PhotoProvider.cs:111`); the row here
+        // started without the resolver's date (`ResolverGuesses::take`), so
+        // any date it carries is a reader's. Either one writes the saved
+        // `DateCreated` over the stored one, which the scan save otherwise
+        // keeps as first imported.
+        let writes_date_created = redated.is_some() || entity.date_created.is_some();
         entity = saved_row(
             stored_row,
             &guesses,
@@ -4277,6 +4418,7 @@ impl LibraryScanner {
                 probe_ran,
                 locked_fields,
                 merge,
+                redated,
                 // `MetadataService.RefreshMetadata` (`:160-171`) runs
                 // `BeforeMetadataRefresh` only when a metadata mode runs and
                 // there are providers to run, or the refresh is a first or
@@ -4365,8 +4507,13 @@ impl LibraryScanner {
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
         let ancestors_changed = ancestors_changed(links, item);
-        let row_changed = stored_row
-            .is_none_or(|row| crate::item_persistence_service::scan_save_changes_row(&entity, row));
+        let row_changed = stored_row.is_none_or(|row| {
+            crate::item_persistence_service::scan_save_changes_row(
+                &entity,
+                row,
+                writes_date_created,
+            )
+        });
         // Upstream's `updateType > None`: a local provider answered (the
         // probe, a reader whose change monitor fired and found its file), or
         // what the save would write differs from what is stored. A remote
@@ -4446,10 +4593,19 @@ impl LibraryScanner {
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
         // `PrimaryVersionId`, the first-import `DateCreated`, the refresh
-        // dates and a locked row's metadata and `Data` are never lost.
-        self.persistence
-            .save_scanned_items(std::slice::from_ref(&entity))
-            .await?;
+        // dates and a locked row's metadata and `Data` are never lost. A
+        // re-dated file, or a date a reader supplied, writes its
+        // `DateCreated` over the stored one, which the first-import guard
+        // would otherwise keep.
+        if writes_date_created {
+            self.persistence
+                .save_scanned_items_with_date_created(std::slice::from_ref(&entity))
+                .await?;
+        } else {
+            self.persistence
+                .save_scanned_items(std::slice::from_ref(&entity))
+                .await?;
+        }
         if let Some(key) = moved_series_key {
             // `SeriesMetadataService.UpdateSeriesChildrenInfoAsync`: the
             // children a previous scan stored under the old key are
@@ -5223,12 +5379,12 @@ impl LibraryScanner {
     /// and it keeps an album's runtime right after a track is re-probed in
     /// place, which no folder refresh follows.
     ///
-    /// ACCEPTED DIVERGENCE (flagged to the owner): on a library monitor's
-    /// scan ([`ScanTarget::Changed`]) the planned folders include the
-    /// context ones above the refreshed item, so Ferrofin keeps a series'
-    /// `DateLastMediaAdded` current on a watcher event — a new episode moves
-    /// its series' "date added" at once, that one column written — where
-    /// upstream updates it only on the series' own refresh
+    /// ACCEPTED DIVERGENCE (approved by the owner on 2026-09-27): on a
+    /// library monitor's scan ([`ScanTarget::Changed`]) the planned folders
+    /// include the context ones above the refreshed item, so Ferrofin keeps
+    /// a series' `DateLastMediaAdded` current on a watcher event — a new
+    /// episode moves its series' "date added" at once, that one column
+    /// written — where upstream updates it only on the series' own refresh
     /// (`MetadataService.cs:404-411`), i.e. at the next library scan.
     async fn update_folder_aggregates(
         &self,
@@ -8366,7 +8522,8 @@ impl LibraryScanner {
     /// folds it into `homevideos`.
     #[cfg(test)]
     fn plan(&self, folders: &[VirtualFolderInfo]) -> Vec<Planned> {
-        self.plan_in(folders, folders, PlanScope::ALL).items
+        self.plan_in(folders, folders, PlanScope::ALL, DateAdded::default())
+            .items
     }
 
     /// [`plan`](Self::plan) restricted to `scope`: the items at or under its
@@ -8380,7 +8537,8 @@ impl LibraryScanner {
     #[cfg(test)]
     fn plan_paths(&self, folders: &[VirtualFolderInfo], scope: PlanScope<'_>) -> Vec<Planned> {
         let affected = affected_libraries(folders, scope.roots.unwrap_or_default(), scope.exact);
-        self.plan_in(&affected, folders, scope).items
+        self.plan_in(&affected, folders, scope, DateAdded::default())
+            .items
     }
 
     /// The plan pass over the libraries `plan_folders`, resolving what
@@ -8388,15 +8546,18 @@ impl LibraryScanner {
     /// presentation key names every library whose locations hold its folder
     /// (`LibraryManager.GetCollectionFolders`), whichever libraries this pass
     /// walks, so a library, a path-scoped and a full scan settle the same
-    /// key.
+    /// key. `date_added` dates what it resolves ([`base_item`](Self::base_item)).
     fn plan_in(
         &self,
         plan_folders: &[VirtualFolderInfo],
         key_folders: &[VirtualFolderInfo],
         scope: PlanScope<'_>,
+        date_added: DateAdded,
     ) -> PlanOutput {
         let naming = NamingOptions::new();
-        let ctx = PlanCtx::new(&naming, scope).with_locations(plan_folders);
+        let ctx = PlanCtx::new(&naming, scope)
+            .with_locations(plan_folders)
+            .with_date_added(date_added);
         let folders = key_folders;
         let mut out = Vec::new();
         for folder in plan_folders {
@@ -8448,6 +8609,7 @@ impl LibraryScanner {
             items: out,
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
+            date_added,
         }
     }
 
@@ -8472,9 +8634,11 @@ impl LibraryScanner {
     /// Builds a typed item row under collection folder `cf` with direct parent
     /// `parent`, returning its deterministic id and the row (the caller sets any
     /// type-specific fields and pushes it with its ancestor closure). `None` when
-    /// the id cannot be derived.
+    /// the id cannot be derived. `ctx`'s date-added rule dates it.
+    #[allow(clippy::too_many_arguments)]
     fn base_item(
         &self,
+        ctx: &PlanCtx<'_>,
         kind: BaseItemKind,
         cf: Uuid,
         parent: Uuid,
@@ -8521,21 +8685,25 @@ impl LibraryScanner {
             top_parent_id: Some(guid_to_db(cf)),
             is_folder,
             // Port of `ResolverHelper.SetDateCreated` (+ `EnsureDates`): with
-            // `UseFileCreationTimeForDateAdded` (the default) a FILE's "Date
-            // Added" is its creation time and `DateModified` its mtime — scan
-            // wall-clock would order a first scan by directory traversal. A
-            // DIRECTORY is different: `ManagedFileSystem.GetFileSystemMetadata`
-            // only fills `CreationTimeUtc`/`LastWriteTimeUtc` for a `FileInfo`,
-            // so every folder item (Series, Season, MusicAlbum, PhotoAlbum, a
-            // disc-rip Movie whose path is the directory) resolves with
-            // `MinValue` dates → `DateCreated = DateTime.UtcNow` at FIRST
-            // resolve. The scan upsert's `coalesce("DateCreated",
-            // excluded."DateCreated")` is what keeps that first-resolve stamp
-            // stable across rescans. Its `DateModified` is the directory's
-            // mtime, which `SaveInternal` stamps on every save (D3).
-            date_created: Some(match &times {
-                Some(times) => creation_time_from(times).into(),
-                None => Utc::now(),
+            // `UseFileCreationTimeForDateAdded` (the default, "Use file
+            // creation date") a FILE's "Date Added" is its creation time and
+            // `DateModified` its mtime. A DIRECTORY is different:
+            // `ManagedFileSystem.GetFileSystemMetadata` only fills
+            // `CreationTimeUtc`/`LastWriteTimeUtc` for a `FileInfo`, so every
+            // folder item (Series, Season, MusicAlbum, PhotoAlbum, a disc-rip
+            // Movie whose path is the directory) resolves with `MinValue`
+            // dates → `DateCreated = DateTime.UtcNow` at FIRST resolve. With
+            // the setting off ("Use date scanned into the library") every
+            // item, file or folder, is `DateTime.UtcNow` at that resolve: the
+            // moment this scan — a library scan, a watcher or webhook event,
+            // a refresh — first found it. The scan upsert's
+            // `coalesce("DateCreated", excluded."DateCreated")` is what keeps
+            // the first stamp stable across rescans, whatever the rule. Its
+            // `DateModified` is the directory's mtime, which `SaveInternal`
+            // stamps on every save (D3).
+            date_created: Some(match (&times, ctx.date_added) {
+                (Some(times), DateAdded::FileCreation) => creation_time_from(times).into(),
+                (_, DateAdded::Scanned) | (None, DateAdded::FileCreation) => Utc::now(),
             }),
             date_modified: mtime.map(Into::into),
             size,
@@ -8591,7 +8759,7 @@ impl LibraryScanner {
                 _ => (BaseItemKind::Video, "Video"),
             };
             let Some((id, mut entity)) =
-                self.base_item(kind, cf, cf, file_stem(&path), &path, false)
+                self.base_item(ctx, kind, cf, cf, file_stem(&path), &path, false)
             else {
                 continue;
             };
@@ -8693,7 +8861,7 @@ impl LibraryScanner {
                 folder_name(dir).unwrap_or(clean_name)
             };
             let Some((id, mut entity)) =
-                self.base_item(BaseItemKind::Movie, cf, cf, name, &entry.path, false)
+                self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, &entry.path, false)
             else {
                 continue;
             };
@@ -8753,7 +8921,8 @@ impl LibraryScanner {
         out: &mut Vec<Planned>,
     ) {
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-        let Some((id, mut entity)) = self.base_item(BaseItemKind::Movie, cf, cf, name, dir, true)
+        let Some((id, mut entity)) =
+            self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, dir, true)
         else {
             return;
         };
@@ -8796,7 +8965,7 @@ impl LibraryScanner {
             let name = info.name.unwrap_or_else(|| entry.name.clone());
             let series_name = name.clone();
             let Some((series_id, mut series)) =
-                self.base_item(BaseItemKind::Series, cf, cf, name, &entry.path, true)
+                self.base_item(ctx, BaseItemKind::Series, cf, cf, name, &entry.path, true)
             else {
                 continue;
             };
@@ -8943,6 +9112,7 @@ impl LibraryScanner {
                     let num = season.season_number;
                     let name = num.map_or_else(|| entry.name.clone(), season_display_name);
                     let Some((season_id, mut e)) = self.base_item(
+                        ctx,
                         BaseItemKind::Season,
                         cf,
                         series_id,
@@ -9059,9 +9229,15 @@ impl LibraryScanner {
             // synthetic path (unique per series+season) and leave the season's own
             // path unset (it is a virtual grouping, not an on-disk folder).
             let synthetic = format!("{series_dir}/#virtual-season-{}", num.unwrap_or(-1));
-            let Some((season_id, mut e)) =
-                self.base_item(BaseItemKind::Season, cf, series_id, name, &synthetic, true)
-            else {
+            let Some((season_id, mut e)) = self.base_item(
+                ctx,
+                BaseItemKind::Season,
+                cf,
+                series_id,
+                name,
+                &synthetic,
+                true,
+            ) else {
                 continue;
             };
             e.path = None;
@@ -9095,7 +9271,7 @@ impl LibraryScanner {
                 series_name,
                 series_key,
                 Some(&season_name),
-                naming,
+                ctx,
                 out,
             );
         }
@@ -9144,7 +9320,7 @@ impl LibraryScanner {
                     series_name,
                     series_key,
                     season_name,
-                    naming,
+                    ctx,
                     out,
                 );
             }
@@ -9164,15 +9340,16 @@ impl LibraryScanner {
         series_name: &str,
         series_key: &str,
         season_name: Option<&str>,
-        naming: &NamingOptions,
+        ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
-        let info = EpisodeResolver::new(naming).resolve_simple(path, false);
+        let info = EpisodeResolver::new(ctx.naming).resolve_simple(path, false);
         let (parent, ancestors) = match season {
             Some((season_id, _)) => (season_id, vec![cf, series_id, season_id]),
             None => (series_id, vec![cf, series_id]),
         };
         let Some((id, mut entity)) = self.base_item(
+            ctx,
             BaseItemKind::Episode,
             cf,
             parent,
@@ -9387,7 +9564,7 @@ impl LibraryScanner {
             // A directory name is not a filename: `file_stem` would truncate
             // "Trip 2024. Iceland" at the dot.
             let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-            match self.base_item(BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
+            match self.base_item(ctx, BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
                 Some((album_id, album)) => {
                     let mut ancestors = vec![cf];
                     if parent != cf {
@@ -9415,6 +9592,7 @@ impl LibraryScanner {
                 continue;
             }
             let Some((id, mut entity)) = self.base_item(
+                ctx,
                 BaseItemKind::Photo,
                 cf,
                 photo_parent,
@@ -9467,6 +9645,7 @@ impl LibraryScanner {
         if !in_artist
             && self.is_music_artist(dir, ctx)
             && let Some((artist_id, artist)) = self.base_item(
+                ctx,
                 BaseItemKind::MusicArtist,
                 cf,
                 parent,
@@ -9584,6 +9763,7 @@ impl LibraryScanner {
         // `file_stem` would cut "Greatest Hits Vol. 2" at the dot.
         let album_name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
         let Some((album_id, album)) = self.base_item(
+            ctx,
             BaseItemKind::MusicAlbum,
             cf,
             parent,
@@ -9622,6 +9802,7 @@ impl LibraryScanner {
                 continue;
             }
             let Some((id, mut entity)) = self.base_item(
+                ctx,
                 BaseItemKind::Audio,
                 cf,
                 album_id,
@@ -9672,6 +9853,7 @@ impl LibraryScanner {
                 continue;
             }
             let Some((id, mut entity)) = self.base_item(
+                ctx,
                 BaseItemKind::Audio,
                 cf,
                 artist_id,
@@ -9809,13 +9991,13 @@ impl LibraryScanner {
         if dir != root {
             if let Some(book) = single_book_file(&entries) {
                 if ctx.scope.keeps(&book) {
-                    self.push_book(&book, folder_name(dir), cf, out);
+                    self.push_book(&book, folder_name(dir), cf, ctx, out);
                 }
                 return;
             }
             if let Some((audio, year)) = single_audio_book(&entries, naming) {
                 if ctx.scope.keeps(&audio) {
-                    self.push_audio_book(&audio, folder_name(dir), year, cf, out);
+                    self.push_audio_book(&audio, folder_name(dir), year, cf, ctx, out);
                 }
                 return;
             }
@@ -9831,9 +10013,9 @@ impl LibraryScanner {
                 continue;
             }
             if is_book_file(&entry.path) {
-                self.push_book(&entry.path, None, cf, out);
+                self.push_book(&entry.path, None, cf, ctx, out);
             } else if is_audio_file(&entry.path, naming) && !is_cue_sheet(&entry.path) {
-                self.push_audio_book(&entry.path, None, None, cf, out);
+                self.push_audio_book(&entry.path, None, None, cf, ctx, out);
             }
         }
     }
@@ -9847,7 +10029,14 @@ impl LibraryScanner {
     /// a `SeriesName` body diff on the common `Dracula/dracula.epub` shape.
     /// Otherwise the file's own stem is parsed and the containing directory name
     /// stands in for a missing series (`BookResolver.Resolve`).
-    fn push_book(&self, path: &str, folder: Option<String>, cf: Uuid, out: &mut Vec<Planned>) {
+    fn push_book(
+        &self,
+        path: &str,
+        folder: Option<String>,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
         let (parsed_from, series_fallback) = match folder {
             Some(name) => (name, Some(String::new())),
             None => (file_stem(path), parent_folder_name(path)),
@@ -9859,7 +10048,8 @@ impl LibraryScanner {
             .name
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| parsed_from.clone());
-        let Some((id, mut entity)) = self.base_item(BaseItemKind::Book, cf, cf, name, path, false)
+        let Some((id, mut entity)) =
+            self.base_item(ctx, BaseItemKind::Book, cf, cf, name, path, false)
         else {
             return;
         };
@@ -9892,11 +10082,12 @@ impl LibraryScanner {
         folder: Option<String>,
         year: Option<i32>,
         cf: Uuid,
+        ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
         let name = folder.unwrap_or_else(|| file_stem(path));
         let Some((id, mut entity)) =
-            self.base_item(BaseItemKind::AudioBook, cf, cf, name, path, false)
+            self.base_item(ctx, BaseItemKind::AudioBook, cf, cf, name, path, false)
         else {
             return;
         };
@@ -10661,13 +10852,10 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     }
     // `<dateadded>` overrides the resolver's stamp (`BaseNfoParser`:
     // `item.DateCreated = dateCreated`, and `MetadataService.MergeData` copies
-    // a non-MinValue `DateCreated` from the provider result onto the item).
-    // Accepted divergence: this lands on FIRST import only — the scan upsert
-    // (`item_persistence_service::scan_upsert_sql`) coalesces `DateCreated`,
-    // so a `<dateadded>` added or edited later is not re-applied on rescan or
-    // refresh, where upstream's `MergeData` re-stamps it on every refresh.
-    // Letting an NFO-sourced `DateCreated` win that coalesce is the
-    // persistence-side follow-up.
+    // a non-MinValue `DateCreated` from the provider result onto the item) —
+    // on a stored item too, whenever the NFO reader runs: the scan saves a
+    // reader-supplied `DateCreated` over the stored one
+    // (`save_scanned_items_with_date_created`).
     if n.date_created.is_some() {
         entity.date_created = n.date_created;
     }
@@ -10916,6 +11104,11 @@ struct SaveFacts<'a> {
     /// `IndexNumber = info.IndexNumber`); Ferrofin's fetchers leave that to
     /// the merge ([`merge_onto_stored`]).
     remote_answered: bool,
+    /// The stored row's new `DateCreated`, when its file changed on disk
+    /// under "Use file creation date" ([`RefreshContext::redated`]). Set
+    /// before the merge, as `BeforeSave` runs before the providers: an NFO
+    /// `<dateadded>` the pass read still wins (`MergeData`).
+    redated: Option<DateTime<Utc>>,
 }
 
 /// What one pass's providers did, as the merge rule reads it.
@@ -11207,6 +11400,9 @@ fn saved_row(
 ) -> BaseItemEntity {
     let mut row = if let Some(stored) = stored {
         let mut base = stored.clone();
+        if facts.redated.is_some() {
+            base.date_created = facts.redated;
+        }
         if facts.before_refresh {
             before_metadata_refresh(&mut base, facts.replace_all, guesses.parent_index_number);
         }
@@ -12652,10 +12848,13 @@ mod tests {
         );
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
         let cf = uuid::Uuid::from_u128(0x7100);
+        let naming = super::NamingOptions::new();
+        let ctx = super::PlanCtx::new(&naming, super::PlanScope::ALL);
 
         let before = chrono::Utc::now() - chrono::Duration::seconds(5);
         let (_, folder) = scanner
             .base_item(
+                &ctx,
                 BaseItemKind::Series,
                 cf,
                 cf,
@@ -12682,6 +12881,7 @@ mod tests {
 
         let (_, episode) = scanner
             .base_item(
+                &ctx,
                 BaseItemKind::Episode,
                 cf,
                 cf,
@@ -12711,6 +12911,7 @@ mod tests {
         // upstream's `MinValue → UtcNow` guard.
         let (_, ghost) = scanner
             .base_item(
+                &ctx,
                 BaseItemKind::Movie,
                 cf,
                 cf,
@@ -12722,6 +12923,68 @@ mod tests {
         let created = ghost.date_created.expect("stamped");
         assert!((chrono::Utc::now() - created).num_seconds().abs() < 60);
         assert_eq!(ghost.date_modified, None);
+    }
+
+    /// "Use date scanned into the library" (`SetDateCreated`'s `else`): a
+    /// FILE is dated by the moment it is resolved too, not by its creation
+    /// time; its `DateModified` and `Size` are still the file's.
+    #[tokio::test]
+    async fn base_item_dates_files_by_the_resolve_under_date_scanned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("S01E01.mkv");
+        std::fs::write(&file, b"x").expect("write");
+        let past = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(past)
+            .expect("set mtime");
+        let meta = std::fs::metadata(&file).expect("stat");
+        let created = chrono::DateTime::<chrono::Utc>::from(super::creation_time_from(
+            &super::FileTimes::of(&meta),
+        ));
+        // Past the file's creation: a birth time is the write above.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(dir.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence);
+        let cf = uuid::Uuid::from_u128(0x7101);
+        let naming = super::NamingOptions::new();
+        let ctx = super::PlanCtx::new(&naming, super::PlanScope::ALL)
+            .with_date_added(super::DateAdded::Scanned);
+
+        let before = chrono::Utc::now();
+        let (_, episode) = scanner
+            .base_item(
+                &ctx,
+                BaseItemKind::Episode,
+                cf,
+                cf,
+                "S01E01".into(),
+                &file.to_string_lossy(),
+                false,
+            )
+            .expect("episode row");
+        let after = chrono::Utc::now();
+        let stamped = episode.date_created.expect("stamped");
+        assert!(
+            (before..=after).contains(&stamped),
+            "dated by the resolve: {stamped} not in {before}..={after}"
+        );
+        assert_ne!(stamped, created, "not the file's creation time");
+        assert_eq!(
+            episode.date_modified,
+            Some(chrono::DateTime::<chrono::Utc>::from(past)),
+            "DateModified is still the file's mtime"
+        );
+        assert_eq!(episode.size, Some(1));
     }
 
     /// A folder's first-resolve stamp survives a rescan: the scan upsert
@@ -16174,6 +16437,7 @@ mod tests {
                 before_refresh: true,
                 replace_all: false,
                 remote_answered: false,
+                redated: None,
             },
         )
     }
@@ -16335,6 +16599,7 @@ mod tests {
                 before_refresh: true,
                 replace_all: options.replace_all_metadata,
                 remote_answered: answered,
+                redated: None,
             },
         )
     }
@@ -16844,6 +17109,7 @@ mod tests {
             locked: &std::collections::HashSet::new(),
             externals: None,
             superseded: std::collections::HashSet::new(),
+            date_added: super::DateAdded::default(),
             cancel: &super::ScanCancel::new(),
         };
         let at = |path: &str| super::Planned {
@@ -17261,6 +17527,7 @@ mod tests {
                     before_refresh,
                     replace_all: false,
                     remote_answered: false,
+                    redated: None,
                 },
             )
         };
@@ -17579,6 +17846,7 @@ mod tests {
                 before_refresh: true,
                 replace_all: false,
                 remote_answered: true,
+                redated: None,
             },
         );
         // The season response's episode 1 (the path's episode 3 is not in it).
@@ -17922,6 +18190,7 @@ mod tests {
                 before_refresh: true,
                 replace_all: false,
                 remote_answered: true,
+                redated: None,
             },
         )
     }

@@ -55,6 +55,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   only by name), now uses the server-wide metadata options — their disabled fetchers and
   their order. Their defaults (Jellyfin's) disable TheAudioDB metadata for albums and
   artists and OMDb for music videos. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- Honour "Date added behavior for new content" (Dashboard → Libraries → Display):
+  "Use date scanned into the library" dates a new item by the moment Ferrofin first
+  detects it, by a library scan or the disk watcher/webhook alike, and its series'
+  date added follows; "Use file creation date" (the default) keeps the file's
+  creation time, and re-dates a file whose modification time changed, as Jellyfin
+  does. An `.nfo` `<dateadded>` or a photo's EXIF date now also re-dates an item
+  already in the library whenever it is read again. Adopting a Jellyfin install
+  carries the choice over from `metadata.xml`, including an install adopted by an
+  earlier version (on its first boot of this one). Existing items otherwise keep their
+  stored date. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ## [1.0.0] - 2026-09-05
 

@@ -11,7 +11,7 @@ use rstest::rstest;
 
 use super::{
     FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
-    ProbeKind, RefreshReason, RefreshRequest, SaveDecision, StoredState, decide_save,
+    ProbeKind, RefreshReason, RefreshRequest, SaveDecision, StoredState, decide_save, file_changed,
     plan_item_refresh,
 };
 
@@ -948,4 +948,20 @@ fn every_reason_has_a_distinct_log_name() {
     assert_eq!(RefreshReason::LocalMetadata.as_str(), "nfo");
     assert_eq!(RefreshReason::Sidecars.as_str(), "sidecar");
     assert_eq!(ItemRefreshPlan::IDLE.reason, RefreshReason::Unchanged);
+}
+
+/// `BaseItemExtensions.HasChanged`: more than a second either way, and an
+/// unset stored date (`DateTime.MinValue`) always.
+#[rstest]
+#[case::same(Some(0), false)]
+#[case::within_a_second(Some(1_000), false)]
+#[case::past_a_second(Some(1_001), true)]
+#[case::earlier(Some(-1_001), true)]
+#[case::never_saved(None, true)]
+fn a_file_changed_when_its_mtime_drifted_past_a_second(
+    #[case] stored_offset_ms: Option<i64>,
+    #[case] changed: bool,
+) {
+    let stored = stored_offset_ms.map(|ms| mtime() + TimeDelta::milliseconds(ms));
+    assert_eq!(file_changed(stored, mtime()), changed);
 }

@@ -543,6 +543,22 @@ pub trait ItemPersistenceService: Send + Sync {
         self.save_items(items).await
     }
 
+    /// [`save_scanned_items`](Self::save_scanned_items), except that each
+    /// row's own `DateCreated` replaces the stored one (a `NULL` still keeps
+    /// it): the save of a stored file whose modification time drifted under
+    /// "Use file creation date", which upstream re-dates to the file's
+    /// creation time (`MetadataService.BeforeSaveInternal`). Every other
+    /// guard of the scan save holds.
+    ///
+    /// The default delegates to [`save_items`](Self::save_items) (for
+    /// stub/fake services).
+    async fn save_scanned_items_with_date_created(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<(), ServiceError> {
+        self.save_items(items).await
+    }
+
     /// Re-points a series' children at `key` after the series'
     /// `PresentationUniqueKey` changed — C# `SeriesMetadataService.
     /// UpdateSeriesChildrenInfoAsync` (v12.0), which syncs every season and
@@ -821,16 +837,24 @@ pub trait ItemPersistenceService: Send + Sync {
     /// not be read — its `Path`, `ParentId`, `TopParentId` and, when the
     /// stat has them, `DateModified` and `Size` — and only when one of them
     /// differs from what is stored (stamping `DateLastSaved` then). Every
-    /// other column keeps its stored value. Returns whether the row was
-    /// written.
+    /// other column keeps its stored value, except that `date_if_changed`,
+    /// when given, becomes `DateCreated` if the new `DateModified` differs
+    /// from the stored one by more than a second (an unset one included) —
+    /// `MetadataService.BeforeSaveInternal`'s re-date of a changed file,
+    /// judged on the row itself since it cannot be read. Returns whether the
+    /// row was written.
     ///
     /// The default writes nothing (for stub/fake services).
     ///
     /// # Errors
     ///
     /// [`ServiceError::Backend`] on a storage failure.
-    async fn update_file_facts(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
-        let _ = item;
+    async fn update_file_facts(
+        &self,
+        item: &BaseItemEntity,
+        date_if_changed: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, date_if_changed);
         Ok(false)
     }
 
