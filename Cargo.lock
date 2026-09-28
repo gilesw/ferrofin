@@ -1578,6 +1578,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex 1.3.0",
+ "sqlx",
  "tempfile",
  "tikv-jemallocator",
  "tokio",

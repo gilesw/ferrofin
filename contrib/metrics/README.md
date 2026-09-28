@@ -277,6 +277,10 @@ left behind.
   rescan (change detection is not holding); *Time since last scheduled scan* past the
   task interval (12 h by default).
 
+To check a server on demand instead of waiting for its next scheduled scan, run
+[`verify/scan-behaviour.sh`](../../verify/README.md): it drives scratch changes through one
+library and asserts on these same counters.
+
 ## Divergences — .NET metrics deliberately NOT ported (never faked)
 
 These are .NET-runtime internals with no Rust equivalent. Jellyfin emits them from

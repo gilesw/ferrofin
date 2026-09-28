@@ -153,10 +153,11 @@ impl FanartClient {
         }
     }
 
-    /// Points the client at `base_url` (a mock server) for tests.
-    #[cfg(test)]
-    pub(crate) fn with_base_url(mut self, base_url: &str) -> Self {
-        self.base_url = base_url.to_owned();
+    /// Points the client at `base_url` (a mock server in tests, and the
+    /// composition root's provider test seam).
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        base_url.clone_into(&mut self.base_url);
         self
     }
 

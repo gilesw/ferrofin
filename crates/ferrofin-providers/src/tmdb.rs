@@ -863,6 +863,9 @@ pub struct TmdbClient {
     /// The TMDb plugin's dashboard settings (`TmdbApiKey`, `IncludeAdult`, the
     /// cast/crew caps, the five image sizes).
     plugin: crate::plugin_config::ConfigSource,
+    /// Image root replacing TMDb's CDN, for tests
+    /// ([`with_image_root`](TmdbClient::with_image_root)).
+    image_root: Option<String>,
 }
 
 impl Default for TmdbClient {
@@ -881,6 +884,7 @@ impl TmdbClient {
             api_key: SecretString::from(DEFAULT_API_KEY),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
+            image_root: None,
         }
     }
 
@@ -897,6 +901,7 @@ impl TmdbClient {
             }),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
+            image_root: None,
         }
     }
 
@@ -915,7 +920,19 @@ impl TmdbClient {
     /// saving the settings page changes the next lookup, with no restart. The
     /// read is a few hundred bytes off disk in front of a TMDB round trip.
     pub(crate) async fn settings(&self) -> crate::plugin_config::TmdbConfig {
-        self.plugin.load(crate::builtin_plugins::TMDB.id).await
+        let mut cfg: crate::plugin_config::TmdbConfig =
+            self.plugin.load(crate::builtin_plugins::TMDB.id).await;
+        cfg.image_root.clone_from(&self.image_root);
+        cfg
+    }
+
+    /// Points the artwork URLs at a different image root than TMDb's CDN
+    /// (`https://image.tmdb.org/t/p`) — a mock server in tests; the size
+    /// segment and the image path follow it.
+    #[must_use]
+    pub fn with_image_root(mut self, root: &str) -> Self {
+        self.image_root = Some(root.trim_end_matches('/').to_owned());
+        self
     }
 
     /// Points the client at a different API root (a mock server in tests).

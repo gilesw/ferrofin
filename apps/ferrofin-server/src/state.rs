@@ -475,14 +475,30 @@ pub async fn build_app_state(
     // The shared TMDB client — the scan's automatic artwork, the remote-search
     // ("Identify") providers, and the remote-image ("Choose Image") methods all
     // use Jellyfin's built-in key.
-    let tmdb_client = Arc::new(ferrofin_providers::TmdbClient::new());
+    //
+    // `config.provider_endpoints` is a test seam (never set from a file or the
+    // environment): the end-to-end scan test points every provider a scan
+    // reaches at its mock server. Unset, each client keeps its public host.
+    let endpoints = &config.provider_endpoints;
+    let mut tmdb_client = ferrofin_providers::TmdbClient::new();
+    if let Some(base) = endpoints.tmdb.as_deref() {
+        tmdb_client = tmdb_client.with_base_url(base);
+    }
+    if let Some(root) = endpoints.tmdb_images.as_deref() {
+        tmdb_client = tmdb_client.with_image_root(root);
+    }
+    let tmdb_client = Arc::new(tmdb_client);
     let metadata_library = std::path::PathBuf::from(paths.internal_metadata_path()).join("library");
     // TheTVDB — the TV authority. Ships on with the built-in project key (like
     // TMDB); a user key/PIN override enables their subscription tier.
-    let the_tvdb = Arc::new(ferrofin_providers::TvdbClient::with_config(
+    let the_tvdb = ferrofin_providers::TvdbClient::with_config(
         &config.tvdb_api_key,
         &config.tvdb_subscriber_pin,
-    ));
+    );
+    let the_tvdb = Arc::new(match endpoints.tvdb.as_deref() {
+        Some(base) => the_tvdb.with_base_url(base),
+        None => the_tvdb,
+    });
     // OMDb — IMDb-sourced text, the community rating and the Rotten Tomatoes
     // critic score TMDB has no data for. Inert until FERROFIN_OMDB_KEY (config
     // `omdb_api_key`) is set: every call returns nothing without a key.
@@ -496,14 +512,21 @@ pub async fn build_app_state(
     ));
     // TheAudioDb — artist bio/genre + artist/album artwork by MusicBrainz id
     // (built-in free key). Shared by the scan and the "Choose Image" methods.
-    let audiodb_client = Arc::new(ferrofin_providers::AudioDbClient::new());
+    let audiodb_client = Arc::new(match endpoints.audiodb.as_deref() {
+        Some(base) => ferrofin_providers::AudioDbClient::with_base_url(base),
+        None => ferrofin_providers::AudioDbClient::new(),
+    });
     // fanart.tv — logos/clear-art/disc/banners keyed off the Tmdb/Imdb/Tvdb/
     // MusicBrainz ids. Built-in key works keyless; FERROFIN_FANART_KEY adds a
     // personal client_key. Shared by the scan and the "Choose Image" methods.
-    let fanart_client = Arc::new(ferrofin_providers::FanartClient::new(
+    let fanart_client = ferrofin_providers::FanartClient::new(
         (!config.fanart_personal_api_key.is_empty())
             .then(|| config.fanart_personal_api_key.clone()),
-    ));
+    );
+    let fanart_client = Arc::new(match endpoints.fanart.as_deref() {
+        Some(base) => fanart_client.with_base_url(base),
+        None => fanart_client,
+    });
     let search_providers: Vec<Arc<dyn ferrofin_providers::RemoteSearchProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSearchProvider::new(
             Arc::clone(&tmdb_client),

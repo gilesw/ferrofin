@@ -55,7 +55,9 @@ Deep-verified against a real Jellyfin server:
   `movies` / `tvshows` / `music` / `homevideos` / `musicvideos` / `mixed` / untyped
   libraries; `books` is scanned too but is **not** deep-verified — see the entry below.
   `boxsets` is the one library type not resolved off disk (its members are curated through
-  the collection API).
+  the collection API). A rescan reprocesses only what changed (an unchanged library is not
+  re-probed, re-fetched or re-saved); [`verify/`](../verify/README.md) checks that against
+  any running server.
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,

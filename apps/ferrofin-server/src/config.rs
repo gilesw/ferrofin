@@ -156,6 +156,40 @@ enum DbPoolFileValue {
     Mode(String),
 }
 
+/// API roots that replace the public hosts of the remote providers a library
+/// scan reaches ([`Config::provider_endpoints`], a test seam). `None` keeps
+/// the provider's public host.
+///
+/// Not here, and why:
+/// - MusicBrainz and the studio artwork repository: each has a real setting
+///   already ([`Config::musicbrainz_base_url`], [`Config::studios_repo_url`]).
+/// - OMDb: inert without a key ([`Config::omdb_api_key`]).
+/// - LrcLib and ListenBrainz: a scan never calls them (lyrics come from the
+///   "Download missing lyrics" task, similar artists on request), as upstream.
+/// - OpenSubtitles: a scan does not call it yet. Upstream's probe downloads
+///   missing subtitles when a library sets `SubtitleDownloadLanguages`
+///   (`FFProbeVideoInfo.AddExternalSubtitlesAsync`); that is not ported yet,
+///   and Ferrofin downloads them only in the "Download missing subtitles"
+///   task. Porting it needs an `opensubtitles` entry here, or the end-to-end
+///   scan test would reach the real API.
+/// - Image CDNs other than TMDb's: their URLs come from the provider answers
+///   (fanart.tv, TheTVDB, TheAudioDB), which a mock serves.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderEndpoints {
+    /// Replaces `https://api.themoviedb.org/3`.
+    pub tmdb: Option<String>,
+    /// Replaces TMDb's image CDN root, `https://image.tmdb.org/t/p` (the
+    /// artwork URLs TMDb's answers are relative to).
+    pub tmdb_images: Option<String>,
+    /// Replaces `https://api4.thetvdb.com/v4`.
+    pub tvdb: Option<String>,
+    /// Replaces `https://webservice.fanart.tv/v3.2`.
+    pub fanart: Option<String>,
+    /// Replaces TheAudioDB's API root (`…/api/v1/json/{key}`).
+    pub audiodb: Option<String>,
+}
+
 /// The resolved bootstrap configuration, after layering CLI > env > file >
 /// defaults and deriving the sub-directories under `data_dir`.
 ///
@@ -192,6 +226,12 @@ pub struct Config {
     /// disable it or select an isolated loopback endpoint. Not a file/env setting.
     #[doc(hidden)]
     pub discovery_bind_addr: Option<std::net::SocketAddr>,
+
+    /// Internal provider transport seam: production calls each built-in
+    /// remote provider's public API; the end-to-end scan test points them at
+    /// an in-process mock server. Not a file/env setting.
+    #[doc(hidden)]
+    pub provider_endpoints: ProviderEndpoints,
 
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
@@ -579,6 +619,7 @@ impl Config {
             web_dir,
             bind_addr,
             discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
+            provider_endpoints: ProviderEndpoints::default(),
             port,
             https_port,
             published_url,
@@ -693,6 +734,7 @@ impl Config {
             web_dir: root.join("web"),
             bind_addr: "127.0.0.1".parse().expect("literal IP parses"),
             discovery_bind_addr: None,
+            provider_endpoints: ProviderEndpoints::default(),
             port: 0,
             https_port: 0,
             published_url: None,
