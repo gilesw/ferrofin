@@ -14,6 +14,7 @@
 //! account for a bearer token, `GET /subtitles` searches, and `POST /download`
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
 use std::sync::Arc;
 
@@ -288,7 +289,7 @@ impl OpenSubtitlesProvider {
                 resp.status()
             )));
         }
-        let body: LoginResponse = resp.json().await.map_err(net_err)?;
+        let body: LoginResponse = resp.counted_json().await.map_err(net_err)?;
         Ok(body.token)
     }
 
@@ -391,7 +392,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 resp.status()
             )));
         }
-        let body: SearchResponse = resp.json().await.map_err(net_err)?;
+        let body: SearchResponse = resp.counted_json().await.map_err(net_err)?;
         Ok(map_search(&body, &request.language))
     }
 
@@ -434,7 +435,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .map_err(request_err)?
             .error_for_status()
             .map_err(net_err)?
-            .json()
+            .counted_json()
             .await
             .map_err(net_err)?;
 
@@ -443,15 +444,17 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .http
             .get(&dl.link)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send_limited(&crate::image_download::limiter_for(&dl.link))
+            .send_limited(&crate::image_download::limiter_for(
+                &dl.link,
+                "opensubtitles",
+            ))
             .await
             .map_err(request_err)?
             .error_for_status()
             .map_err(net_err)?
-            .bytes()
+            .counted_bytes()
             .await
-            .map_err(net_err)?
-            .to_vec();
+            .map_err(net_err)?;
 
         Ok(SubtitleResponse {
             language: parsed.language,

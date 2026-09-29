@@ -20,6 +20,7 @@
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use std::sync::Mutex;
 
@@ -418,7 +419,7 @@ impl TvdbClient {
             .send_limited(&self.limiter)
             .await
             .ok()?;
-        let env: Envelope<LoginData> = resp.json().await.ok()?;
+        let env: Envelope<LoginData> = resp.counted_json().await.ok()?;
         let token = env.data?.token;
         if let Ok(mut guard) = self.token.lock() {
             *guard = Some(token.clone());
@@ -442,7 +443,7 @@ impl TvdbClient {
             .send_limited(&self.limiter)
             .await
             .ok()?;
-        let env: Envelope<T> = resp.json().await.ok()?;
+        let env: Envelope<T> = resp.counted_json().await.ok()?;
         env.data
     }
 
@@ -583,7 +584,7 @@ impl TvdbClient {
     /// Downloads an image by absolute URL, returning its bytes.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
         let resp = crate::image_download::send(&self.http, url).await.ok()?;
-        resp.bytes().await.ok().map(|b| b.to_vec())
+        resp.counted_bytes().await.ok()
     }
 }
 

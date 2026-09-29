@@ -18,6 +18,7 @@
 //! via `GET /api/get/{id}`. Every request sends a descriptive `User-Agent`, as
 //! lrclib.net asks of API consumers.
 
+use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
 use async_trait::async_trait;
 use ferrofin_model::lyrics::{LyricMetadata, LyricSearchRequest};
@@ -277,7 +278,7 @@ impl LrcLibProvider {
             tracing::debug!(status = %response.status(), path, "lrclib request rejected");
             return None;
         }
-        match response.json::<T>().await {
+        match response.counted_json::<T>().await {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::debug!(error = %e, path, "lrclib response decode failed");

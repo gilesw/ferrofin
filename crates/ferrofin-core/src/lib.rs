@@ -205,7 +205,9 @@ pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
 pub mod quick_connect_manager;
+use ferrofin_providers::refresh_plan;
 pub mod resolvers;
+pub mod scan_metrics;
 pub mod scheduled_tasks;
 pub mod search_manager;
 pub mod server_discovery;
@@ -263,7 +265,10 @@ pub use library_manager::FerrofinLibraryManager;
 pub use library_monitor::{
     FerrofinLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
 };
-pub use library_scan::LibraryScanner;
+pub use library_scan::{
+    LaneRefresh, LibraryScanner, PriorityLane, ScanCancel, ScanOutcome, ScanPasses, ScanProgress,
+    ScanRun,
+};
 pub use linked_children_service::FerrofinLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::FerrofinLyricManager;

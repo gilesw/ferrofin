@@ -116,6 +116,9 @@ struct Prefetched {
     /// which is `series.Studios.FirstOrDefault()` and therefore lives on a row
     /// the projected item is not.
     series_studios: HashMap<Uuid, String>,
+    /// Locked metadata fields per item id (populated only when the
+    /// `Settings` field is requested — the gate `LockedFields` rides on).
+    locked_fields: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>,
     /// Credited people per item id (populated only when the `People` field is
     /// requested), so a page's cast/crew loads in one query.
     people: HashMap<Uuid, Vec<ferrofin_db::entities::base_items::PeopleEntity>>,
@@ -1596,10 +1599,12 @@ impl FerrofinDtoService {
         // The page's credits and their images were bulk-loaded once by the
         // prefetch (the per-item get_people + per-person load_images was the
         // N+1 cost of a large-cast item).
-        let people = prefetched
-            .people
-            .get(&item_id)
-            .map_or(&[][..], Vec::as_slice);
+        let people = attach_order(
+            prefetched
+                .people
+                .get(&item_id)
+                .map_or(&[][..], Vec::as_slice),
+        );
         let images_by_person = &prefetched.person_images;
 
         let mut list = Vec::with_capacity(people.len());
@@ -2381,7 +2386,15 @@ impl FerrofinDtoService {
             dto.forced_sort_name = item.forced_sort_name.clone();
             dto.preferred_metadata_country_code = item.preferred_metadata_country_code.clone();
             dto.preferred_metadata_language = item.preferred_metadata_language.clone();
-            dto.locked_fields = Some(Vec::new()); // Jellyfin emits item.LockedFields ([] here)
+            // `dto.LockedFields = item.LockedFields` (`DtoService.cs:1120`):
+            // the stored set, `[]` when the item has none.
+            dto.locked_fields = Some(
+                prefetched
+                    .locked_fields
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
         }
 
         dto.end_date = item.end_date;
@@ -3251,6 +3264,39 @@ fn f64_to_f32(value: f64) -> f32 {
 }
 
 /// Maps a stored `PersonType` string onto a [`PersonKind`].
+/// `AttachPeople`'s order (`DtoService.cs:900-935`) over an item's credits
+/// as `GetPeople` returns them (`ListOrder`): by `SortOrder ?? int.MaxValue`,
+/// then by kind — actors, guest stars, directors, writers, then producers
+/// and composers together, then everyone else — a stable sort, so ties keep
+/// the credit order. Credits with an order (a TMDB cast's billing, an NFO's
+/// `<sortorder>`) lead; the crew, which has none, groups by kind after them.
+fn attach_order(
+    people: &[ferrofin_db::entities::base_items::PeopleEntity],
+) -> Vec<&ferrofin_db::entities::base_items::PeopleEntity> {
+    use ferrofin_model::data::PersonKind;
+    let kind_rank = |person: &ferrofin_db::entities::base_items::PeopleEntity| match person
+        .person_type
+        .as_deref()
+        .map(person_kind_from_str)
+    {
+        Some(PersonKind::Actor) => 0,
+        Some(PersonKind::GuestStar) => 1,
+        Some(PersonKind::Director) => 2,
+        Some(PersonKind::Writer) => 3,
+        Some(PersonKind::Producer | PersonKind::Composer) => 4,
+        _ => 10,
+    };
+    let mut ordered: Vec<&ferrofin_db::entities::base_items::PeopleEntity> =
+        people.iter().collect();
+    ordered.sort_by_key(|person| {
+        (
+            person.sort_order.unwrap_or(i64::from(i32::MAX)),
+            kind_rank(person),
+        )
+    });
+    ordered
+}
+
 fn person_kind_from_str(value: &str) -> ferrofin_model::data::PersonKind {
     use ferrofin_model::data::PersonKind;
     match value {
@@ -3530,7 +3576,15 @@ impl FerrofinDtoService {
                 Ok(HashMap::new())
             }
         };
-        let (user_data, people) = tokio::try_join!(user_data_fut, people_fut)?;
+        let locked_fields_fut = async {
+            if options.contains_field(ItemFields::Settings) {
+                self.library.get_locked_fields_batch(&ids).await
+            } else {
+                Ok(HashMap::new())
+            }
+        };
+        let (user_data, people, locked_fields) =
+            tokio::try_join!(user_data_fut, people_fut, locked_fields_fut)?;
         // The page ids that can actually own media sources. A folder or a
         // by-name item (person, genre, studio, …) owns no stream, chapter,
         // trickplay or alternate-version row, so asking for them is four
@@ -4019,6 +4073,7 @@ impl FerrofinDtoService {
             photo_album_names,
             series_provider_ids,
             series_studios,
+            locked_fields,
             people,
             person_images,
             value_ids,
@@ -5575,9 +5630,6 @@ mod tests {
             Err(ServiceError::NotFound("get_live_stream".into()))
         }
         async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn refresh_media_streams(&self, _item_id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
     }
@@ -8100,6 +8152,71 @@ mod tests {
         assert_eq!(people.len(), 2);
         assert_eq!(people[0].id, person, "first spelling");
         assert_eq!(people[1].id, person, "second spelling");
+    }
+
+    /// `AttachPeople`'s order (`DtoService.cs:900-935`): `SortOrder ??
+    /// int.MaxValue` first, then actors, guest stars, directors, writers,
+    /// producers and composers (together), everyone else; ties keep the
+    /// credit order. A row an older Ferrofin wrote carries its list position
+    /// as its `SortOrder`, so its credits keep their stored order.
+    #[rstest::rstest]
+    #[case::sort_order_then_kind(
+        &[
+            ("Dir", "Director", None),
+            ("Actor Two", "Actor", Some(1)),
+            ("Wri", "Writer", None),
+            ("Actor One", "Actor", Some(0)),
+            ("Guest", "GuestStar", Some(5)),
+            ("Prod", "Producer", None),
+            ("Eng", "Engineer", None),
+            ("Comp", "Composer", None),
+            ("Guest Two", "GuestStar", None),
+        ],
+        &["Actor One", "Actor Two", "Guest", "Guest Two", "Dir", "Wri", "Prod", "Comp", "Eng"]
+    )]
+    #[case::list_position_as_sort_order(
+        &[
+            ("Dir", "Director", Some(0)),
+            ("Actor", "Actor", Some(1)),
+            ("Wri", "Writer", Some(2)),
+        ],
+        &["Dir", "Actor", "Wri"]
+    )]
+    #[tokio::test]
+    async fn people_follow_attach_peoples_order(
+        #[case] credits: &[(&str, &str, Option<i64>)],
+        #[case] expected: &[&str],
+    ) {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let item = fetch_item(&db, movie).await;
+        let library = Arc::new(FakeLibrary {
+            people: credits
+                .iter()
+                .map(|(name, kind, order)| PeopleEntity {
+                    id: Uuid::new_v4().to_string(),
+                    name: (*name).to_owned(),
+                    person_type: Some((*kind).to_owned()),
+                    sort_order: *order,
+                    ..Default::default()
+                })
+                .collect(),
+            named_items: Vec::new(),
+        });
+        let svc = service_with(db, library);
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        let names: Vec<&str> = dto
+            .people
+            .as_ref()
+            .expect("people")
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .collect();
+        assert_eq!(names, expected);
     }
 
     #[tokio::test]
