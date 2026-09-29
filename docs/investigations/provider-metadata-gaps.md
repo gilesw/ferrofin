@@ -111,3 +111,35 @@ RUSTC_WRAPPER= cargo test -p ferrofin-server --test scan_bench -- --nocapture
 Session artifacts: `/tmp/ferrofin-metadata-bench.log` and
 `/tmp/ferrofin-metadata-bench.json`; coverage reports are
 `/tmp/metadata-core-coverage.log` and `/tmp/metadata-provider-coverage.log`.
+
+## Integration with the final scan PR
+
+The metadata branch was created from `feat/scan-change-detection` at `71311ef2`.
+PR #21 was subsequently squash-merged into main as `670d530e`, including scan
+changes made after that fork. Git's ordinary merge base therefore predates the
+scan work and reports many files as independently added.
+
+The merge resolution uses `71311ef2` to compare the actual changes on each side.
+It preserves all 13 files changed only on main byte-for-byte, and integrates the
+metadata/subtitle changes with main's final scan behavior. In particular, TMDB's
+combined episode detail/credits request retains billing order and the rule that
+an empty TMDB credit list does not clear existing people; TVDB retains its
+provider-order-sensitive credit reset behavior.
+
+Validation of the merged tree:
+
+- 2,795 tests passed across core, providers, database and traits; 5 skipped.
+- Separate coverage runs passed: core 94.07% (1,884 tests), providers 92.65%
+  (716 tests, 4 skipped), each gated at 80% with dependency sources excluded.
+- Real HTTP scan matrix passed in 18.13 seconds, including subtitle downloads,
+  provider identities/artwork, outage behavior and unchanged cast-image rows.
+- All 33 verification-script tests passed with local HTTP fixtures enabled.
+- Clippy (core/providers/server, all targets/features, warnings denied), formatting
+  and whitespace checks passed.
+
+Four alternating runs per build of the same 420-item scan fixture described
+above compared `54542417` with the merged tree. Median first-scan time was
+1.1295 → 1.1210 seconds; median rescan time was 0.7155 → 0.7150 seconds.
+Timing ranges overlap and scan outcomes match. These debug measurements cover
+local scan overhead without ffprobe or remote providers. Raw results are in
+`/tmp/metadata-merge-bench.log` and `/tmp/metadata-merge-bench.json`.

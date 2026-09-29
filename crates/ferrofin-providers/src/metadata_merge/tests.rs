@@ -1,6 +1,8 @@
 //! `MergeData` cases. The upstream ones are transliterated from
-//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceTests.cs` and
-//! `tests/Jellyfin.Model.Tests/Entities/ProviderIdsExtensionsTests.cs`
+//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceTests.cs`,
+//! `tests/Jellyfin.Model.Tests/Entities/ProviderIdsExtensionsTests.cs` and
+//! the `RefreshWithProviders_*` cases of
+//! `tests/Jellyfin.Providers.Tests/Manager/MetadataServiceRefreshTests.cs`
 //! (upstream master `208c278b75`); their expected values are the oracle.
 //!
 //! Upstream's reflection helper `TestMergeBaseItemData` answers "did the
@@ -16,8 +18,8 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data,
-    merge_provider_ids, merge_refresh, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data, merge_people,
+    merge_provider_ids, merge_refresh, pass_credits, set_provider_ids, settle_sort_name,
 };
 
 /// The stored `Type` name for `kind`.
@@ -565,6 +567,7 @@ fn person(name: &str) -> PeopleEntity {
         role: None,
         primary_image_url: None,
         provider_id: None,
+        sort_order: None,
     }
 }
 
@@ -689,6 +692,370 @@ fn merge_people_matches_names_loosely_and_drops_invalid_ids() {
         false,
     );
     assert_eq!(result.expect("people")[0].provider_id, Some(37_917));
+}
+
+/// `MergePeople` pairs same-named people by position: the n-th target
+/// "John Smith" takes from the n-th source one, and a target past the
+/// source's count takes from its first. Names nobody in the source carries
+/// are left alone, and nobody is added. A missing sort order fills like the
+/// rest (`:1465-1468`) and a present one is kept.
+#[test]
+fn merge_people_pairs_same_named_people_by_position() {
+    let credited = |name: &str, id: i64, role: &str, order: i64| PeopleEntity {
+        provider_id: Some(id),
+        role: Some(role.into()),
+        sort_order: Some(order),
+        ..person(name)
+    };
+    let source = vec![
+        credited("John Smith", 1, "First", 10),
+        credited("Jane Doe", 3, "Lead", 30),
+        credited("JOHN SMITH", 2, "Second", 20),
+    ];
+    let mut target = vec![
+        person("John Smith"),
+        person("Nobody Else"),
+        PeopleEntity {
+            sort_order: Some(99),
+            ..person("john smith")
+        },
+        person("John Smith"),
+    ];
+    merge_people(&source, &mut target);
+    let got: Vec<(Option<i64>, Option<&str>, Option<i64>)> = target
+        .iter()
+        .map(|p| (p.provider_id, p.role.as_deref(), p.sort_order))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (Some(1), Some("First"), Some(10)),
+            (None, None, None),
+            (Some(2), Some("Second"), Some(99)),
+            (Some(1), Some("First"), Some(10)),
+        ]
+    );
+}
+
+/// Upstream's lookup keys by name alone (`ToLookup(p => p.Name
+/// .RemoveDiacritics())`), not by name and type: a person credited as both
+/// director and actor pairs the target's director credit with the source's
+/// first same-named credit, so the director credit takes the actor's role.
+/// Faithful, and pinned as the chosen behaviour.
+#[test]
+fn merge_people_pairs_by_name_across_person_types() {
+    let source = vec![PeopleEntity {
+        role: Some("Himself".into()),
+        provider_id: Some(7),
+        ..person("Clint Eastwood")
+    }];
+    let mut target = vec![PeopleEntity {
+        person_type: Some("Director".into()),
+        ..person("Clint Eastwood")
+    }];
+    merge_people(&source, &mut target);
+    assert_eq!(target[0].person_type.as_deref(), Some("Director"));
+    assert_eq!(target[0].role.as_deref(), Some("Himself"));
+    assert_eq!(target[0].provider_id, Some(7));
+}
+
+/// The credits a pass saves (`metadata.People` after `RefreshWithProviders`,
+/// written by `SaveItemAsync` when not null, `MetadataService.cs:320-324`).
+/// `None` keeps the stored credits.
+///
+/// Gathering (`:850`, `:1003`): with no local credits the remote provider's
+/// stand; with some, the remote ones only enrich them — never adding anyone,
+/// never overwriting what the local reader said. A person id
+/// `IsValidProviderId(Tmdb, …)` rejects is dropped on both sides.
+#[test]
+fn pass_credits_enrich_the_local_credits_from_the_remote_ones() {
+    let remote = vec![
+        PeopleEntity {
+            provider_id: Some(6384),
+            role: Some("Neo".into()),
+            primary_image_url: Some("https://img/keanu.jpg".into()),
+            sort_order: Some(0),
+            ..person("Keanu Reeves")
+        },
+        PeopleEntity {
+            provider_id: Some(i64::from(i32::MAX) + 1),
+            role: Some("Morpheus".into()),
+            ..person("Laurence Fishburne")
+        },
+    ];
+
+    let only_remote = pass_credits(None, &[Some(remote.clone())], true).expect("remote credits");
+    assert_eq!(only_remote.len(), 2);
+    assert_eq!(only_remote[0].provider_id, Some(6384));
+    assert_eq!(only_remote[1].provider_id, None, "past int.MaxValue");
+
+    let local = vec![
+        PeopleEntity {
+            role: Some(String::new()),
+            ..person("keanu reeves")
+        },
+        PeopleEntity {
+            role: Some("Self".into()),
+            provider_id: Some(-4),
+            ..person("Nfo Only")
+        },
+    ];
+    let merged = pass_credits(Some(local), &[Some(remote)], true).expect("credits");
+    assert_eq!(merged.len(), 2, "nobody is added: {merged:?}");
+    assert_eq!(merged[0].name, "keanu reeves", "the local name stands");
+    assert_eq!(merged[0].role.as_deref(), Some("Neo"));
+    assert_eq!(merged[0].provider_id, Some(6384));
+    assert_eq!(merged[0].sort_order, Some(0));
+    assert_eq!(
+        merged[0].primary_image_url.as_deref(),
+        Some("https://img/keanu.jpg")
+    );
+    assert_eq!(merged[1].role.as_deref(), Some("Self"));
+    assert_eq!(
+        merged[1].provider_id, None,
+        "an invalid local id is dropped"
+    );
+}
+
+/// When a pass keeps the stored credits and when it replaces or clears
+/// them (`None` keeps them). `keep_existing` is "Add existing metadata to
+/// provider result" (`:905`): on everywhere but "Replace all metadata"
+/// (`RemoveOldMetadata` with a provider that answered, or none that failed).
+/// It finds the stored credits null (`RefreshMetadata` never loads them,
+/// `:145-148`), so it nulls an empty result.
+///
+/// Each answer folds into `temp` in order (`:1240-1247`): a null or empty
+/// `temp` takes the answer — even a null one — and a non-empty `temp` is
+/// only enriched. TMDB's answer that credits nobody is null (it only
+/// `AddPerson`s); TVDB's is an empty list (the plugin `ResetPeople`s).
+#[rstest]
+// Nothing read, nothing answered: kept, in every mode.
+#[case::nothing(None, &[], true, None)]
+#[case::nothing_replace_all(None, &[], false, None)]
+// TMDB answering with nobody (null): kept in every mode.
+#[case::tmdb_nobody(None, &[None], true, None)]
+#[case::tmdb_nobody_replace_all(None, &[None], false, None)]
+// TVDB answering with nobody (an empty list): kept by Default and "Search
+// for missing metadata", cleared by "Replace all metadata".
+#[case::tvdb_nobody(None, &[Some(&[][..])], true, None)]
+#[case::tvdb_nobody_replace_all(None, &[Some(&[][..])], false, Some(&[][..]))]
+// A later null answer nulls TVDB's empty list again; a later TVDB list
+// replaces a null one.
+#[case::tvdb_then_tmdb_nobody_replace_all(None, &[Some(&[][..]), None], false, None)]
+#[case::tmdb_then_tvdb_nobody_replace_all(None, &[None, Some(&[][..])], false, Some(&[][..]))]
+// An answer with a cast replaces the stored one in every mode.
+#[case::cast(None, &[Some(&["Tmdb Actor"][..])], true, Some(&["Tmdb Actor"][..]))]
+#[case::cast_replace_all(None, &[Some(&["Tmdb Actor"][..])], false, Some(&["Tmdb Actor"][..]))]
+// The first answer with a cast stands; a later one only enriches it.
+#[case::first_cast_stands(None, &[Some(&["Tvdb Actor"][..]), Some(&["Tmdb Actor"][..])], true, Some(&["Tvdb Actor"][..]))]
+#[case::empty_tvdb_takes_a_later_cast(None, &[Some(&[][..]), Some(&["Tmdb Actor"][..])], true, Some(&["Tmdb Actor"][..]))]
+// An NFO naming no actors: cleared only by "Replace all metadata" with no
+// null answer after it; TVDB's empty answer clears with it.
+#[case::empty_nfo(Some(&[][..]), &[], true, None)]
+#[case::empty_nfo_replace_all(Some(&[][..]), &[], false, Some(&[][..]))]
+#[case::empty_nfo_tmdb_nobody_replace_all(Some(&[][..]), &[None], false, None)]
+#[case::empty_nfo_tvdb_nobody_replace_all(Some(&[][..]), &[Some(&[][..])], false, Some(&[][..]))]
+#[case::empty_nfo_cast(Some(&[][..]), &[Some(&["Tmdb Actor"][..])], true, Some(&["Tmdb Actor"][..]))]
+// An NFO cast stands, enriched, whatever answered.
+#[case::nfo(Some(&["Nfo Actor"][..]), &[None], true, Some(&["Nfo Actor"][..]))]
+#[case::nfo_tvdb_nobody_replace_all(Some(&["Nfo Actor"][..]), &[Some(&[][..])], false, Some(&["Nfo Actor"][..]))]
+#[case::nfo_cast_replace_all(Some(&["Nfo Actor"][..]), &[Some(&["Tmdb Actor"][..])], false, Some(&["Nfo Actor"][..]))]
+fn pass_credits_keep_the_stored_credits_unless_upstream_writes_them(
+    #[case] local: Option<&[&str]>,
+    #[case] answers: &[Option<&[&str]>],
+    #[case] keep_existing: bool,
+    #[case] expected: Option<&[&str]>,
+) {
+    let people = |names: &[&str]| names.iter().copied().map(person).collect::<Vec<_>>();
+    let answers: Vec<Option<Vec<PeopleEntity>>> = answers.iter().map(|a| a.map(people)).collect();
+    let saved = pass_credits(local.map(people), &answers, keep_existing);
+    let names = saved.map(|p| p.into_iter().map(|p| p.name).collect::<Vec<_>>());
+    assert_eq!(
+        names,
+        expected.map(|n| n.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+    );
+}
+
+/// The music kinds' own MusicBrainz step, run after `MergeBaseItemData`:
+/// `AudioMetadataService.SetProviderId` (`AudioMetadataService.cs:43-57`,
+/// called for the album artist, album and release group at `:80-82`) and
+/// `AlbumMetadataService`'s (`AlbumMetadataService.cs:183-193,251-264`) set
+/// the source's id when replacing or when the target has none. Upstream's
+/// base rule (`MetadataService.cs:1307-1334`) already did exactly that — and
+/// replaced an unusable stored id — so the step never changes its result;
+/// [`merge_data`], which ports the base rule, gives upstream's ids after both
+/// steps. `bad` is no MBID.
+#[rstest]
+#[case::fills_an_empty_target(false, None, Some(MBID_A), Some(MBID_A))]
+#[case::keeps_a_stored_id(false, Some(MBID_B), Some(MBID_A), Some(MBID_B))]
+#[case::replaces_a_stored_id(true, Some(MBID_B), Some(MBID_A), Some(MBID_A))]
+#[case::keeps_it_with_no_source(true, Some(MBID_B), None, Some(MBID_B))]
+#[case::replaces_an_unusable_one(false, Some("bad"), Some(MBID_A), Some(MBID_A))]
+#[case::drops_an_unusable_one(false, Some("bad"), None, None)]
+#[case::never_takes_an_unusable_one(true, None, Some("bad"), None)]
+#[case::keeps_the_stored_spelling(false, Some(MBID_A_UPPER), Some(MBID_A), Some(MBID_A_UPPER))]
+fn music_kinds_musicbrainz_ids_merge_as_upstream(
+    #[values(BaseItemKind::Audio, BaseItemKind::MusicAlbum)] kind: BaseItemKind,
+    #[values(
+        "MusicBrainzAlbumArtist",
+        "MusicBrainzAlbum",
+        "MusicBrainzReleaseGroup"
+    )]
+    key: &str,
+    #[case] replace: bool,
+    #[case] stored: Option<&str>,
+    #[case] answered: Option<&str>,
+    #[case] expected: Option<&str>,
+) {
+    let pairs = |value: Option<&str>| -> Vec<(String, String)> {
+        value
+            .map(|v| (key.to_owned(), v.to_owned()))
+            .into_iter()
+            .collect()
+    };
+    let source = MetadataResult {
+        provider_ids: pairs(answered),
+        ..MetadataResult::of(item(kind))
+    };
+    let mut target = MetadataResult {
+        provider_ids: pairs(stored),
+        ..MetadataResult::of(item(kind))
+    };
+    merge_data(&source, &mut target, &[], replace, true);
+    assert_eq!(target.provider_ids, pairs(expected));
+}
+
+const MBID_A: &str = "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432";
+const MBID_A_UPPER: &str = "A3CB23FC-ACD3-4CE0-8F36-1E5AA6A18432";
+const MBID_B: &str = "5b11f4ce-a62d-471e-81fc-a69a8278c7da";
+
+/// `IsGuid` is .NET's `Guid.TryParse` (`ProviderIdsExtensions.cs:280-281`):
+/// every form it reads is a MusicBrainz id — `N`, `D`, `B`, `P` and `X`,
+/// either case, surrounding whitespace trimmed, and the `D` form's compat
+/// openers (`+`, `0x` inside a group's width; dotnet/runtime `Guid.cs`,
+/// `TryParseExactD`: "`1234` or `0x34` or `+0x4` or `+234`, but not
+/// `0x1234` nor `+1234`") — and nothing else, `uuid`'s `urn:uuid:` form
+/// included.
+#[rstest]
+#[case::d("a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", true)]
+#[case::d_upper("A3CB23FC-ACD3-4CE0-8F36-1E5AA6A18432", true)]
+#[case::n("a3cb23fcacd34ce08f361e5aa6a18432", true)]
+#[case::b("{a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432}", true)]
+#[case::p("(a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432)", true)]
+#[case::x(
+    "{0xa3cb23fc,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x32}}",
+    true
+)]
+#[case::x_spaced(
+    "{0xa3cb23fc, 0xacd3, 0x4ce0, {0x8f, 0x36, 0x1e, 0x5a, 0xa6, 0xa1, 0x84, 0x32}}",
+    true
+)]
+#[case::x_upper_prefix_short_parts(
+    "{0XA3CB23FC,0Xd3,0x0,{0x8F,0x6,0x1e,0x5a,0xa6,0xa1,0x84,0x2}}",
+    true
+)]
+#[case::trimmed("  a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432\t\n", true)]
+#[case::d_hex_prefix("a3cb23fc-0xd3-4ce0-8f36-1e5aa6a18432", true)]
+#[case::d_plus_hex_prefix("a3cb23fc-+0x3-4ce0-8f36-1e5aa6a18432", true)]
+#[case::d_plus("+3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", true)]
+#[case::d_hex_prefix_fourth_group("a3cb23fc-acd3-4ce0-0x36-1e5aa6a18432", true)]
+#[case::b_with_compat("{a3cb23fc-0xd3-4ce0-8f36-1e5aa6a18432}", true)]
+#[case::d_hex_prefix_last_group("a3cb23fc-acd3-4ce0-8f36-0x5aa6a18432", false)]
+#[case::d_prefix_after_plus_misplaced("a3cb23fc-0x+3-4ce0-8f36-1e5aa6a18432", false)]
+#[case::n_with_plus("+3cb23fcacd34ce08f361e5aa6a18432", false)]
+#[case::n_short("a3cb23fcacd34ce08f361e5aa6a1843", false)]
+#[case::n_long("a3cb23fcacd34ce08f361e5aa6a184321", false)]
+#[case::not_hex("g3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", false)]
+#[case::mismatched_close("{a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432)", false)]
+#[case::unclosed("(a3cb23fc-acd3-4ce0-8f36-1e5aa6a184321", false)]
+#[case::urn("urn:uuid:a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432", false)]
+#[case::inner_space("a3cb23fc-acd3-4ce0-8f36 1e5aa6a18432", false)]
+#[case::x_byte_too_big(
+    "{0xa3cb23fc,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x100}}",
+    false
+)]
+#[case::x_seven_bytes(
+    "{0xa3cb23fc,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84}}",
+    false
+)]
+#[case::x_no_hex_prefix(
+    "{a3cb23fc0,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x32}}",
+    false
+)]
+#[case::x_empty_part("{0x,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x32}}", false)]
+#[case::x_nine_digits(
+    "{0x1a3cb23fc,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x32}}",
+    false
+)]
+#[case::x_trailing(
+    "{0xa3cb23fc,0xacd3,0x4ce0,{0x8f,0x36,0x1e,0x5a,0xa6,0xa1,0x84,0x32}}}",
+    false
+)]
+fn a_musicbrainz_id_is_any_form_guid_try_parse_reads(#[case] value: &str, #[case] expected: bool) {
+    for key in [
+        "MusicBrainzAlbum",
+        "MusicBrainzAlbumArtist",
+        "MusicBrainzArtist",
+        "MusicBrainzReleaseGroup",
+        "MusicBrainzRecording",
+        "MusicBrainzTrack",
+    ] {
+        assert_eq!(
+            is_valid_provider_id(key, value),
+            expected,
+            "{key}={value:?}"
+        );
+    }
+}
+
+/// `Guid.TryParse` reads every form as the one GUID (`ToString()` is the
+/// lowercase `D` form): what `ParseMusicBrainzId` hands the lookups. The
+/// `D` form's compat openers shorten a group, so `0xd3` is `00d3`; an `X`
+/// form's short component keeps its low 16 bits.
+#[rstest]
+#[case(
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "A3CB23FC-ACD3-4CE0-8F36-1E5AA6A18432",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "a3cb23fcacd34ce08f361e5aa6a18432",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "{a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432}",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    " (a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432)\n",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "{0xa3cb23fc, 0xacd3, 0x4ce0, {0x8f, 0x36, 0x1e, 0x5a, 0xa6, 0xa1, 0x84, 0x32}}",
+    "a3cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "a3cb23fc-0xd3-+0x4-0x36-1e5aa6a18432",
+    "a3cb23fc-00d3-0004-0036-1e5aa6a18432"
+)]
+#[case(
+    "+3cb23fc-acd3-4ce0-8f36-1e5aa6a18432",
+    "03cb23fc-acd3-4ce0-8f36-1e5aa6a18432"
+)]
+#[case(
+    "{0x1,0x12345,0x0,{0x0,0x0,0x0,0x0,0x0,0x0,0x0,0xff}}",
+    "00000001-2345-0000-0000-0000000000ff"
+)]
+fn parse_guid_reads_every_form_as_the_same_guid(#[case] value: &str, #[case] canonical: &str) {
+    assert_eq!(
+        super::parse_guid(value)
+            .map(|g| g.hyphenated().to_string())
+            .as_deref(),
+        Some(canonical)
+    );
 }
 
 /// `MergeBaseItemData_MergeMetadataSettings_MergesWhenSet`.
@@ -1301,6 +1668,221 @@ fn merge_refresh_runs_both_calls_by_the_rule() {
     assert_eq!(cleared.item.overview.as_deref(), Some("Mine"), "locked");
     assert_eq!(cleared.item.tagline, None, "not returned: cleared");
     assert_eq!(cleared.item.name.as_deref(), Some("Provider"));
+}
+
+// --- MetadataServiceRefreshTests.cs `RefreshWithProviders_*`, transliterated ---
+//
+// `RefreshWithProviders_ForeignProviderId_ReplacedInLookupInfo` exercises
+// `MergeNewData` (the lookup info handed to the next provider), which the
+// scan's music pass ports: its transliteration sits beside that port in
+// `ferrofin-core`'s `library_scan/music.rs`.
+
+/// What one provider's `GetMetadata` did.
+enum Answer {
+    /// It threw (`RefreshResult.Failures++`).
+    Threw,
+    /// `HasMetadata = true` with this result.
+    Found(Box<MetadataResult>),
+}
+
+/// A provider that answered with `result`.
+fn found(result: MetadataResult) -> Answer {
+    Answer::Found(Box::new(result))
+}
+
+/// A movie row carrying `name`.
+fn movie(name: &str) -> BaseItemEntity {
+    BaseItemEntity {
+        name: Some(name.into()),
+        ..item(BaseItemKind::Movie)
+    }
+}
+
+/// `RefreshWithProviders` (`MetadataService.cs:761-928`) as upstream's
+/// `TestMetadataService` drives it: a local provider, then the remote ones,
+/// then the merge onto `existing`. The provider loop is the harness; the
+/// rules under test are Ferrofin's — each answer taken into `temp` by
+/// [`merge_data`] (a local one with `mergeMetadataSettings`, a remote one
+/// without, both `replaceData = false`), then [`RefreshMerge::of`] and
+/// [`merge_refresh`]. Returns `RefreshResult.Failures` and the item.
+fn refresh_with_providers(
+    existing: MetadataResult,
+    options: &MetadataRefreshOptions,
+    local: Option<MetadataResult>,
+    remote: Vec<Answer>,
+) -> (usize, MetadataResult) {
+    let mut temp = MetadataResult::of(item(BaseItemKind::Movie));
+    let mut answers = RefreshAnswers::default();
+    if let Some(local) = local {
+        merge_data(&local, &mut temp, &[], false, true);
+        answers.any = true;
+    }
+    let mut failures = 0;
+    if options.replace_all_metadata
+        || matches!(
+            options.metadata_refresh_mode,
+            MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+        )
+    {
+        for answer in remote {
+            match answer {
+                Answer::Threw => failures += 1,
+                Answer::Found(result) => {
+                    merge_data(&result, &mut temp, &[], false, false);
+                    answers.remote = true;
+                    answers.any = true;
+                }
+            }
+        }
+    }
+    answers.failed = failures > 0;
+    // `if (refreshResult.UpdateType > ItemUpdateType.None)`: nothing
+    // answered, nothing merged.
+    if !answers.any {
+        return (failures, existing);
+    }
+    let locked = existing.locked_fields.clone();
+    let merged = merge_refresh(&existing, temp, &locked, RefreshMerge::of(options, answers));
+    (failures, merged)
+}
+
+/// "Replace all metadata" (or Identify): `FullRefresh` with
+/// `ReplaceAllMetadata` and, when `remove_old`, `RemoveOldMetadata`.
+fn replace_all(remove_old: bool) -> MetadataRefreshOptions {
+    MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        remove_old_metadata: remove_old,
+        ..MetadataRefreshOptions::default()
+    }
+}
+
+/// `RefreshWithProviders_ReplaceAllMetadata_ErasesOldDataWhenAProviderAnswers`
+/// (`[InlineData(false)]`, `[InlineData(true)]`): a provider failing does not
+/// downgrade a `RemoveOldMetadata` replace to a merge when another one
+/// answered — the old overview is erased.
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn refresh_with_providers_replace_all_metadata_erases_old_data_when_a_provider_answers(
+    #[case] all_providers_succeed: bool,
+) {
+    let existing = MetadataResult::of(BaseItemEntity {
+        overview: Some("existing overview".into()),
+        ..movie("Test Movie")
+    });
+    let failing = if all_providers_succeed {
+        found(MetadataResult::of(item(BaseItemKind::Movie)))
+    } else {
+        Answer::Threw
+    };
+    let succeeding = found(MetadataResult::of(BaseItemEntity {
+        tagline: Some("new tagline".into()),
+        ..movie("Test Movie")
+    }));
+    let (failures, merged) = refresh_with_providers(
+        existing,
+        &replace_all(true),
+        None,
+        vec![failing, succeeding],
+    );
+    assert_eq!(failures, usize::from(!all_providers_succeed));
+    assert_eq!(merged.item.tagline.as_deref(), Some("new tagline"));
+    assert_eq!(merged.item.overview, None);
+}
+
+/// `RefreshWithProviders_ReplaceAllMetadata_KeepsExistingDataWhenEveryRemoteProviderFails`:
+/// only the local provider answered, so erasing the overview would lose it
+/// for good — it is kept, and the local answer still lands.
+#[test]
+fn refresh_with_providers_replace_all_metadata_keeps_existing_data_when_every_remote_provider_fails()
+ {
+    let existing = MetadataResult::of(BaseItemEntity {
+        overview: Some("existing overview".into()),
+        ..movie("Test Movie")
+    });
+    let local = MetadataResult::of(BaseItemEntity {
+        tagline: Some("new tagline".into()),
+        ..movie("Test Movie")
+    });
+    let (failures, merged) = refresh_with_providers(
+        existing,
+        &replace_all(true),
+        Some(local),
+        vec![Answer::Threw],
+    );
+    assert_eq!(failures, 1);
+    assert_eq!(merged.item.tagline.as_deref(), Some("new tagline"));
+    assert_eq!(merged.item.overview.as_deref(), Some("existing overview"));
+}
+
+/// `RefreshWithProviders_ForeignProviderId_NotStored`: an IMDb person id
+/// filed under `Tmdb` is dropped; the valid IMDb id is stored.
+#[test]
+fn refresh_with_providers_foreign_provider_id_not_stored() {
+    let answer = MetadataResult {
+        provider_ids: ids(&[("Tmdb", "nm0000123"), ("Imdb", "tt0113375")]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let (_, merged) = refresh_with_providers(
+        MetadataResult::of(movie("Test Movie")),
+        &replace_all(false),
+        None,
+        vec![found(answer)],
+    );
+    assert!(
+        !merged
+            .provider_ids
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("Tmdb")),
+        "{:?}",
+        merged.provider_ids
+    );
+    assert_eq!(merged.provider_ids, ids(&[("Imdb", "tt0113375")]));
+}
+
+/// `RefreshWithProviders_ForeignPersonProviderId_NotStored`
+/// (`[InlineData(true)]`, `[InlineData(false)]` for `ReplaceAllMetadata`):
+/// the merged credit keeps no TMDB id that cannot be one.
+///
+/// Ferrofin's credit carries one person id, TMDB's, as a number, so
+/// upstream's `nm0000123` has no form here; the ids `IsValidProviderId(Tmdb,
+/// …)` rejects that it can hold stand in for it (`#[values]`: zero and
+/// `-11`, as in `IsValidProviderId_ChecksKnownFormats`, and one past
+/// `int.MaxValue`). The case's other half — the credit keeps its valid IMDb
+/// id — has no counterpart: a credit carries no IMDb id.
+#[rstest]
+#[case(true)]
+#[case(false)]
+fn refresh_with_providers_foreign_person_provider_id_not_stored(
+    #[case] replace_all_metadata: bool,
+    #[values(0, -11, i64::from(i32::MAX) + 1)] foreign_id: i64,
+) {
+    let actor = || PeopleEntity {
+        name: "Some Actor".into(),
+        person_type: Some("Actor".into()),
+        ..PeopleEntity::default()
+    };
+    let existing = MetadataResult {
+        people: Some(vec![actor()]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let answer = MetadataResult {
+        people: Some(vec![PeopleEntity {
+            provider_id: Some(foreign_id),
+            ..actor()
+        }]),
+        ..MetadataResult::of(movie("Test Movie"))
+    };
+    let options = MetadataRefreshOptions {
+        replace_all_metadata,
+        ..replace_all(false)
+    };
+    let (_, merged) = refresh_with_providers(existing, &options, None, vec![found(answer)]);
+    let people = merged.people.expect("people");
+    assert_eq!(people.len(), 1, "{people:?}");
+    assert_eq!(people[0].name, "Some Actor");
+    assert_eq!(people[0].provider_id, None);
 }
 
 /// The sort key a refresh settles, by kind: a forced one wins, an episode, a
