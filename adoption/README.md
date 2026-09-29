@@ -210,11 +210,21 @@ database came from.
 
 ## Metadata gate validation
 
-Before expanding artwork sampling, all **seven fixture paths passed** the metadata
-gate and existing adoption checks on **2026-09-29**, using local fixtures. Each baseline
+All **seven fixture paths passed the expanded metadata and artwork checks** on
+**2026-09-29**, using local fixtures and the harness at `460df788`. Each baseline
 contained **318 movies, 126 series and 8,878 episodes** (9,322 items). Database and HTTP
-checks passed after adoption, restart and a completed scan. Each stage compares
-against the original Jellyfin baseline.
+checks passed after adoption, restart and a completed scan. Each stage compared
+against the original Jellyfin baseline and decoded artwork for the fixed 10% sample.
+
+| Fixture | Adoption | Restart | Completed scan |
+|---|---|---|---|
+| `jellyfin-10.11.8` | PASS | PASS | PASS |
+| `jellyfin-10.11.9` | PASS | PASS | PASS |
+| `jellyfin-10.11.10` | PASS | PASS | PASS |
+| `jellyfin-10.11.11` | PASS | PASS | PASS |
+| `jellyfin-12.0` | PASS | PASS | PASS |
+| `jellyfin-12.1-from-10` | PASS | PASS | PASS |
+| `jellyfin-12.1-from-12` | PASS | PASS | PASS |
 
 The local correctness image was `ferrofin:adoption-metadata-23`, image ID
 `sha256:d85ab7a9861c8a4185ee690047bc12a6c78ee3e667eebee6bfaa4e6090d77a91`.
@@ -224,18 +234,15 @@ correctness run, not a release performance measurement. The runs used the provid
 outage configuration above, an isolated `ADOPTION_WORK_DIR`, and
 `ADOPTION_SCAN_TIMEOUT=1200`.
 
-All **26 Bats harness tests**, including **20 Python metadata tests**, passed, along
+All **26 Bats harness tests**, including **26 Python metadata tests**, passed, along
 with ShellCheck and shell syntax checks. A separate native-server test checked a
 synthetic movie after scan, restart and another scan, then deliberately cleared its
 overview and confirmed that both the database and HTTP checks detected the loss.
 
-The subsequent 10% artwork sample was validated on a fresh copy of
-`jellyfin-12.1-from-12` using the same server image. Adoption, restart and full-scan
-checks all passed, including decoding posters/backdrops for 32 movies and 13 series,
-plus one episode poster (90 image requests per checkpoint). This follow-up reran
-one fixture; the seven-fixture result above used the earlier artwork check.
-The expanded suite passed **26 Python metadata tests** within **26 Bats harness
-tests**, plus ShellCheck and shell syntax checks. These include explicit database
-and post-scan API checks for missing descriptions and ratings, corrupt images,
-stable sampling and decoder failures. Committed test data is synthetic; real
-snapshots and reports remain local and excluded from Git.
+The expanded artwork checks first passed on `jellyfin-12.1-from-12`; the other six
+fixtures subsequently passed on fresh copies using the same server image. The sample
+checks posters/backdrops for 32 movies and 13 series, plus one episode poster.
+The regression tests include explicit database and post-scan API checks for missing
+descriptions and ratings, corrupt images, stable sampling and decoder failures.
+Committed test data is synthetic; real snapshots and reports remain local and
+excluded from Git.
