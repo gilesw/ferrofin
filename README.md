@@ -123,7 +123,7 @@ See [`charts/ferrofin/README.md`](charts/ferrofin/README.md) and
 [`values.example.yaml`](charts/ferrofin/values.example.yaml) for a worked configuration.
 
 **Debian/Ubuntu package** (depends on `jellyfin-ffmpeg8` and `jellyfin-web` from Jellyfin's
-apt repository, ships a hardened systemd unit): add the repository, then
+apt repository, ships a systemd unit): add the repository, then
 `apt-get install ./ferrofin_<version>_<arch>.deb` from the releases page. The full walk-through,
 including the plain release tarball, is [`docs/INSTALL.md`](docs/INSTALL.md).
 

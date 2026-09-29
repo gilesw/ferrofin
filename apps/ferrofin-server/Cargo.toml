@@ -104,7 +104,7 @@ extended-description = """\
 Ferrofin is a from-scratch Rust implementation of the Jellyfin media server
 speaking the same HTTP API, so existing Jellyfin clients connect unchanged.
 It adopts an existing Jellyfin 10.11.x database in place. This package installs
-the server, a hardened systemd unit (not enabled by default), a config file at
+the server, a systemd unit (not enabled by default), a config file at
 /etc/ferrofin/config.toml and the service user; ffmpeg and the web client come
 from the jellyfin-ffmpeg8 and jellyfin-web packages."""
 conf-files = ["/etc/ferrofin/config.toml"]
