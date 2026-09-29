@@ -1034,8 +1034,8 @@ pub(crate) fn exclude_item_types_for(
 impl FerrofinUserViewManager {
     /// `UserViewManager.GetUserViews` omits views in the user's
     /// `MyMediaExcludes` preference unless `IncludeHidden` was requested.
-    /// `/UserViews` has no caller for `IncludeHidden`, so apply the default
-    /// behavior here. Keep media-folder and playlist endpoints unaffected.
+    /// This applies only to home views; media folders and latest-item
+    /// exclusions are independent preferences.
     async fn without_hidden_views(
         &self,
         user_id: Uuid,
@@ -1085,8 +1085,8 @@ impl FerrofinUserViewManager {
 
     /// The parents of a latest-items request (C# `GetItemsForLatestItems`,
     /// first half): the `parent_id` folder when it is one, else the user's
-    /// views minus `latest_item_excludes`. Also settles `is_played`, which a
-    /// music parent clears — decided on the EXPLICIT parent, before the views
+    /// root media folders minus `latest_item_excludes`. Also settles `is_played`,
+    /// which a music parent clears — decided on the EXPLICIT parent, before the
     /// fallback, exactly as upstream orders it. `Ok(None)` is the Channel
     /// early exit (an empty result).
     async fn latest_parents(
@@ -1138,7 +1138,7 @@ impl FerrofinUserViewManager {
                 .and_then(|u| Uuid::parse_str(&u.id).ok())
                 .unwrap_or_default();
             parents = self
-                .get_user_views(user_id)
+                .get_media_folders(user_id)
                 .await?
                 .iter()
                 .filter_map(classify)
@@ -2557,6 +2557,72 @@ mod tests {
         )
         .await;
         assert_eq!(shape(&groups), vec![(None, vec![e])]);
+    }
+
+    #[tokio::test]
+    async fn hidden_home_library_still_supplies_latest_items() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0xAA19);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let movie = Uuid::from_u128(0xAA20);
+        seed(
+            &db,
+            &[Row::new(
+                movie,
+                BaseItemKind::Movie,
+                "Movie",
+                day(9),
+                MOVIES,
+            )],
+        )
+        .await;
+        let mgr = manager(&db).with_database(db.clone());
+        let mut query = LatestItemsQuery {
+            user: Some(user),
+            ..Default::default()
+        };
+        let expected = vec![(None, vec![movie])];
+        assert_eq!(shape(&latest(&mgr, query.clone()).await), expected);
+
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
+            &[guid_to_db(MOVIES)],
+        )
+        .await
+        .expect("hide home tile");
+        assert!(
+            mgr.get_user_views(user_id)
+                .await
+                .expect("home views")
+                .is_empty()
+        );
+        assert_eq!(
+            mgr.get_media_folders(user_id)
+                .await
+                .expect("media folders")
+                .len(),
+            1
+        );
+        assert_eq!(
+            shape(&latest(&mgr, query.clone()).await),
+            expected,
+            "MyMediaExcludes must not suppress latest items"
+        );
+
+        query.latest_item_excludes = vec![MOVIES];
+        assert!(
+            latest(&mgr, query.clone()).await.is_empty(),
+            "LatestItemExcludes still applies"
+        );
+        query.parent_id = Some(MOVIES);
+        assert_eq!(
+            shape(&latest(&mgr, query).await),
+            expected,
+            "an explicit parent remains browsable regardless of home preferences"
+        );
     }
 
     /// Stored view ids are uppercase-hyphenated (`guid_to_db`); a `parentId`
