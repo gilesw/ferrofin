@@ -128,6 +128,21 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
     // ----- encoder selection -------------------------------------------------
 
+    /// Whether the running ffmpeg has an encoder for the audio `codec`.
+    ///
+    /// Port of `MediaEncoder.CanEncodeToAudioCodec`.
+    #[must_use]
+    pub fn can_encode_to_audio_codec(&self, codec: &str) -> bool {
+        let encoder = if codec.eq_ignore_ascii_case("opus") {
+            "libopus"
+        } else if codec.eq_ignore_ascii_case("mp3") {
+            "libmp3lame"
+        } else {
+            codec
+        };
+        self.capabilities.supports_encoder(encoder)
+    }
+
     /// Selects the ffmpeg audio encoder for `state`.
     ///
     /// Port of `GetAudioEncoder`. Prefers Apple `aac_at` then `libfdk_aac` (when
@@ -1537,6 +1552,54 @@ fn audio_stream_copy_failure_reasons(
     reasons
 }
 
+/// Moves audio codecs that transcode badly for `audio_stream` to the end of the
+/// client's preference list.
+///
+/// Port of `EncodingHelper.ShiftAudioCodecsIfNeeded`: DTS and TrueHD are not
+/// HLS-playable from a 6+ channel source, and 2-channel AC-3/E-AC-3 almost
+/// always fails playback. A missing stream counts as 6 channels.
+pub fn shift_audio_codecs_if_needed(codecs: &mut [String], audio_stream: Option<&MediaStream>) {
+    if codecs.len() < 2 {
+        return;
+    }
+    let input_channels = audio_stream.map_or(6, |s| s.channels.unwrap_or(6));
+    let shift: &[&str] = if input_channels >= 6 {
+        &["dts", "truehd"]
+    } else {
+        &["ac3", "eac3"]
+    };
+    shift_codecs_to_end(codecs, shift);
+}
+
+/// Moves video codecs the server is not allowed to encode to the end of the
+/// client's preference list.
+///
+/// Port of `EncodingHelper.ShiftVideoCodecsIfNeeded`: HEVC unless
+/// `AllowHevcEncoding`, AV1 unless `AllowAv1Encoding`.
+pub fn shift_video_codecs_if_needed(codecs: &mut [String], options: &EncodingOptions) {
+    if codecs.len() < 2 {
+        return;
+    }
+    let mut shift = Vec::new();
+    if !options.allow_hevc_encoding {
+        shift.extend(["hevc", "h265"]);
+    }
+    if !options.allow_av1_encoding {
+        shift.push("av1");
+    }
+    shift_codecs_to_end(codecs, &shift);
+}
+
+/// Rotates leading members of `shift` to the end, unless every codec is in it.
+fn shift_codecs_to_end(codecs: &mut [String], shift: &[&str]) {
+    let shifted = |c: &String| shift.iter().any(|s| c.eq_ignore_ascii_case(s));
+    if codecs.iter().all(shifted) {
+        return;
+    }
+    let leading = codecs.iter().take_while(|c| shifted(c)).count();
+    codecs.rotate_left(leading);
+}
+
 #[cfg(test)]
 mod tests {
     //! Hand-derived expectations from the C# `EncodingHelper` software logic.
@@ -2452,5 +2515,71 @@ mod tests {
         assert_eq!(video_sync_option("", v(7, 0)), "");
         // Below the gate the number is passed through unexamined.
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
+    }
+
+    fn codecs(list: &str) -> Vec<String> {
+        list.split(',').map(str::to_owned).collect()
+    }
+
+    #[rstest]
+    #[case("av1,hevc,h264", false, false, "h264,av1,hevc")]
+    #[case("av1,hevc,h264", false, true, "hevc,h264,av1")]
+    #[case("av1,hevc,h264", true, true, "av1,hevc,h264")]
+    #[case("h265,av1,vp9", false, false, "vp9,h265,av1")]
+    #[case("AV1,h264", false, false, "h264,AV1")]
+    #[case("h264,av1", false, false, "h264,av1")]
+    #[case("av1,hevc", false, false, "av1,hevc")]
+    #[case("av1", false, false, "av1")]
+    fn shift_video_codecs_moves_disallowed_codecs_to_the_end(
+        #[case] input: &str,
+        #[case] allow_av1: bool,
+        #[case] allow_hevc: bool,
+        #[case] expected: &str,
+    ) {
+        let options = EncodingOptions {
+            allow_av1_encoding: allow_av1,
+            allow_hevc_encoding: allow_hevc,
+            ..EncodingOptions::default()
+        };
+        let mut list = codecs(input);
+        shift_video_codecs_if_needed(&mut list, &options);
+        assert_eq!(list, codecs(expected));
+    }
+
+    #[rstest]
+    #[case("dts,truehd,aac", Some(6), "aac,dts,truehd")]
+    #[case("dts,aac", None, "aac,dts")]
+    #[case("dts,aac", Some(2), "dts,aac")]
+    #[case("ac3,eac3,aac", Some(2), "aac,ac3,eac3")]
+    #[case("ac3,aac", Some(6), "ac3,aac")]
+    #[case("ac3,eac3", Some(2), "ac3,eac3")]
+    fn shift_audio_codecs_moves_unplayable_codecs_to_the_end(
+        #[case] input: &str,
+        #[case] channels: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let stream = channels.map(|c| MediaStream {
+            channels: Some(c),
+            ..audio_stream("dts", 1)
+        });
+        let mut list = codecs(input);
+        shift_audio_codecs_if_needed(&mut list, stream.as_ref());
+        assert_eq!(list, codecs(expected));
+    }
+
+    #[rstest]
+    #[case("opus", "libopus", true)]
+    #[case("MP3", "libmp3lame", true)]
+    #[case("aac", "aac", true)]
+    #[case("opus", "opus", false)]
+    fn can_encode_to_audio_codec_maps_codec_to_encoder(
+        #[case] codec: &str,
+        #[case] available: &'static str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            helper(vec![available]).can_encode_to_audio_codec(codec),
+            expected
+        );
     }
 }

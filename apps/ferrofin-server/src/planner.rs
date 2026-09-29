@@ -36,6 +36,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoding_helper::helper::{
+    shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
+};
 use ferrofin_mediaencoding::encoding_helper::hw;
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
@@ -633,8 +636,12 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // `-c:a` encoder name, so it must be resolved to a single codec here — a
         // passed-through list makes ffmpeg exit immediately and the whole
         // transcode (hence playback) fails.
-        let video_codecs = split_codecs(request.video_codec.as_deref());
-        let audio_codecs = split_codecs(request.audio_codec.as_deref());
+        let mut video_codecs = split_codecs(request.video_codec.as_deref());
+        let mut audio_codecs = split_codecs(request.audio_codec.as_deref());
+        // `AttachMediaSourceInfo`: codecs the server may not or should not
+        // produce drop to the end, so they are neither the target nor preferred.
+        shift_video_codecs_if_needed(&mut video_codecs, &options);
+        shift_audio_codecs_if_needed(&mut audio_codecs, audio_stream.as_ref());
 
         // The requested/target codecs (defaulting to the broadly-compatible
         // h264/aac). A `copy` request is honoured verbatim. The video target is
@@ -651,7 +658,9 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             media_source.video_type,
         );
         let requested_audio_codec = audio_codecs
-            .first()
+            .iter()
+            .find(|c| self.encoding_helper.can_encode_to_audio_codec(c))
+            .or_else(|| audio_codecs.first())
             .cloned()
             .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
 
@@ -3631,6 +3640,61 @@ mod tests {
             hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
             ..EncodingOptions::default()
         }
+    }
+
+    /// The `-c:v` a VAAPI server with `av1_vaapi` in its ffmpeg picks for a
+    /// browser's `av1,hevc,h264` request against an XviD source.
+    async fn vaapi_encoder_for_browser_request(allow_av1: bool, allow_hevc: bool) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let caps = FfmpegCapabilities::builder()
+            .platform(ferrofin_mediaencoding::encoding_helper::hw::Platform::Linux)
+            .encoders(["h264_vaapi", "hevc_vaapi", "av1_vaapi", "libx264"])
+            .hwaccels(["vaapi", "drm", "opencl", "vulkan"])
+            .filters(ferrofin_mediaencoding::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .os_version(ferrofin_mediaencoding::encoder::FfmpegVersion::new(6, 1))
+            .ffmpeg_version(ferrofin_mediaencoding::encoder::FfmpegVersion::with_build(
+                7, 0, 1,
+            ))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("mp3")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            caps,
+            EncodingOptions {
+                allow_av1_encoding: allow_av1,
+                allow_hevc_encoding: allow_hevc,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("av1,hevc,h264".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let pos = plan.arguments.iter().position(|a| a == "-c:v").unwrap();
+        plan.arguments[pos + 1].clone()
+    }
+
+    #[tokio::test]
+    async fn disallowed_encodings_are_not_the_transcode_target() {
+        assert_eq!(
+            vaapi_encoder_for_browser_request(false, true).await,
+            "hevc_vaapi"
+        );
+        assert_eq!(
+            vaapi_encoder_for_browser_request(false, false).await,
+            "h264_vaapi"
+        );
+        assert_eq!(
+            vaapi_encoder_for_browser_request(true, true).await,
+            "av1_vaapi"
+        );
     }
 
     #[tokio::test]
