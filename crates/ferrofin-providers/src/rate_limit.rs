@@ -304,7 +304,12 @@ impl RateLimiter {
             tracing::debug!(provider = %self.provider, %context, %status,
                 delay_ms = delay.as_millis(), "Metadata provider request rejected; backing off");
         } else {
-            if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Provider clients and request metrics already classify 404
+                // as an empty result, not an authentication or service failure.
+                tracing::debug!(provider = %self.provider, %context, %status,
+                    "Metadata provider lookup returned no result");
+            } else if !status.is_success() {
                 tracing::warn!(provider = %self.provider, %context, %status,
                     "Metadata provider request rejected");
             } else if rate.succeeded() {
@@ -901,7 +906,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         async {
-            let (url, server) = scripted_server(vec![(404, ""), (200, ""), (200, "")]).await;
+            let (url, server) = scripted_server(vec![(401, ""), (200, ""), (200, "")]).await;
             let client = RateLimiter::new("omdb");
             let http = reqwest::Client::new();
             let request = || {
@@ -929,13 +934,55 @@ mod tests {
         assert!(
             logs.lines().any(|line| line.contains("WARN")
                 && line.contains("tt123")
-                && line.contains("404"))
+                && line.contains("401"))
         );
         assert!(logs.lines().any(|line| line.contains("WARN")
             && line.contains("tt123")
             && line.contains("could not be parsed")));
         assert!(logs.contains("skipped=2"));
         assert!(!logs.contains("private-key"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_provider_entries_are_debug_but_access_rejections_warn() {
+        use tracing::instrument::WithSubscriber as _;
+        let _clock = TestClock::start();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        async {
+            let (url, server) = scripted_server(vec![(404, ""), (401, ""), (403, "")]).await;
+            let limiter = RateLimiter::new("fanart");
+            let http = reqwest::Client::new();
+            for status in [404, 401, 403] {
+                let response = limiter
+                    .send_request(http.get(&url), Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), status);
+            }
+            server.await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.lines().any(|line| line.contains("DEBUG")
+            && line.contains("404")
+            && line.contains("lookup returned no result")));
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("WARN") && line.contains("404"))
+        );
+        for status in ["401", "403"] {
+            assert!(logs.lines().any(|line| line.contains("WARN")
+                && line.contains(status)
+                && line.contains("request rejected")));
+        }
     }
 
     #[test]
