@@ -23,6 +23,8 @@ pub mod local_xml;
 #[cfg(feature = "lrclib")]
 pub mod lrclib;
 pub mod mediainfo;
+pub mod metadata_merge;
+pub mod metrics;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;
@@ -33,6 +35,7 @@ pub mod playlist_file;
 pub mod plugin_config;
 pub mod provider_manager;
 pub mod rate_limit;
+pub mod refresh_plan;
 pub mod similarity;
 pub mod studios;
 pub mod tmdb;
@@ -58,8 +61,8 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
-    AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate, ReleaseArtistCredit,
-    ReleaseDetails, ReleaseHit,
+    AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,
+    ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
 pub use similarity::{
