@@ -48,12 +48,49 @@ with exit status 0. Later server changes require rerunning this matrix.
    are reported as failures.
 4. A second boot reports no repeated repair work, including version promotions, and
    produces the same normalised probe summaries.
+5. For every movie, series and episode in the source fixture, populated metadata
+   remains populated after adoption, after restart, and after an explicitly requested
+   library scan. Both SQLite and the HTTP item responses are checked. A scan must
+   produce a new successful completion record; an idle task or an old successful
+   result does not pass this check.
+
+The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
+It checks overview, original title, tagline, community/critic ratings, official rating,
+year, premiere date, genres, studios, tags and production locations, plus provider-key
+presence, cast/crew presence and image types. Item UUIDs are normalised across SQLite
+and HTTP. Items omitted by browse filtering (such as alternate versions) are also
+checked through their individual detail endpoints. Losing one item's metadata fails
+even if another item's metadata is added.
+Fields absent in Jellyfin are optional; valid provider updates may change values.
+This checks presence, not exact text, provider-ID values, cast membership or image bytes.
+The suite also downloads one primary image per represented kind to check that image
+tags point to usable responses. The source must contain at least one movie with both
+an overview and a provider ID, so an empty or filename-only fixture cannot pass.
+
+Only fixture copies are scanned; source snapshots remain untouched. All media mounts
+must resolve for the scan, which can otherwise remove unavailable items. The scan
+keeps the fixture's provider settings, but the container's HTTP(S) requests use an
+unreachable local proxy. Provider failures therefore cannot be hidden by a later
+successful download refilling lost metadata, and the check does not depend on live
+API keys or quotas. This tests retention during provider failure; provider enrichment
+is covered separately by the server's controlled HTTP scan tests. Its default timeout is
+600 seconds; set `ADOPTION_SCAN_TIMEOUT` for larger libraries. Set
+`ADOPTION_WORK_DIR` to isolate a run from previous artifacts (default: `$FIXTURES/work`).
+A timeout, failed scan, failed query, malformed response or inaccessible metadata
+endpoint fails the run.
+
+The new metadata reports contain field names and aggregate failure counts, with no
+titles, paths, provider-ID values or credentials. The baseline file contains item UUIDs
+and presence information only and is written with owner-only permissions. Existing
+smoke outputs, server logs and database copies can still contain library details;
+keep those local. No reporter library data is needed to test the harness.
 
 These checks cover the reference library and the probe summaries; they do not assert
 equality of every API field or cover every possible library configuration.
 
-It is not a CI gate: it needs a real library, gigabytes of fixtures and about two minutes per
-generation. Run it before any change to `crates/ferrofin-db/migrations/`, the adoption gate in
+It is not a CI gate: it needs a populated library and fixtures. Each generation takes
+about two minutes for the boot probes, plus a complete library scan. Run it before
+any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 `database.rs`, or the boot repairs in `adoption_repairs.rs`, and before a release.
 
 ## The fixtures are yours, not the repository's
@@ -85,6 +122,7 @@ media paths referenced by the library options must resolve inside the container,
 (the builder records which account the oracle ran as in `oracle/user.txt` and the runner
 probes every fixture as that account; `--user NAME` or `ADOPTION_USER` overrides) and an
 **API key** in `ApiKeys`. Credentials are read from the copy at run time and never written.
+The runner also requires Python 3 (standard library only) for the metadata checks.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~25 min, pulls 10.11.9–12.1
@@ -108,7 +146,9 @@ PASS  12.1.0    jellyfin-12.1-from-12
 The second column is the generation the gate matched — the id *set*, so 10.11.9 reports
 `10.11.8` and 10.11.10 reports `10.11.11`; `run.sh` knows which is expected for which fixture.
 A `FAIL` line names every check that failed and points at the diff; the copy is kept under
-`work/` with `<name>.server.log`, `<name>.smoke.txt` and `<name>.smoke2.txt` beside it.
+`work/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` and the metadata
+presence baseline `<name>.metadata.json` beside it. The per-stage
+`<name>.metadata-after-{adoption,restart,scan}.log` files record the metadata results.
 
 ## Tests
 
@@ -116,8 +156,13 @@ A `FAIL` line names every check that failed and points at the diff; the copy is 
 checks in `lib.sh` (log parsing, smoke normalisation and comparison, the SQLite checks, the
 second-boot repair detection, the credential picker) run against canned logs, smoke outputs
 and throwaway SQLite files, and the two entry points are exercised for their refusals and the
-missing-fixture path. CI runs them with `bats adoption/tests` next to `scripts/tests`; locally
-`mise exec bats@latest -- bats adoption/tests` or a system `bats` works.
+missing-fixture path. `tests/test_metadata.py` exercises the metadata checks using
+invented library rows and a local HTTP server: partial/total metadata loss, missing
+items, empty baselines, optional fields, valid updates, WAL visibility, HTTP failures,
+batched API reads and scan completion/failure/timeout handling. Bats invokes these
+Python tests, so CI runs them too. CI runs the Bats tests with `bats adoption/tests`
+next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
+a system `bats` works.
 
 The 2026-09-16 validation also passed all **23 adoption harness tests** and **13 script
 tests** (36 total), plus ShellCheck. The database crate passed **121 tests**, including
@@ -147,3 +192,24 @@ database came from.
   `sqlite3` built with ICU lower-cases non-ASCII names differently from the SQLite inside
   Jellyfin and Ferrofin, so it reports rows "missing from index" on a file both servers agree
   with. Nothing else is exempt.
+
+## Metadata gate validation
+
+All **seven fixture paths passed** the metadata gate and existing adoption checks on
+**2026-09-29**, using the fixtures at `/mnt/nvme0/ferrofin-adoption-test`. Each baseline
+contained **318 movies, 126 series and 8,878 episodes** (9,322 items). Database and HTTP
+checks passed after adoption, restart and a completed scan. Each stage compares
+against the original Jellyfin baseline.
+
+The local correctness image was `ferrofin:adoption-metadata-23`, image ID
+`sha256:d85ab7a9861c8a4185ee690047bc12a6c78ee3e667eebee6bfaa4e6090d77a91`.
+It packaged the debug server built from `ded26d35` with its host runtime libraries,
+using the existing `ferrofin:bench` image for web assets and FFmpeg. This was a
+correctness run, not a release performance measurement. The runs used the provider
+outage configuration above, an isolated `ADOPTION_WORK_DIR`, and
+`ADOPTION_SCAN_TIMEOUT=1200`.
+
+All **26 Bats harness tests**, including **20 Python metadata tests**, passed, along
+with ShellCheck and shell syntax checks. A separate native-server test checked a
+synthetic movie after scan, restart and another scan, then deliberately cleared its
+overview and confirmed that both the database and HTTP checks detected the loss.

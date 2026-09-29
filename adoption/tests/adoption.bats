@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 # Tests for the adoption harness (adoption/lib.sh, run.sh, smoke.sh, build-fixtures.sh).
-# Nothing here needs docker, a Jellyfin database or the network: the checks in lib.sh are
-# driven with canned logs and smoke outputs, and the SQLite checks with throwaway files.
+# Nothing here needs docker, a Jellyfin database or external services: tests use canned
+# logs and smoke outputs, throwaway SQLite files and a local HTTP server.
 
 setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
@@ -10,7 +10,7 @@ setup() {
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"
   cd "$TMP" || exit 1
-  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER
+  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT
 }
 
 # A smoke output in the real format: "status  metric  path".
@@ -258,4 +258,20 @@ EOS
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 2 ]
   [[ "$output" == *"has 3 EF migration ids, a 10.11.8 database has 68"* ]]
+}
+
+@test "metadata: populated fields survive adoption, HTTP presentation and a completed scan" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_metadata.py
+  [ "$status" -eq 0 ]
+}
+
+@test "run.sh: an unreadable metadata baseline fails before starting a container" {
+  fake_docker
+  mkdir -p fixtures/oracle fixtures/jellyfin-12.0/data
+  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 6451
+  printf 'not a database\n' > fixtures/jellyfin-12.0/data/jellyfin.db
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"metadata baseline: metadata check could not read"* ]]
+  [[ "$output" != *"unexpected docker run"* ]]
 }
