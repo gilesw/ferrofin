@@ -30,6 +30,21 @@ use ferrofin_traits::persistence::{
 };
 use std::collections::HashMap;
 
+/// Compare the values the image save actually persists, including the database's
+/// 100 ns timestamp precision. A provider returning identical artwork is a no-op.
+fn image_row_matches(
+    row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
+    image: &ItemImageInfo,
+) -> bool {
+    row.image_type == image_type_to_disc(image.image_type)
+        && row.path == image.path
+        && row.width == i64::from(image.width)
+        && row.height == i64::from(image.height)
+        && row.blurhash.as_deref() == image.blur_hash.as_deref().map(str::as_bytes)
+        && row.date_modified.map(datetime_to_db).as_deref()
+            == Some(datetime_to_db(image.date_modified).as_str())
+}
+
 /// One `BaseItemImageInfos` row as the scan's change detection reads it:
 /// `ItemId`, `ImageType`, `Path`, `Width`, `Height`, `Blurhash`, `DateModified`.
 type ScanImageRow = (
@@ -2096,31 +2111,72 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         images: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
+        use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
         let item = guid_to_db(item_id);
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        // Replace the item's image set (idempotent re-scan).
-        sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#)
-            .bind(&item)
-            .execute(&mut *tx)
+        // Reserve the writer before reading: a concurrent image edit must not
+        // invalidate a deferred transaction's snapshot before its first write.
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
+        let mut stored = sqlx::query_as::<_, BaseItemImageInfoEntity>(
+            r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+        )
+        .bind(&item)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // Preserve exact matches first, including their row ids and therefore
+        // the stable order of multiple Backdrops. Consume matches one-to-one
+        // so duplicate paths do not hide additions or removals.
+        let mut changed = Vec::new();
         for image in images {
+            if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
+                stored.swap_remove(index);
+            } else {
+                changed.push(image);
+            }
+        }
+        for image in changed {
+            // A changed file's metadata updates its own row; a new path/type
+            // gets a new row. The other images remain untouched.
+            let id = stored
+                .iter()
+                .position(|row| {
+                    row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
+                })
+                .map_or_else(
+                    || guid_to_db(Uuid::new_v4()),
+                    |index| stored.swap_remove(index).id,
+                );
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                    ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                   ON CONFLICT("Id") DO UPDATE SET
+                     "Width" = excluded."Width", "Height" = excluded."Height",
+                     "Blurhash" = excluded."Blurhash", "DateModified" = excluded."DateModified""#,
             )
-            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(id)
             .bind(&item)
             .bind(image_type_to_disc(image.image_type))
             .bind(&image.path)
             .bind(i64::from(image.width))
             .bind(i64::from(image.height))
-            .bind(image.blur_hash.as_deref().map(str::as_bytes)) // BLOB of the hash's UTF-8 bytes
+            .bind(image.blur_hash.as_deref().map(str::as_bytes))
             .bind(datetime_to_db(image.date_modified))
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        }
+        for row in stored {
+            sqlx::query(r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = ?1"#)
+                .bind(row.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -5483,6 +5539,137 @@ mod tests {
                 .expect("read")
                 .is_empty()
         );
+    }
+
+    /// Observe real SQLite mutations: identical final values alone would miss
+    /// a DELETE/INSERT replacement or an unconditional UPDATE.
+    async fn image_writes(db: &ferrofin_db::Database) -> Vec<(String, String)> {
+        let rows =
+            sqlx::query_as(r#"SELECT "Op", "ImageId" FROM "TestImageWrites" ORDER BY rowid"#)
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        sqlx::query(r#"DELETE FROM "TestImageWrites""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        rows
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn image_saves_only_write_changed_rows() {
+        use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Person).await;
+        sqlx::query(r#"CREATE TABLE "TestImageWrites" ("Op" TEXT, "ImageId" TEXT)"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        for (op, row) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                r#"CREATE TRIGGER "TestImage_{op}" AFTER {op} ON "BaseItemImageInfos"
+                   BEGIN INSERT INTO "TestImageWrites" VALUES ('{op}', {row}."Id"); END"#
+            )))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        let primary = ItemImageInfo {
+            path: "/metadata/person/primary.jpg".to_owned(),
+            image_type: ImageType::Primary,
+            // Values beyond the database's precision must not trigger writes
+            // each time this identical input is passed back to persistence.
+            date_modified: chrono::DateTime::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            width: 48,
+            height: 64,
+            blur_hash: Some("hash".to_owned()),
+        };
+        let backdrop = ItemImageInfo {
+            path: "/metadata/person/backdrop.jpg".to_owned(),
+            image_type: ImageType::Backdrop,
+            ..primary.clone()
+        };
+        let mut images = vec![primary, backdrop.clone(), backdrop];
+        svc.save_item_images(item, &images).await.unwrap();
+        assert_eq!(image_writes(&db).await.len(), 3);
+        let read = || async {
+            sqlx::query_as::<_, BaseItemImageInfoEntity>(
+                r#"SELECT * FROM "BaseItemImageInfos" WHERE "ItemId" = ?1 ORDER BY "Id""#,
+            )
+            .bind(guid_to_db(item))
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        let before = read().await;
+        let primary_id = before
+            .iter()
+            .find(|r| r.image_type == 0)
+            .unwrap()
+            .id
+            .clone();
+        // Even a reordered list with duplicate paths is the same multiset.
+        images.reverse();
+        svc.save_item_images(item, &images).await.unwrap();
+        assert!(image_writes(&db).await.is_empty());
+        assert_eq!(read().await, before);
+        images.reverse();
+
+        // Each persisted metadata field independently triggers just one UPDATE,
+        // retaining the row id. The backdrop rows are untouched throughout.
+        for field in ["width", "height", "blurhash", "mtime"] {
+            match field {
+                "width" => images[0].width += 1,
+                "height" => images[0].height += 1,
+                "blurhash" => images[0].blur_hash = None,
+                "mtime" => images[0].date_modified += chrono::Duration::seconds(1),
+                _ => unreachable!(),
+            }
+            svc.save_item_images(item, &images).await.unwrap();
+            assert_eq!(
+                image_writes(&db).await,
+                vec![("UPDATE".to_owned(), primary_id.clone())],
+                "{field}"
+            );
+            svc.save_item_images(item, &images).await.unwrap();
+            assert!(image_writes(&db).await.is_empty(), "{field} settled");
+        }
+        // Removing one duplicate removes one row, without replacing its twin.
+        images.pop();
+        svc.save_item_images(item, &images).await.unwrap();
+        let removed = image_writes(&db).await;
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "DELETE");
+        assert_ne!(removed[0].1, primary_id);
+        let retained = read()
+            .await
+            .into_iter()
+            .find(|r| r.image_type == 2)
+            .unwrap();
+
+        // A replacement at a different path removes/inserts that image only.
+        images[0].path = "/metadata/person/new-primary.jpg".to_owned();
+        svc.save_item_images(item, &images).await.unwrap();
+        let replaced = image_writes(&db).await;
+        assert_eq!(replaced.len(), 2);
+        assert_eq!(replaced[0].0, "INSERT");
+        assert_eq!(replaced[1], ("DELETE".to_owned(), primary_id));
+        assert!(read().await.contains(&retained));
+        // A changed type at the same path also replaces just that entry.
+        images[0].image_type = ImageType::Thumb;
+        svc.save_item_images(item, &images).await.unwrap();
+        assert_eq!(image_writes(&db).await.len(), 2);
+        assert!(read().await.contains(&retained));
+        svc.save_item_images(item, &[]).await.unwrap();
+        assert_eq!(image_writes(&db).await.len(), 2);
+        assert!(read().await.is_empty());
+        svc.save_item_images(item, &[]).await.unwrap();
+        assert!(image_writes(&db).await.is_empty());
     }
 
     #[tokio::test]

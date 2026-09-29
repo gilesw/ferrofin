@@ -2697,6 +2697,13 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
         );
     }
     assert_tables_within(seen, PROVIDER_PASS_TABLES, row);
+    assert!(
+        !seen.item_writes.iter().any(|(table, _, item)| {
+            table == "BaseItemImageInfos" && item.starts_with("Person:")
+        }),
+        "row {row}: identical provider results must not rewrite cast images: {:?}",
+        seen.item_writes
+    );
     let written = seen.written_items();
     assert!(
         keys.iter().all(|k| written.contains(k))
