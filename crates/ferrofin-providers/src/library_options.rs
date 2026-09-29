@@ -10,7 +10,7 @@
 //! The registry reflects what is actually compiled into this build: the local
 //! Kodi/XBMC **Nfo** reader/saver and **Local Images** provider are always
 //! present; **The Open Movie Database** (OMDb) and **IntroSkipper** segments are
-//! always compiled (OMDb needs a key at runtime, which the checkbox gates);
+//! always compiled (shared API keys are supplied where required);
 //! **TheMovieDb** and **Open Subtitles** appear only when their crate features
 //! are enabled. Nothing here is a placeholder — a provider is listed iff its
 //! code is in the binary.
@@ -465,8 +465,7 @@ fn metadata_providers() -> Vec<Provider> {
             images: Some(omdb_images),
         },
         Provider {
-            // Optional at runtime (needs an API key/config), like OMDb —
-            // the checkbox gates; absence of config just yields no hits.
+            // Uses a built-in project key; the library checkbox gates requests.
             name: fetcher_names::TVDB,
             caps: &[Cap::MetadataFetcher, Cap::ImageFetcher],
             types: &["Series", "Season", "Episode"],

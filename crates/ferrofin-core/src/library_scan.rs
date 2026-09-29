@@ -1216,7 +1216,10 @@ impl ScanCancel {
 
     /// Runs `work` unless the scan is asked to stop first; `None` when it
     /// was (and `work` is dropped where it stood).
-    async fn unless_cancelled<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+    pub(crate) async fn unless_cancelled<T>(
+        &self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
         tokio::select! {
             biased;
             () = self.cancelled() => None,
@@ -2550,6 +2553,7 @@ const LIBRARY_COLLAGE_SOURCES: i32 = 8;
 
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
+    subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
     file_system: Arc<dyn FileSystem>,
     persistence: Arc<dyn ItemPersistenceService>,
@@ -2575,7 +2579,7 @@ pub struct LibraryScanner {
     /// items without local images. Paired with [`metadata_dir`](Self::metadata_dir).
     tmdb: Option<Arc<TmdbClient>>,
     /// Optional OMDb client for the Rotten Tomatoes critic rating (keyed by the
-    /// title's IMDb id from TMDB). Disabled when no OMDb API key is configured.
+    /// title's IMDb id from TMDB). Uses a shared API key by default.
     omdb: Option<Arc<ferrofin_providers::OmdbClient>>,
     /// Optional TheTVDB client — the TV authority. When present, series/episode
     /// metadata + artwork come from TVDB (falling back to TMDB when TVDB has no
@@ -2754,7 +2758,17 @@ impl LibraryScanner {
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             metadata_options: None,
             metadata_configuration: None,
+            subtitle_downloader: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attaches the shared automatic downloader after the library and subtitle
+    /// manager have been constructed. Wiring is set once before scans start.
+    pub fn attach_subtitle_downloader(
+        &self,
+        downloader: Arc<crate::subtitle_downloader::SubtitleDownloader>,
+    ) {
+        let _ = self.subtitle_downloader.set(downloader);
     }
 
     /// Attaches the reader of the `metadata` named configuration, whose
@@ -4524,6 +4538,23 @@ impl LibraryScanner {
         if cancel.is_cancelled() {
             return Ok(ItemSaved::Cancelled);
         }
+        let subtitle_downloader = self.subtitle_downloader.get().filter(|_| {
+            probe_ran
+                && policy
+                    .options
+                    .and_then(|o| o.subtitle_download_languages.as_ref())
+                    .is_some_and(|languages| !languages.is_empty())
+        });
+        // Acquire before the first file/DB write so cancellation while a
+        // scheduled download holds the gate still leaves this item untouched.
+        let _subtitle_guard = if let Some(downloader) = subtitle_downloader {
+            let Some(guard) = downloader.lock(cancel).await else {
+                return Ok(ItemSaved::Cancelled);
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let ((artwork, cut_short), failed) = count_request_failures(Box::pin(
             self.collect_artwork(item.id, art, state.art_cache),
         ))
@@ -4665,7 +4696,23 @@ impl LibraryScanner {
             // union (upstream `LockedFields.Concat(…).Distinct()`).
             self.persistence.add_locked_fields(item.id, &ids).await?;
         }
-        self.persist_probe_rows(item.id, &rows).await?;
+        self.persist_probe_rows(item.id, &rows, subtitle_downloader.map(AsRef::as_ref))
+            .await?;
+        // Like FFProbeVideoInfo.AddExternalSubtitlesAsync, only a successful
+        // video probe in Default/FullRefresh downloads. Save first: attachment
+        // reads the item and appends streams, so it must follow the probe's
+        // full stream replacement. Failed probes cannot establish absence.
+        if probe_ran
+            && matches!(
+                options.metadata_refresh_mode,
+                MetadataRefreshMode::Default | MetadataRefreshMode::FullRefresh
+            )
+            && let (Some(downloader), Some(options)) = (subtitle_downloader, policy.options)
+        {
+            downloader
+                .download_missing_locked(&entity, options, cancel)
+                .await;
+        }
         // TODO(parity, open work item — NOT an accepted divergence): upstream's
         // `TrickplayProvider` (`MediaBrowser.Providers/Trickplay/
         // TrickplayProvider.cs:95-118`, a forced custom provider) runs here
@@ -4933,9 +4980,16 @@ impl LibraryScanner {
         &self,
         item_id: Uuid,
         probe: &ProbeRows,
+        subtitles: Option<&crate::subtitle_downloader::SubtitleDownloader>,
     ) -> Result<(), ServiceError> {
         if let (false, Some(repo)) = (probe.streams.is_empty(), &self.media_streams) {
-            repo.save_media_streams(item_id, &probe.streams).await?;
+            if let Some(subtitles) = subtitles {
+                subtitles
+                    .save_probed_streams(item_id, &probe.streams)
+                    .await?;
+            } else {
+                repo.save_media_streams(item_id, &probe.streams).await?;
+            }
         }
         // Attachments are replaced whenever a video probe ran (an empty set clears
         // the rows of a re-muxed file); without a probe the stored rows stay.

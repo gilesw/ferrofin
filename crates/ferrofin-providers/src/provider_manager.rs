@@ -405,8 +405,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
 }
 
 /// A [`RemoteSearchProvider`] backed by OMDb — the "Identify" flow's IMDb-keyed
-/// candidates. Port of `OmdbItemProvider.GetSearchResults`; inert (no results)
-/// until an OMDb API key is configured.
+/// candidates. Port of `OmdbItemProvider.GetSearchResults`, using the shared
+/// API key unless the operator supplies an override.
 pub struct OmdbSearchProvider {
     omdb: Arc<crate::omdb::OmdbClient>,
     kind: crate::omdb::OmdbKind,
@@ -1259,7 +1259,7 @@ impl LocalProviderManager {
     }
 
     /// Attaches the OMDb client as a remote image provider (the poster of a
-    /// movie/trailer/episode with an IMDb id). Inert without an API key.
+    /// movie/trailer/episode with an IMDb id), using the shared key by default.
     #[must_use]
     pub fn with_omdb(mut self, omdb: Arc<crate::omdb::OmdbClient>) -> Self {
         self.omdb = Some(omdb);
