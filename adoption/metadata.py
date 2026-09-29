@@ -9,12 +9,12 @@ import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from io import BytesIO
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
-import subprocess
 import sys
 import time
 import urllib.error
@@ -54,16 +54,18 @@ def connect(db):
 
 
 def decodable_image(body):
-    """Decode one image frame; suppress decoder diagnostics containing metadata."""
+    """Decode image pixels without depending on the server's video toolchain."""
     try:
-        result = subprocess.run([
-            "ffmpeg", "-v", "error", "-xerror", "-protocol_whitelist", "pipe",
-            "-i", "pipe:0", "-vf", "scale=1:1", "-frames:v", "1",
-            "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
-        ], input=body, capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        raise CheckError("metadata image decoder unavailable or timed out") from None
-    return result.returncode == 0 and len(result.stdout) == 3
+        from PIL import Image
+    except ImportError:
+        raise CheckError("metadata image decoder unavailable: install Pillow") from None
+    try:
+        with Image.open(BytesIO(body)) as image:
+            # open() reads headers lazily; load() must decode the actual pixels.
+            image.load()
+            return image.width > 0 and image.height > 0
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return False
 
 
 def snapshot(db):

@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sqlite3
 import struct
-import subprocess
 import tempfile
 import threading
 import unittest
@@ -233,6 +232,12 @@ class MetadataTest(unittest.TestCase):
         result, output = self.run_check()
         self.assertEqual((result, output), (0, ""))
         self.assertEqual(sum("/Images/" in path for path in self.requests), 2)
+        from PIL import Image
+        for format_name in ("PNG", "JPEG", "WEBP"):
+            with self.subTest(format=format_name), io.BytesIO() as body:
+                with Image.new("RGB", (2, 2), "red") as image:
+                    image.save(body, format=format_name)
+                self.assertTrue(metadata.decodable_image(body.getvalue()))
 
     def test_api_loss_fails_even_when_database_is_intact(self):
         result, output = self.run_check(missing_field="Overview")
@@ -341,11 +346,10 @@ class MetadataTest(unittest.TestCase):
                 self.assertIn("image was empty or undecodable", output)
                 self.assertNotIn(MOVIE, output)
 
-    def test_image_decoder_unavailable_or_timeout_fails(self):
-        for error in (FileNotFoundError(), subprocess.TimeoutExpired("ffmpeg", 10)):
-            with self.subTest(error=type(error).__name__), patch.object(metadata.subprocess, "run", side_effect=error):
-                with self.assertRaisesRegex(metadata.CheckError, "decoder unavailable or timed out"):
-                    metadata.decodable_image(png())
+    def test_image_decoder_unavailable_fails(self):
+        with patch.dict("sys.modules", {"PIL": None}):
+            with self.assertRaisesRegex(metadata.CheckError, "decoder unavailable: install Pillow"):
+                metadata.decodable_image(png())
 
 
 if __name__ == "__main__":

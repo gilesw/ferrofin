@@ -61,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl ffmpeg
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil
       - run: shellcheck -x scripts/version.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh verify/lib.sh verify/scan-behaviour.sh
       - run: shellcheck -x -s bash scripts/tests/version.bats adoption/tests/adoption.bats verify/tests/verify.bats
       - run: bats scripts/tests adoption/tests verify/tests
@@ -104,7 +104,10 @@ jobs:
             # `-p X` still instruments X's workspace deps, so their (uncovered) source
             # lands in the TOTAL the gate compares against. Exclude every sibling.
             others=$(basename -a crates/*/ | grep -v "^$crate\$" | paste -sd'|')
-            cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
-              --ignore-filename-regex "(crates/($others)|apps)/" || fail=1
+            if ! cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
+              --ignore-filename-regex "(crates/($others)|apps)/"; then
+              echo "::error::Tests or coverage failed for $crate"
+              fail=1
+            fi
           done
           exit $fail

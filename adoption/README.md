@@ -68,7 +68,7 @@ movies and a separate 10% sample of series that had posters or backdrops in Jell
 (rounded up). Sorting the original item UUIDs keeps the sample identical across
 stages and repeat runs. Each sampled item's poster and first backdrop are checked
 where present, plus one episode poster, with at most four downloads/decodes running
-at once. FFmpeg must decode an image frame; an image content type alone does not
+at once. Pillow must decode the image pixels; an image content type alone does not
 pass. Artwork records, descriptions and ratings are
 still checked for every original item, including items outside the artwork sample.
 The source must contain at least one movie with both an overview and a provider ID,
@@ -135,8 +135,8 @@ media paths referenced by the library options must resolve inside the container,
 (the builder records which account the oracle ran as in `oracle/user.txt` and the runner
 probes every fixture as that account; `--user NAME` or `ADOPTION_USER` overrides) and an
 **API key** in `ApiKeys`. Credentials are read from the copy at run time and never written.
-The runner also requires Python 3 (standard library only) and FFmpeg on the host for
-the metadata checks and image decoding.
+The runner also requires Python 3 and Pillow for metadata checks and image decoding
+(`python3-pil` on Debian/Ubuntu). The artwork checker does not invoke FFmpeg.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~25 min, pulls 10.11.9–12.1
@@ -211,7 +211,7 @@ database came from.
 ## Metadata gate validation
 
 All **seven fixture paths passed the expanded metadata and artwork checks** on
-**2026-09-29**, using local fixtures and the harness at `460df788`. Each baseline
+**2026-09-29**, using local fixtures and Pillow for artwork decoding. Each baseline
 contained **318 movies, 126 series and 8,878 episodes** (9,322 items). Database and HTTP
 checks passed after adoption, restart and a completed scan. Each stage compared
 against the original Jellyfin baseline and decoded artwork for the fixed 10% sample.
@@ -239,9 +239,9 @@ with ShellCheck and shell syntax checks. A separate native-server test checked a
 synthetic movie after scan, restart and another scan, then deliberately cleared its
 overview and confirmed that both the database and HTTP checks detected the loss.
 
-The expanded artwork checks first passed on `jellyfin-12.1-from-12`; the other six
-fixtures subsequently passed on fresh copies using the same server image. The sample
-checks posters/backdrops for 32 movies and 13 series, plus one episode poster.
+The complete matrix was rerun on fresh copies after replacing the host FFmpeg
+dependency with Pillow, using the same server image. The sample checks posters and
+backdrops for 32 movies and 13 series, plus one episode poster.
 The regression tests include explicit database and post-scan API checks for missing
 descriptions and ratings, corrupt images, stable sampling and decoder failures.
 Committed test data is synthetic; real snapshots and reports remain local and
