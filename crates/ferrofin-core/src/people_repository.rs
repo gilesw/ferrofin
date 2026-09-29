@@ -529,7 +529,7 @@ type PersonRepairRow = (
 /// Dedupes credited people case-insensitively by `(name, person_type)`, matching
 /// the C# `DistinctBy(name.ToLower + "-" + type)` and preserving first-seen order
 /// (which becomes the credit `ListOrder`).
-fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
+pub(crate) fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
     let mut seen = std::collections::HashSet::new();
     let mut deduped: Vec<&PeopleEntity> = Vec::new();
     for person in people {
@@ -855,6 +855,7 @@ impl FerrofinPeopleRepository {
                 role: None,
                 primary_image_url: None,
                 provider_id: None,
+                sort_order: None,
             })
             .collect();
         Ok(QueryResult::new(
@@ -967,7 +968,9 @@ impl PeopleRepository for FerrofinPeopleRepository {
                 // `string.Empty` on write (v10.11.8 `PeopleRepository.cs:77-80`)
                 // and `Map` reads `Role = mapping?.Role` with no coalescing
                 // (`:157`), so a roleless credit is serialized as `"Role": ""`.
-                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType", m."Role"
+                // `SortOrder` too: `AttachPeople` orders the DTO's people by
+                // it (`Map` reads `SortOrder = mapping?.SortOrder`, `:378`).
+                r#"SELECT m."ItemId", p."Id", p."Name", p."PersonType", m."Role", m."SortOrder"
                    FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
                    WHERE m."ItemId" IN ("#,
             );
@@ -1111,7 +1114,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
             .bind(people_id)
             .bind(person.role.clone().unwrap_or_default())
             .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
-            .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
+            // `SortOrder = credit.Person.SortOrder` (`PeopleRepository.cs:
+            // 146,218,231`): the credit's own order (TMDB billing, NFO
+            // `<sortorder>`), NULL when it has none — not the list position.
+            .bind(person.sort_order)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -1228,6 +1234,19 @@ impl PeopleRepository for FerrofinPeopleRepository {
         }
         Ok(result)
     }
+}
+
+/// Test-only: a `Peoples` row with no item link, so the raw SQL stays inside
+/// the repository boundary.
+#[cfg(test)]
+pub(crate) async fn seed_people_row(db: &Database, id: uuid::Uuid, name: &str, person_type: &str) {
+    sqlx::query(r#"INSERT INTO "Peoples" ("Id", "Name", "PersonType") VALUES (?1, ?2, ?3)"#)
+        .bind(guid_to_db(id))
+        .bind(name)
+        .bind(person_type)
+        .execute(db.writer())
+        .await
+        .expect("seed people row");
 }
 
 #[cfg(test)]
@@ -1709,6 +1728,7 @@ mod tests {
             role: Some("Chani".to_owned()),
             primary_image_url: Some("https://img/zendaya.jpg".to_owned()),
             provider_id: Some(505_710),
+            sort_order: None,
         };
         let refs = repo
             .update_people(item, &[with_image, person("No Photo", "Director")])

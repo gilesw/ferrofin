@@ -67,6 +67,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 |---|---|---|
 | `FERROFIN_ENABLE_METRICS` | `false` | Serve Prometheus `/metrics`. Off → the route is absent. |
 | `FERROFIN_METRICS_SAMPLE_INTERVAL` | built-in | Seconds between process-metric samples. |
+| `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` | 1–2.5–5 per decade, `0.001` … `5000` | Bucket boundaries, in seconds, of the library-scan duration histograms (`ferrofin_library_scan_duration_seconds`, `ferrofin_library_scan_pass_duration_seconds`). The env var is comma-separated (`0.01,0.1,1,10,60,300,1800,7200`); the `config.toml` key `metrics_scan_duration_buckets` is an array (`[0.01, 0.1, 1, 10]`). A list that is empty, non-numeric, non-finite, not above zero or not strictly increasing is refused with a warning at startup and the default is used. |
 | `FERROFIN_SHUTDOWN_TIMEOUT_SECS` | `30` | Seconds a graceful shutdown or in-process restart (`POST /System/Restart`, backup restore) waits for in-flight requests before aborting the remaining connections — ASP.NET's `ShutdownTimeout` default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Enable OTLP trace export to this endpoint (off by default). |
 
