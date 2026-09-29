@@ -204,6 +204,7 @@ pub mod path_manager;
 pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
+pub mod program_data_rebase;
 pub mod quick_connect_manager;
 pub mod resolvers;
 pub mod scheduled_tasks;
