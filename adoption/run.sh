@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do case $1 in
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
 WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work}
-for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
+for t in docker sqlite3 jq curl python3 ffmpeg; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-12.1.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run adoption/build-fixtures.sh first" >&2; exit 2; }

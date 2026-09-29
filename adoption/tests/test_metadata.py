@@ -7,9 +7,12 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import struct
+import subprocess
 import tempfile
 import threading
 import unittest
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -19,6 +22,14 @@ metadata = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(metadata)
 MOVIE = "a" * 32
 EPISODE = "b" * 32
+
+
+def png():
+    def chunk(kind, data):
+        return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack("!2I5B", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\0\xff\0\0")) + chunk(b"IEND", b""))
 
 
 class MetadataTest(unittest.TestCase):
@@ -149,7 +160,7 @@ class MetadataTest(unittest.TestCase):
             self.assertEqual(metadata.compare(self.expected, metadata.snapshot(self.db), "database"),
                              {"database missing Overview": 2})
 
-    def api_fixture(self, missing_field=None, status=200, scan_status="Completed", stale=False, hide_item=False, missing_item=False):
+    def api_fixture(self, missing_field=None, status=200, scan_status="Completed", stale=False, hide_item=False, missing_item=False, image_body=None):
         owner = self
         self.requests = []
         self.scan_calls = 0
@@ -190,7 +201,7 @@ class MetadataTest(unittest.TestCase):
                     self.send_response(status)
                     self.send_header("Content-Type", "image/png")
                     self.end_headers()
-                    self.wfile.write(b"image bytes")
+                    self.wfile.write(png() if image_body is None else image_body)
                     return
                 else:
                     query = parse_qs(urlsplit(self.path).query)
@@ -277,6 +288,64 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("API missing People: 2 item(s)", output)
         self.assertIn("/Library/Refresh", self.requests)
+
+    def test_descriptions_and_ratings_lost_in_database_fail(self):
+        for field in ("Overview", "CommunityRating", "CriticRating", "OfficialRating"):
+            with self.subTest(field=field):
+                with contextlib.closing(sqlite3.connect(self.db)) as db:
+                    original = db.execute(f'SELECT "{field}" FROM BaseItems LIMIT 1').fetchone()[0]
+                self.sql(f'UPDATE BaseItems SET "{field}" = NULL')
+                self.assertEqual(metadata.compare(self.expected, metadata.snapshot(self.db), "database"),
+                                 {f"database missing {field}": 2})
+                with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+                    db.execute(f'UPDATE BaseItems SET "{field}" = ?', (original,))
+
+    def test_descriptions_and_ratings_lost_in_api_fail_after_scan(self):
+        for field in ("Overview", "CommunityRating", "CriticRating", "OfficialRating"):
+            with self.subTest(field=field), patch.object(metadata.time, "sleep"):
+                result, output = self.run_check(mode="scan", missing_field=field)
+                self.assertEqual(result, 1)
+                self.assertIn(f"API missing {field}: 2 item(s)", output)
+
+    def test_artwork_sample_is_ten_percent_per_kind_and_stable(self):
+        items = {}
+        for kind, count, offset in (("Movie", 318, 0), ("Series", 126, 1000), ("Episode", 30, 2000)):
+            for i in range(count):
+                items[f"{i + offset:032x}"] = {"kind": kind, "images": ["Primary", "Backdrop"]}
+        api = metadata.Api("http://127.0.0.1", self.db)
+        with patch.object(api, "request", return_value=True) as request:
+            api.images({"items": items})
+            first = request.call_args_list[:]
+            request.reset_mock()
+            api.images({"items": dict(reversed(list(items.items())))})
+            self.assertCountEqual(first, request.call_args_list)
+        ids = {call.args[0].split("/")[2] for call in first}
+        self.assertEqual(sum(items[key]["kind"] == "Movie" for key in ids), 32)
+        self.assertEqual(sum(items[key]["kind"] == "Series" for key in ids), 13)
+        self.assertEqual(sum(items[key]["kind"] == "Episode" for key in ids), 1)
+        self.assertEqual(len(first), (32 + 13) * 2 + 1)
+
+    def test_artwork_sample_handles_missing_optional_images(self):
+        api = metadata.Api("http://127.0.0.1", self.db)
+        self.expected["items"][MOVIE]["images"] = ["Backdrop"]
+        self.expected["items"][EPISODE]["images"] = []
+        with patch.object(api, "request", return_value=True) as request:
+            api.images(self.expected)
+            request.assert_called_once_with(f"/Items/{MOVIE}/Images/Backdrop/0?maxWidth=200", image=True)
+
+    def test_corrupt_artwork_with_image_content_type_fails(self):
+        for body in (b"", b"not actually an image", png()[:33]):
+            with self.subTest(body_length=len(body)):
+                result, output = self.run_check(image_body=body)
+                self.assertEqual(result, 1)
+                self.assertIn("image was empty or undecodable", output)
+                self.assertNotIn(MOVIE, output)
+
+    def test_image_decoder_unavailable_or_timeout_fails(self):
+        for error in (FileNotFoundError(), subprocess.TimeoutExpired("ffmpeg", 10)):
+            with self.subTest(error=type(error).__name__), patch.object(metadata.subprocess, "run", side_effect=error):
+                with self.assertRaisesRegex(metadata.CheckError, "decoder unavailable or timed out"):
+                    metadata.decodable_image(png())
 
 
 if __name__ == "__main__":

@@ -7,12 +7,14 @@ values or credentials. Reports contain only aggregate counts and field names.
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -49,6 +51,19 @@ def item_id(value):
 
 def connect(db):
     return sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)
+
+
+def decodable_image(body):
+    """Decode one image frame; suppress decoder diagnostics containing metadata."""
+    try:
+        result = subprocess.run([
+            "ffmpeg", "-v", "error", "-xerror", "-protocol_whitelist", "pipe",
+            "-i", "pipe:0", "-vf", "scale=1:1", "-frames:v", "1",
+            "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+        ], input=body, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        raise CheckError("metadata image decoder unavailable or timed out") from None
+    return result.returncode == 0 and len(result.stdout) == 3
 
 
 def snapshot(db):
@@ -139,7 +154,8 @@ class Api:
             with urllib.request.urlopen(request, timeout=30) as response:
                 body = response.read()
                 if image:
-                    return bool(body) and response.headers.get_content_type().startswith("image/")
+                    return (bool(body) and response.headers.get_content_type().startswith("image/")
+                            and decodable_image(body))
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as error:
             code = error.code
@@ -187,13 +203,27 @@ class Api:
         return {"version": 1, "items": items}
 
     def images(self, expected):
-        """Fetch one primary image per represented kind, beyond checking tags."""
-        checked = set()
-        for key, entry in expected["items"].items():
-            if "Primary" in entry["images"] and entry["kind"] not in checked:
-                if not self.request(f"/Items/{key}/Images/Primary?maxWidth=200", image=True):
-                    raise CheckError("metadata primary image was empty or not an image")
-                checked.add(entry["kind"])
+        """Decode a stable 10% movie/series sample, plus one episode poster."""
+        sample = []
+        for kind in ("Movie", "Series", "Episode"):
+            types = ("Primary",) if kind == "Episode" else ("Primary", "Backdrop")
+            candidates = sorted(key for key, entry in expected["items"].items()
+                                if entry["kind"] == kind and set(types) & set(entry["images"]))
+            count = 1 if kind == "Episode" else math.ceil(len(candidates) / 10)
+            # UUID order is reproducible across JSON/DB ordering and all stages.
+            for key in candidates[:count]:
+                for image_type in types:
+                    if image_type in expected["items"][key]["images"]:
+                        sample.append((key, kind, image_type))
+
+        def check(entry):
+            key, kind, image_type = entry
+            if not self.request(f"/Items/{key}/Images/{image_type}/0?maxWidth=200", image=True):
+                raise CheckError(f"metadata {kind} {image_type} image was empty or undecodable")
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            # Consume the results so download/decode failures reach the caller.
+            list(pool.map(check, sample))
 
     def scan(self, timeout, interval=2):
         deadline = time.monotonic() + timeout

@@ -63,9 +63,16 @@ checked through their individual detail endpoints. Losing one item's metadata fa
 even if another item's metadata is added.
 Fields absent in Jellyfin are optional; valid provider updates may change values.
 This checks presence, not exact text, provider-ID values, cast membership or image bytes.
-The suite also downloads one primary image per represented kind to check that image
-tags point to usable responses. The source must contain at least one movie with both
-an overview and a provider ID, so an empty or filename-only fixture cannot pass.
+At each stage, the suite downloads and decodes artwork for a fixed 10% sample of
+movies and a separate 10% sample of series that had posters or backdrops in Jellyfin
+(rounded up). Sorting the original item UUIDs keeps the sample identical across
+stages and repeat runs. Each sampled item's poster and first backdrop are checked
+where present, plus one episode poster, with at most four downloads/decodes running
+at once. FFmpeg must decode an image frame; an image content type alone does not
+pass. Artwork records, descriptions and ratings are
+still checked for every original item, including items outside the artwork sample.
+The source must contain at least one movie with both an overview and a provider ID,
+so an empty or filename-only fixture cannot pass.
 
 Only fixture copies are scanned; source snapshots remain untouched. All media mounts
 must resolve for the scan, which can otherwise remove unavailable items. The scan
@@ -98,6 +105,12 @@ any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 Nothing under `adoption/` contains a database. You supply **one** Jellyfin 10.11.8 data
 directory and the builder derives the rest with the official Jellyfin images:
 
+Committed test cases use invented users, item IDs and metadata. Keep real fixture
+snapshots and generated reports outside the checkout. Git ignore rules also exclude
+the fixture directories, media mount scripts and generated metadata/smoke reports;
+never force-add these private artifacts. Live baselines retain item UUIDs locally so
+the same items can be checked across stages, but reports show only aggregate results.
+
 ```
 $FIXTURES/
   jellyfin-10.11.8/            supplied: config/, data/jellyfin.db, root/, metadata/ …
@@ -122,7 +135,8 @@ media paths referenced by the library options must resolve inside the container,
 (the builder records which account the oracle ran as in `oracle/user.txt` and the runner
 probes every fixture as that account; `--user NAME` or `ADOPTION_USER` overrides) and an
 **API key** in `ApiKeys`. Credentials are read from the copy at run time and never written.
-The runner also requires Python 3 (standard library only) for the metadata checks.
+The runner also requires Python 3 (standard library only) and FFmpeg on the host for
+the metadata checks and image decoding.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once, ~25 min, pulls 10.11.9–12.1
@@ -159,7 +173,8 @@ and throwaway SQLite files, and the two entry points are exercised for their ref
 missing-fixture path. `tests/test_metadata.py` exercises the metadata checks using
 invented library rows and a local HTTP server: partial/total metadata loss, missing
 items, empty baselines, optional fields, valid updates, WAL visibility, HTTP failures,
-batched API reads and scan completion/failure/timeout handling. Bats invokes these
+batched API reads, scan completion/failure/timeout handling, reproducible artwork
+sampling, corrupt image responses and description/rating loss. Bats invokes these
 Python tests, so CI runs them too. CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
@@ -195,8 +210,8 @@ database came from.
 
 ## Metadata gate validation
 
-All **seven fixture paths passed** the metadata gate and existing adoption checks on
-**2026-09-29**, using the fixtures at `/mnt/nvme0/ferrofin-adoption-test`. Each baseline
+Before expanding artwork sampling, all **seven fixture paths passed** the metadata
+gate and existing adoption checks on **2026-09-29**, using local fixtures. Each baseline
 contained **318 movies, 126 series and 8,878 episodes** (9,322 items). Database and HTTP
 checks passed after adoption, restart and a completed scan. Each stage compares
 against the original Jellyfin baseline.
@@ -213,3 +228,14 @@ All **26 Bats harness tests**, including **20 Python metadata tests**, passed, a
 with ShellCheck and shell syntax checks. A separate native-server test checked a
 synthetic movie after scan, restart and another scan, then deliberately cleared its
 overview and confirmed that both the database and HTTP checks detected the loss.
+
+The subsequent 10% artwork sample was validated on a fresh copy of
+`jellyfin-12.1-from-12` using the same server image. Adoption, restart and full-scan
+checks all passed, including decoding posters/backdrops for 32 movies and 13 series,
+plus one episode poster (90 image requests per checkpoint). This follow-up reran
+one fixture; the seven-fixture result above used the earlier artwork check.
+The expanded suite passed **26 Python metadata tests** within **26 Bats harness
+tests**, plus ShellCheck and shell syntax checks. These include explicit database
+and post-scan API checks for missing descriptions and ratings, corrupt images,
+stable sampling and decoder failures. Committed test data is synthetic; real
+snapshots and reports remain local and excluded from Git.
