@@ -122,6 +122,19 @@ pub fn image_fetcher_rank(
     configured_order(order, name)
 }
 
+/// Default order for built-in artwork providers. Explicit library order is
+/// applied before this tie-breaker. Fanart leads movie and series artwork,
+/// and precedes AudioDB for music, with OMDb as the final poster fallback.
+#[must_use]
+pub fn default_image_order(name: &str) -> usize {
+    match name {
+        fetcher_names::TMDB | fetcher_names::AUDIODB => 1,
+        fetcher_names::TVDB => 50,
+        fetcher_names::OMDB => 90,
+        _ => 0,
+    }
+}
+
 /// `GetConfiguredOrder` (`ProviderManager.cs:617-628`): the position of
 /// `name` in `order`, or last.
 fn configured_order(order: &[String], name: &str) -> usize {

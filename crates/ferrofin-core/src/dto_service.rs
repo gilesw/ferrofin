@@ -2775,6 +2775,18 @@ impl FerrofinDtoService {
 
         // Episode extras.
         if kind == BaseItemKind::Episode {
+            let data = crate::item_data::parse_data(item.data.as_deref());
+            let number = |key| {
+                data.get(key)
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|n| i32::try_from(n).ok())
+            };
+            dto.index_number_end = number("IndexNumberEnd");
+            if options.contains_field(ItemFields::SpecialEpisodeNumbers) {
+                dto.airs_after_season_number = number("AirsAfterSeasonNumber");
+                dto.airs_before_episode_number = number("AirsBeforeEpisodeNumber");
+                dto.airs_before_season_number = number("AirsBeforeSeasonNumber");
+            }
             dto.series_name = item.series_name.clone();
             dto.season_name = item.season_name.clone();
             dto.season_id = item

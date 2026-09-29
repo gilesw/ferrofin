@@ -22,8 +22,8 @@
 //! upstream rule here too, and every other `Data` key is merged key-wise
 //! (never replaced wholesale).
 //!
-//! The upstream properties Ferrofin has no storage for are not merged:
-//! `HomePageUrl` and a person's `SortOrder`. `LockedFields` lives in its own
+//! A person's `SortOrder` has no storage and is not merged. `HomePageUrl`
+//! lives in `Data`. `LockedFields` lives in its own
 //! table (`BaseItemMetadataFields`), so it rides on [`MetadataResult`].
 //!
 //! It lives here, beside the providers, as upstream's lives in
@@ -634,6 +634,7 @@ enum DataRule {
 /// (see [`merge_data_blob`]).
 const DATA_RULES: &[(&str, DataRule)] = &[
     ("RemoteTrailers", DataRule::Trailers),
+    ("HomePageUrl", DataRule::Plain),
     ("DisplayOrder", DataRule::NonBlankSource),
     ("Video3DFormat", DataRule::PresentSource),
     // `SeriesMetadataService.MergeData`.

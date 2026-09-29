@@ -195,6 +195,7 @@ impl Providers {
                     ("200 OK", "image/png", POSTER_PNG.to_vec())
                 } else {
                     match subtitle_answer(target, addr)
+                        .or_else(|| parity_answer(target, addr))
                         .or_else(|| omdb_answer(target))
                         .or_else(|| answer(target))
                     {
@@ -243,6 +244,31 @@ fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
         }
         _ => return None,
     })
+}
+
+/// Distinct artwork URLs let the HTTP matrix prove which provider won.
+fn parity_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
+    let path = target.split('?').next()?;
+    let art = |file: &str| format!("http://{addr}/image/{file}.png");
+    Some(match path {
+        "/tmdb/movie/901" => json!({"id":901,"title":"Mapped movie","original_title":"Original movie","original_language":"ja",
+            "overview":"Mapped overview", "videos":{"results":[{"site":"YouTube","type":"Trailer","key":"mapped","name":"Trailer"}]}, "production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"mapped keyword"}]},
+            "belongs_to_collection":{"id":99,"name":"Mapped collection"},"poster_path":"/mapped-tmdb.png","credits":{"cast":[],"crew":[]}}),
+        "/fanart/movies/901" => json!({"movieposter":[{"url":art("mapped-fanart"),"lang":"en"}]}),
+        "/tvdb/login" => json!({"data":{"token":"test"}}),
+        "/tvdb/search/remoteid/tt123456" | "/tvdb/search/remoteid/777" => json!({"data":[{"series":{"id":42}}]}),
+        "/tvdb/series/42/extended" => json!({"data":{"id":42,"name":"Mapped series","overview":"TVDB series overview",
+            "averageRuntime":42,"slug":"mapped-series","lists":[{"id":9,"isOfficial":true}],
+            "remoteIds":[{"sourceName":"IMDB","id":"tt123456"}],
+            "artworks":[{"type":2,"image":art("mapped-tvdb")}]
+        }}),
+        "/tvdb/series/42/episodes/official" => json!({"data":{"episodes":[{"id":43,"seasonNumber":1,"number":1}]}}),
+        "/tvdb/episodes/43/extended" => json!({"data":{"id":43,"name":"Mapped episode","overview":"TVDB episode overview",
+            "airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,
+            "remoteIds":[{"sourceName":"IMDB","id":"tt123457"}],"characters":[]}}),
+        "/fanart/tv/42" => json!({"tvposter":[{"url":art("mapped-series-fanart"),"lang":"en"}]}),
+        _ => return None,
+    }.to_string())
 }
 
 /// The request lines of `provider` (its path prefix) among `lines`.
@@ -332,7 +358,7 @@ fn answer(target: &str) -> Option<String> {
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
-                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5}}"#
+                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5, "credits": {{"cast":[],"crew":[]}}, "external_ids": {{"imdb_id":"tt900{n}","tvdb_id":900{n}}}, "videos": {{"results":[]}}}}"#
             )
         };
         return match (parts.next(), parts.next(), parts.next(), parts.next()) {
@@ -1674,6 +1700,7 @@ async fn a_scan_reprocesses_only_what_changed() {
     let started = Instant::now();
     rows(&h).await;
     subtitles_are_downloaded_during_scan(&h).await;
+    provider_identity_fields_and_artwork(&h).await;
     movie_metadata_survives_provider_outage(&h).await;
     subtitle_probe_failure_is_quiet(&h).await;
     omdb_works_without_an_operator_key(&h).await;
@@ -2628,6 +2655,146 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     h.refresh(library, "FullRefresh", true).await;
     let disabled = h.settle(mark, &[("api", 1.0)]).await;
     assert!(of(&disabled.requests, "omdb").is_empty());
+}
+
+/// External identities, newly mapped fields, artwork order and quiet rescans
+/// through the real server, its persistence layer and SQLite write triggers.
+#[allow(clippy::too_many_lines)]
+async fn provider_identity_fields_and_artwork(h: &Harness) {
+    let movie_root = h.media.library("provider-movies");
+    let movie = PathBuf::from(&movie_root).join("Unmatched filename.mkv");
+    put(&movie, &[0; 1024]);
+    put(
+        &movie.with_extension("nfo"),
+        b"<movie><tmdbid>901</tmdbid></movie>",
+    );
+    let mut options = json!({"PathInfos":[{"Path":movie_root}],"EnableRealtimeMonitor":false,
+        "TypeOptions":[{"Type":"Movie","MetadataFetchers":["TheMovieDb"],"ImageFetchers":["TheMovieDb","FanArt"]}]});
+    h.post(
+        "/Library/VirtualFolders?name=ProviderMovies&collectionType=movies&refreshLibrary=false",
+        Some(&json!({"LibraryOptions":options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "ProviderMovies")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/image/mapped-fanart.png"))
+    );
+    assert!(
+        !seen
+            .requests
+            .iter()
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb"))
+    );
+    let id = h.id(&movie).await;
+    let dto = h.item(&id).await;
+    assert_eq!(dto["Name"], "Mapped movie");
+    assert_eq!(dto["OriginalTitle"], "Original movie");
+    assert_eq!(dto["ProductionLocations"], json!(["Japan"]));
+    assert_eq!(dto["Tags"], json!(["mapped keyword"]));
+    assert_eq!(dto["ProviderIds"]["TmdbCollection"], "99");
+    // A plain rescan neither redownloads artwork nor changes image rows.
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "Default", false).await;
+    let quiet = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(quiet.requests.is_empty(), "{quiet:?}");
+    assert!(
+        !quiet.writes.contains_key("BaseItemImageInfos"),
+        "{quiet:?}"
+    );
+    // An explicit library order overrides the default on image replacement.
+    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["TheMovieDb", "FanArt"]);
+    h.post(
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&json!({"Id":library,"LibraryOptions":options})),
+    )
+    .await;
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.post(&format!("/Items/{id}/Refresh?MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllImages=true"),None).await;
+    let reordered = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        reordered
+            .requests
+            .iter()
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+        "{reordered:?}"
+    );
+
+    let series_root = h.media.library("provider-series");
+    let series = PathBuf::from(&series_root).join("Unmatched series");
+    let episode = series.join("Season 1/Unknown.S01E01.mkv");
+    put(&episode, &[0; 1024]);
+    put(
+        &series.join("tvshow.nfo"),
+        b"<tvshow><imdbid>tt123456</imdbid></tvshow>",
+    );
+    let options = json!({"PathInfos":[{"Path":series_root}],"EnableRealtimeMonitor":false,"TypeOptions":[
+        {"Type":"Series","MetadataFetchers":["TheTVDB"],"ImageFetchers":["TheTVDB","FanArt"]},
+        {"Type":"Season","MetadataFetchers":[],"ImageFetchers":[]},
+        {"Type":"Episode","MetadataFetchers":["TheTVDB"],"ImageFetchers":[]}]});
+    h.post(
+        "/Library/VirtualFolders?name=ProviderSeries&collectionType=tvshows&refreshLibrary=false",
+        Some(&json!({"LibraryOptions":options})),
+    )
+    .await;
+    let folders = h.get("/Library/VirtualFolders").await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["Name"] == "ProviderSeries")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap();
+    h.writes.reset().await;
+    let mark = h.mark().await;
+    h.refresh(library, "FullRefresh", false).await;
+    let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/tvdb/search/remoteid/tt123456")),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.requests.iter().any(|r| r.contains("/tvdb/search?")),
+        "{seen:?}"
+    );
+    assert!(
+        seen.requests
+            .iter()
+            .any(|r| r.contains("/image/mapped-series-fanart.png")),
+        "{seen:?}"
+    );
+    let dto = h.item(&h.id(&series).await).await;
+    assert_eq!(dto["Name"], "Mapped series");
+    assert_eq!(dto["OriginalTitle"], "Mapped series");
+    assert_eq!(dto["RunTimeTicks"], 25_200_000_000_i64);
+    assert_eq!(dto["ProviderIds"]["Tvdb"], "42");
+    assert_eq!(dto["ProviderIds"]["TvdbSlug"], "mapped-series");
+    assert_eq!(dto["ProviderIds"]["TvdbCollection"], "9;");
+    let dto = h.item(&h.id(&episode).await).await;
+    assert_eq!(dto["OriginalTitle"], "Mapped episode");
+    assert_eq!(dto["ProviderIds"]["Tvdb"], "43");
+    assert_eq!(dto["ProviderIds"]["Imdb"], "tt123457");
+    assert_eq!(dto["AirsBeforeEpisodeNumber"], 2);
+    assert_eq!(dto["AirsBeforeSeasonNumber"], 1);
+    assert_eq!(dto["AirsAfterSeasonNumber"], 0);
 }
 
 /// Asserts the row wrote rows for every item in `items` and for nothing
