@@ -147,7 +147,7 @@ async fn get_user_views(
 /// `GET /UserViews/GroupingOptions` — the user's grouping-eligible views.
 ///
 /// Port of `UserViewsController.GetGroupingOptions`: resolves the user (a missing
-/// user is `404`), takes their top-level view folders, keeps the ones
+/// user is `404`), takes their root media folders, keeps the ones
 /// `UserView.IsEligibleForGrouping` accepts (movies, tvshows, untyped), and
 /// returns each as a [`SpecialViewOptionDto`] `{ Name, Id }`, id rendered as a
 /// dashless guid and the list ordered by name. A folder that is not a configured
@@ -170,7 +170,9 @@ async fn get_grouping_options(
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
-    let folders = state.user_views.get_user_views(user_id).await?;
+    // Grouping options come from root libraries, independently of which home
+    // views the user hid (`MyMediaExcludes`).
+    let folders = state.user_views.get_media_folders(user_id).await?;
     let by_id = collection_types_by_id(&state).await?;
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()
@@ -196,11 +198,9 @@ async fn get_user_views_for_user(
     state: State<AppState>,
     auth: RequireAuth,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    Query(mut query): Query<UserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let query = UserViewsQuery {
-        user_id: Some(user_id),
-        include_hidden: false,
-    };
+    query.user_id = Some(user_id);
     get_user_views(state, auth, Query(query)).await
 }
 
