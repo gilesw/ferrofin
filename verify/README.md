@@ -113,8 +113,8 @@ Whether the library's remote fetchers are "on" is read from its saved metadata-d
 choices for the scratch items' kinds (a movie; or a series, its seasons and its episodes, as
 the choice is per kind): on when any of them ticks one, off when every one of them saved an
 empty choice. Otherwise it is unknown and the rows do not check provider requests: a kind
-with no saved choice follows the server-wide one, and OMDb ticked alone asks nothing unless
-the server has an OMDb key, which the script cannot see.
+with no saved choice follows the server-wide one. OMDb ticked alone counts as on
+because it now uses a shared API key by default.
 
 In a TV library the rows check for 0 provider requests, whatever the fetchers, on every row
 but the first. An episode's (and a season's) remote lookup starts from its series' provider
@@ -144,7 +144,7 @@ scans do. They cover:
 - a passing run, and one with a failing row (exit 1);
 - a movies library with its fetchers on and one with them off, each with the row that must
   fail when a request is missing or stray;
-- OMDb ticked alone (unknown, not "on"), with every scratch NFO checked for the fields the
+- OMDb ticked alone ("on" with its shared key), with every scratch NFO checked for the fields the
   enriched checks read;
 - a TV library with its fetchers on (every row but the first expects 0), a stray episode
   request, a scratch series that matched a real show (the run stops after row 1), and one

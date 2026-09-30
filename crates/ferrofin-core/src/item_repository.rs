@@ -2724,6 +2724,80 @@ mod tests {
     use ferrofin_model::entities::ExtraType;
     use ferrofin_traits::persistence::ItemPersistenceService;
 
+    #[tokio::test]
+    async fn parental_rating_filters_lists_counts_and_linked_containers() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let mut user = seed_user_with_defaults(&db, Uuid::from_u128(0xAB10)).await;
+        user.max_parental_rating_score = Some(10);
+        user.max_parental_rating_sub_score = Some(1);
+        let ids: Vec<_> = (0xAB20..0xAB25).map(Uuid::from_u128).collect();
+        for (id, score, subscore) in [
+            (ids[0], Some(9_i64), Some(9_i64)),
+            (ids[1], Some(10), Some(1)),
+            (ids[2], Some(10), Some(2)),
+            (ids[3], Some(17), None),
+            (ids[4], None, None),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, "Synthetic rating case").await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue"=?,
+                "InheritedParentalRatingSubValue"=? WHERE "Id"=?"#,
+            )
+            .bind(score)
+            .bind(subscore)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .unwrap();
+        }
+        seed_library_over(&db, &ids).await;
+        let query = InternalItemsQuery {
+            user: Some(user.clone()),
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        let rows = repository.get_items(&query).await.unwrap();
+        assert_eq!(rows.total_record_count, 3);
+        for id in [ids[0], ids[1], ids[4]] {
+            assert!(rows.items.iter().any(|row| row.id == guid_to_db(id)));
+        }
+        let collection = Uuid::from_u128(0xAB30);
+        seed_named_item(
+            &db,
+            collection,
+            BaseItemKind::BoxSet,
+            "Synthetic restricted collection",
+        )
+        .await;
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "TopParentId" =
+            (SELECT "TopParentId" FROM "BaseItems" WHERE "Id"=?) WHERE "Id"=?"#,
+        )
+        .bind(guid_to_db(ids[0]))
+        .bind(guid_to_db(collection))
+        .execute(db.writer())
+        .await
+        .unwrap();
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        links
+            .upsert_linked_child(collection, ids[3], 0)
+            .await
+            .unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            include_item_types: vec![BaseItemKind::BoxSet],
+            ..Default::default()
+        };
+        assert!(repository.get_item_list(&query).await.unwrap().is_empty());
+        links
+            .upsert_linked_child(collection, ids[0], 0)
+            .await
+            .unwrap();
+        assert_eq!(repository.get_item_list(&query).await.unwrap().len(), 1);
+    }
+
     #[rstest::rstest]
     #[case("Élodie", "él", true)]
     #[case("ΟΣ", "οσ", true)]
