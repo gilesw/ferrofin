@@ -13,6 +13,7 @@ from metadata import CheckError
 from preservation import compare, normalize, validate, same_artwork, verify_database
 from synthetic_fixture import USERS
 from unchanged_scan import TABLES, audit, assert_unchanged, check
+from test_user_accounts import fixture as account_fixture
 
 
 class WriteAuditTest(unittest.TestCase):
@@ -115,8 +116,10 @@ class WriteAuditTest(unittest.TestCase):
 
 class FixtureValidationTest(unittest.TestCase):
     def setUp(self):
-        self.manifest = {'allowed_movie': 'allowed', 'rated_movie': 'rated', 'private_movie': 'private'}
+        accounts_manifest, accounts = account_fixture()
+        self.manifest = {**accounts_manifest, 'allowed_movie': 'allowed', 'rated_movie': 'rated', 'private_movie': 'private'}
         self.data = {
+            'accounts': accounts,
             'visibility': {USERS[1]: ['allowed', 'rated', 'private'], USERS[2]: ['allowed']},
             'manual': {'LockData': True, 'LockedFields': ['Name']},
             'custom_artwork': {'size': [100, 150], 'rgb': [0, 255, 255]},

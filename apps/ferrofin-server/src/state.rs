@@ -670,6 +670,7 @@ pub async fn build_app_state(
         Arc::new(FerrofinActivityManager::new(db.clone()));
     let users_impl = Arc::new(
         FerrofinUserManager::new(db.clone())
+            .with_image_processor(Arc::clone(&image_processor))
             .with_server_id(server_id.clone())
             .with_profile_image_dir(
                 std::path::PathBuf::from(paths.internal_metadata_path()).join("users"),

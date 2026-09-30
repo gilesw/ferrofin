@@ -162,6 +162,11 @@ adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
 adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
 ```
 
+Full adoption validation requires **both** `adoption/run.sh` and the
+[synthetic preservation matrix](#running-the-synthetic-matrix). The original
+runner does not invoke `adoption/synthetic.py`; use separate fixture directories
+and run both against the same Ferrofin image.
+
 Output is one line per generation:
 
 ```
@@ -297,13 +302,16 @@ It neither reads nor modifies a personal media server.
 The fixture has five movie titles (one with two versions), one extra, one series
 with two seasons and six episodes, and six music tracks across two artists and
 two albums. One album spans two discs. English subtitle files accompany every
-movie and episode. Three users provide an administrator, an adult with access to
-every library, and a child with a library restriction and a maximum parental
-rating. Downloads and deletion are disabled for both non-administrator accounts.
+movie and episode. Seven users provide an administrator, an adult with access to
+every library, a child with library/parental restrictions, an administratively
+disabled account, an account locked by failed logins, a passwordless account, and
+a dedicated account with populated policy and configuration settings. Downloads
+and deletion are disabled for the adult and child accounts. Each user has a
+distinct generated avatar.
 
 | Category | Checks |
 |---|---|
-| User permissions | Preserve policies; compare adult/child browse visibility; reject cross-user history reads/writes, disabled downloads, and disabled deletion. |
+| User permissions | Compare complete policies/configuration and stored account rows; compare adult/child browse visibility; reject cross-user history reads/writes, disabled downloads, and disabled deletion. |
 | Playlists and collections | Compare exact membership, playlist order, owner and sharing; verify a shared reader can read but cannot edit, and cannot read a private playlist. |
 | Manual metadata | Preserve a changed title, description, sort title, genres, chosen provider IDs, whole-item/field locks, and uploaded artwork. |
 | Settings | Preserve audio/subtitle preferences, subtitle download languages and skip rules, provider selections and ordering, and library options. |
@@ -324,6 +332,45 @@ resume/Next Up entries, music must contain the expected tracks/albums/artists,
 and versions, extras, playlist/collection membership, and subtitles must exist.
 Image comparisons allow small decoder rounding differences in the generated
 solid colors. They still reject a different image or dimensions.
+
+### User-account preservation
+
+Every stage compares the complete `Policy` and `Configuration` objects for every
+synthetic user. There is no field allowlist: newly returned fields automatically
+join the comparison. The settings account currently covers **44 policy fields**
+and **16 configuration fields**, with populated schedules, ordered library
+preferences, tag restrictions, device/channel/folder selections, bitrate/session
+limits, and a selected cast receiver. Fields Jellyfin itself leaves at defaults
+are compared at those defaults.
+
+The account checks also verify:
+
+- The exact account list, original user IDs/names, and public-user visibility.
+- Password login for the original administrator, adult, and child; an empty
+  password for the passwordless account; and usable tokens for those same IDs.
+- Disabled and locked accounts reject both correct and incorrect passwords.
+  Lockout counters and disabled flags remain unchanged.
+- Every user's avatar decodes to the expected pixels and dimensions without
+  authentication, as on Jellyfin's login screen. User responses advertise an
+  image tag, so clients know an avatar exists.
+- Stable data in `Users`, `Permissions`, `Preferences`, `AccessSchedules`, and
+  `ImageInfos` remains unchanged. Reports contain hashes of these rows, including
+  password-bearing rows, rather than exposing their contents. Login/activity
+  timestamps are excluded because the login probes advance them. EF bookkeeping
+  and the derived `NormalizedUsername` migration column are also excluded.
+  Detached permissions/preferences with no user are excluded because migration
+  `0032` removes them. Losing an attached row or its owner still fails the check.
+
+Account states are created through Jellyfin's APIs. The locked account is locked
+by actual failed logins, and each login uses its own synthetic device identity
+so switching test users cannot invalidate the administrator's session.
+
+The harness now has **29 Bats tests**, including **88 Python tests**:
+26 metadata, 13 watch-history, 23 preservation, and 26 user-account tests.
+The account tests deliberately remove or alter account rows, passwords,
+lockout counters, permissions, ordered preferences, schedules, avatar tags and
+images, and login identities/tokens to verify that the checks fail. They also
+verify that unlisted future policy/configuration fields are compared.
 
 ### Running the synthetic matrix
 
@@ -360,7 +407,7 @@ The synthetic harness regression tests run through `bats adoption/tests`, along
 with the original metadata and watch-history tests. The live Docker matrix is a
 separate command, so routine CI does not encode or scan these fixtures.
 
-### Synthetic matrix validation
+### Initial synthetic matrix validation
 
 On **2026-09-29**, all seven source paths passed every preservation category,
 including music, against their own Jellyfin baselines:
@@ -434,3 +481,72 @@ servers used the host's available CPUs without the loaded run's CPU restriction:
 This checks ordinary listing latency, including artist-link resolution, without
 the loaded run's request backlog. It is a local comparison on a shared host;
 it does not establish a release speedup or replace a valid loaded benchmark.
+
+### Expanded user-account validation
+
+On **2026-09-29**, freshly rebuilt fixtures with all seven account scenarios
+passed **all seven source paths × four stages** again: adoption, restart,
+completed scan, and unchanged second scan. Each path compared all 44 policy
+fields and 16 configuration fields, account rows, original login identities,
+disabled/locked login denials, public visibility, and all seven avatars against
+its own Jellyfin baseline. The existing metadata, history, music, permissions,
+relationships, and unchanged-scan checks also passed.
+
+The correctness image was `ferrofin:adoption-accounts`, image ID
+`sha256:25ce362d1f0ec254bb547f91a6ec95218542ad77be5ea143fb51bb1c0d653176`.
+It used the existing Jellyfin FFmpeg and web assets. All new accounts and images
+were generated; the personal-library fixtures and production server were not
+modified.
+
+These checks exposed missing profile-image tags and unauthenticated avatar
+access, plus incorrect disabled/locked login responses and changing lockout
+counters. Ferrofin now advertises avatars, serves them on the login screen,
+invalidates cached user responses after avatar changes, and rejects disabled
+logins with HTTP 403 without changing the lockout counter.
+
+Validation passed **7,350 workspace tests** (five skipped), three doctests,
+**29 Bats tests**, and **88 Python tests** (26 metadata, 13 watch-history,
+23 preservation, 26 user-account). API line coverage was **86.20%** and core
+line coverage was **94.10%**. Formatting, workspace Clippy, ShellCheck, and
+shell syntax checks passed.
+
+The preceding `ferrofin:adoption-preservation` image and this image were measured
+with `bench/run.sh --servers ferrofin --only loaded --rate 1` on the larger
+generated library. Both used server CPUs `6,22`, client CPUs `7,23`, a 30-second
+warmup, and a 120-second window. Both passed the 90% idle preflight. The baseline
+completed 120 iterations and the updated build 121, with zero dropped iterations
+or failed screen loads in either run.
+
+| Screen median (ms) | Before | After |
+|---|---:|---:|
+| Home | 120 | 120 |
+| Movies | 1,130 | 1,094 |
+| Detail | 940 | 921 |
+| Series | 268 | 271 |
+| Search | 1,244 | 1,230 |
+| Playback | 33 | 35 |
+
+These are single debug-build runs on a shared host. CPU interference at p95 was
+20% before and 19% after; home-screen p99 was 249 ms before and 422 ms after.
+The measurements support comparison of ordinary request costs, while tail
+latency needs repeated runs to separate code effects from host variation.
+
+A separate serial HTTP comparison used fresh copies of the seven-account
+synthetic fixture, 50 requests per operation after five warmups, and the host's
+available CPUs. Requests checked the expected status, user identity, account
+count, or avatar dimensions. Avatar requests used authentication in both builds because the
+baseline incorrectly rejected anonymous reads. For uncached user responses,
+saving the same policy cleared the cache before each timed request.
+
+| Account operation, median / p95 (ms) | Before | After |
+|---|---:|---:|
+| List seven users | 1.25 / 1.71 | 1.44 / 3.59 |
+| Current user, cached | 0.66 / 0.79 | 0.57 / 0.71 |
+| Avatar, including decoding | 0.95 / 1.16 | 1.28 / 3.05 |
+| Password login | 2,233.42 / 2,261.02 | 2,209.38 / 2,237.30 |
+| Current user, uncached | 1.05 / 1.18 | 0.95 / 2.19 |
+
+Password timings include verification of the same Jellyfin password hashes in
+debug builds. The user-list and avatar medians increased by 0.20 ms and 0.33 ms;
+cached and uncached current-user medians decreased. These measurements use the
+same shared host as the screen comparison above.

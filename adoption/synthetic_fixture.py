@@ -23,15 +23,16 @@ LIBRARIES = (("Synthetic Movies", "movies", "movies"),
 
 
 class Api:
-    def __init__(self, base, token=None, user=None):
+    def __init__(self, base, token=None, user=None, device=None):
         self.base, self.token, self.user = base.rstrip("/"), token, user
+        self.device = device or f"synthetic-{user or 'setup'}"
 
     def call(self, method, path, body=None, allowed=(200, 204), raw=None, binary=False, **query):
         query = {key: value for key, value in query.items() if value is not None}
         url = self.base + path + ("?" + urllib.parse.urlencode(query) if query else "")
         data = raw if raw is not None else json.dumps(body).encode() if body is not None else None
         auth = ('MediaBrowser Client="Jellyfin Web", Device="Synthetic adoption", '
-                f'DeviceId="synthetic-{self.user or "setup"}", Version="1"')
+                f'DeviceId="{self.device}", Version="1"')
         if self.token:
             auth += f', Token="{self.token}"'
         headers = {"Authorization": auth}
@@ -69,8 +70,9 @@ class Api:
     def login(self, name):
         for attempt in range(60):
             try:
-                response = self.post("/Users/AuthenticateByName", {"Username": name, "Pw": PASSWORD})
-                return Api(self.base, response["AccessToken"], response["User"]["Id"])
+                device = "synthetic-login-" + name
+                response = Api(self.base, device=device).post("/Users/AuthenticateByName", {"Username": name, "Pw": PASSWORD})
+                return Api(self.base, response["AccessToken"], response["User"]["Id"], device=device)
             except OSError:
                 # Jellyfin may restart once after an upgrade. Authentication is
                 # safe to retry; fixture mutations are deliberately not retried.
@@ -193,10 +195,14 @@ def seed(base):
     # The normal add-members action settles membership after creation finishes.
     api.post(f"/Collections/{collection}/Items", ids=",".join([movies["Amber Harbor"]["Id"], movie]))
     api.idle()
-    return {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
+    manifest = {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
             "libraries": {name: row["ItemId"] for name, row in libraries.items()},
             "locked_movie": movie, "allowed_movie": movies["Amber Harbor"]["Id"],
             "rated_movie": movies["Crimson Signal"]["Id"],
             "private_movie": movies["Hidden Meadow"]["Id"],
             "versions_movie": movies["Twin Horizon"]["Id"],
             "playlist": playlist, "private_playlist": private_playlist, "collection": collection}
+
+    from user_accounts import seed as seed_accounts
+    seed_accounts(api, manifest)
+    return manifest

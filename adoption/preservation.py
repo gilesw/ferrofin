@@ -15,10 +15,6 @@ from metadata import CheckError
 from synthetic_fixture import USERS
 
 
-POLICY = ("IsAdministrator", "MaxParentalRating", "EnableAllFolders", "EnabledFolders",
-          "EnableContentDownloading", "EnableContentDeletion", "EnableRemoteControlOfOtherUsers")
-CONFIGURATION = ("AudioLanguagePreference", "SubtitleLanguagePreference", "SubtitleMode",
-                 "PlayDefaultAudioTrack", "RememberAudioSelections", "RememberSubtitleSelections")
 LIBRARY_OPTIONS = ("PreferredMetadataLanguage", "MetadataCountryCode", "SubtitleDownloadLanguages",
                    "RequirePerfectSubtitleMatch", "SaveSubtitlesWithMedia", "SkipSubtitlesIfAudioTrackMatches",
                    "SkipSubtitlesIfEmbeddedSubtitlesPresent", "DisabledSubtitleFetchers",
@@ -59,12 +55,10 @@ def artwork(api, item):
 
 def snapshot(admin, manifest):
     """Use authenticated users for permissions and views, not an admin impersonation."""
-    result = {"version": 1, "policies": {}, "configuration": {}, "libraries": {},
+    result = {"version": 1, "libraries": {},
               "visibility": {}, "denials": {}, "views": {}, "playlists": {}}
-    for name, uid in manifest["users"].items():
-        user = admin.get(f"/Users/{uid}")
-        result["policies"][name] = select(user["Policy"], POLICY)
-        result["configuration"][name] = select(user["Configuration"], CONFIGURATION)
+    from user_accounts import snapshot as account_snapshot
+    result["accounts"] = account_snapshot(admin, manifest)
     for library in admin.get("/Library/VirtualFolders"):
         if library["Name"] in manifest["libraries"]:
             result["libraries"][library["Name"]] = select(library["LibraryOptions"], LIBRARY_OPTIONS)
@@ -126,6 +120,8 @@ def snapshot(admin, manifest):
 
 def validate(data, manifest):
     """A missing test scenario is a build failure, never a silently skipped check."""
+    from user_accounts import validate as validate_accounts
+    validate_accounts(data["accounts"], manifest)
     m = normalize(manifest)
     child, adult = data["visibility"][USERS[2]], data["visibility"][USERS[1]]
     checks = {
@@ -221,6 +217,7 @@ def run_matrix(root, image, only, port):
     from synthetic import VERSIONS, server, recipe
     import metadata
     import watch_history
+    import user_accounts
     failures = []
     for name, _, _ in VERSIONS:
         if only and only != name:
@@ -240,6 +237,7 @@ def run_matrix(root, image, only, port):
         shutil.copytree(source, work)
         db = work / "data/jellyfin.db"
         history = watch_history.snapshot(db)
+        accounts_before = user_accounts.database_snapshot(db)
         metadata_before = metadata.snapshot(db)
         with server(image, work, root / "media", "synthetic-adoption", port, ferrofin=True) as api:
             api = api.login(USERS[0])
@@ -265,6 +263,7 @@ def run_matrix(root, image, only, port):
                     verify_boot(work, name, stage, previous_logs)
                 actual = snapshot(api, manifest)
                 changed = compare(expected, actual)
+                changed += user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db))
                 changed += list(watch_history.compare_db(history, watch_history.snapshot(db)))
                 changed += list(watch_history.compare_api(history, metadata.Api(api.base, db)))
                 changed += list(metadata.compare(metadata_before, metadata.snapshot(db), "database"))

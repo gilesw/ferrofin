@@ -34,7 +34,7 @@ VERSIONS = (
 def recipe():
     directory = Path(__file__).parent
     return hashlib.sha256(b"".join((directory / name).read_bytes() for name in (
-        "synthetic.py", "synthetic_media.py", "synthetic_fixture.py", "preservation.py"))).hexdigest()
+        "synthetic.py", "synthetic_media.py", "synthetic_fixture.py", "preservation.py", "user_accounts.py"))).hexdigest()
 
 
 def save(path, data):

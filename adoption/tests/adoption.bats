@@ -285,3 +285,8 @@ EOS
   run python3 -m unittest discover -s "$ADOPTION/tests" -p test_preservation.py
   [ "$status" -eq 0 ]
 }
+
+@test "user accounts: avatars, login states and complete settings survive adoption" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_user_accounts.py
+  [ "$status" -eq 0 ]
+}
