@@ -1568,31 +1568,33 @@ pub fn shift_audio_codecs_if_needed(codecs: &mut [String], audio_stream: Option<
     } else {
         &["ac3", "eac3"]
     };
-    shift_codecs_to_end(codecs, shift);
+    shift_codecs_to_end(codecs, |c| shift.iter().any(|s| c.eq_ignore_ascii_case(s)));
+}
+
+/// Whether `options` forbid encoding to the video `codec`: HEVC (`hevc`/`h265`)
+/// unless `AllowHevcEncoding`, AV1 unless `AllowAv1Encoding`.
+#[must_use]
+pub fn is_video_encoding_disallowed(codec: &str, options: &EncodingOptions) -> bool {
+    (!options.allow_hevc_encoding
+        && (codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")))
+        || (!options.allow_av1_encoding && codec.eq_ignore_ascii_case("av1"))
 }
 
 /// Moves video codecs the server is not allowed to encode to the end of the
 /// client's preference list.
 ///
-/// Port of `EncodingHelper.ShiftVideoCodecsIfNeeded`: HEVC unless
-/// `AllowHevcEncoding`, AV1 unless `AllowAv1Encoding`.
+/// Port of `EncodingHelper.ShiftVideoCodecsIfNeeded`; see
+/// [`is_video_encoding_disallowed`].
 pub fn shift_video_codecs_if_needed(codecs: &mut [String], options: &EncodingOptions) {
     if codecs.len() < 2 {
         return;
     }
-    let mut shift = Vec::new();
-    if !options.allow_hevc_encoding {
-        shift.extend(["hevc", "h265"]);
-    }
-    if !options.allow_av1_encoding {
-        shift.push("av1");
-    }
-    shift_codecs_to_end(codecs, &shift);
+    shift_codecs_to_end(codecs, |c| is_video_encoding_disallowed(c, options));
 }
 
-/// Rotates leading members of `shift` to the end, unless every codec is in it.
-fn shift_codecs_to_end(codecs: &mut [String], shift: &[&str]) {
-    let shifted = |c: &String| shift.iter().any(|s| c.eq_ignore_ascii_case(s));
+/// Rotates leading codecs matching `shifted` to the end, unless every codec does.
+fn shift_codecs_to_end(codecs: &mut [String], shifted: impl Fn(&str) -> bool) {
+    let shifted = |c: &String| shifted(c);
     if codecs.iter().all(shifted) {
         return;
     }
