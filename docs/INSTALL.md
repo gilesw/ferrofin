@@ -10,7 +10,7 @@ Jellyfin's own apt repository.
 | `/usr/bin/ferrofin-server` | the binary (the `.deb` puts it here) |
 | `/etc/ferrofin/config.toml` | configuration ([`docs/CONFIG.md`](CONFIG.md)); a conffile, never overwritten on upgrade |
 | `/lib/systemd/system/ferrofin.service` | the unit ([`contrib/systemd/ferrofin.service`](../contrib/systemd/ferrofin.service)) |
-| `/var/lib/ferrofin/data` | `jellyfin.db`, `cache/` (transcodes), `log/`, `plugins/`, `config/` |
+| `/var/lib/ferrofin` | `jellyfin.db`, `cache/` (transcodes), `log/`, `plugins/`, `config/` |
 | `/usr/lib/jellyfin-ffmpeg/` | jellyfin-ffmpeg (`ffmpeg`, `ffprobe`), from the `jellyfin-ffmpeg8` package |
 | `/usr/share/jellyfin/web/` | jellyfin-web's built client, from the `jellyfin-web` package, served at `/web` |
 
@@ -48,7 +48,7 @@ curl -fsSLO "https://github.com/mangoleaf/ferrofin/releases/download/v$V/ferrofi
 sudo apt-get install -y "./ferrofin_${V}_$A.deb"
 ```
 
-The package creates the `ferrofin` system user and `/var/lib/ferrofin/data`, installs the
+The package creates the `ferrofin` system user and `/var/lib/ferrofin`, installs the
 unit, and **does not enable or start it**: configure a password or be ready to complete
 the web setup wizard on first boot. Give the `ferrofin` user read access to your
 media, typically by adding it to the group that owns the library. Keep the service stopped
@@ -68,7 +68,7 @@ sha256sum -c "ferrofin-$V-$T.tar.gz.sha256"
 tar xzf "ferrofin-$V-$T.tar.gz"
 sudo install -m 755 "ferrofin-$V-$T/ferrofin-server" /usr/local/bin/ferrofin-server
 sudo useradd --system --user-group --home /var/lib/ferrofin --shell /usr/sbin/nologin ferrofin
-sudo install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin /var/lib/ferrofin/data
+sudo install -d -o ferrofin -g ferrofin -m 0750 /var/lib/ferrofin
 sudo install -d /etc/ferrofin
 sudo install -o root -g ferrofin -m 640 contrib/debian/config.toml /etc/ferrofin/config.toml
 sudo install -m 644 contrib/systemd/ferrofin.service /etc/systemd/system/ferrofin.service
@@ -84,20 +84,10 @@ fresh-install or migration procedure below before starting it.
 
 ## 3. The unit
 
-The unit runs with `ProtectSystem=strict`: the filesystem is read-only except
-`/var/lib/ferrofin/data`. Scans and playback only read media, so that is enough for most
-installs. If you enable deleting items or saving metadata/images into the library from the
-UI, add that library to `ReadWritePaths=` in a drop-in:
-
-```sh
-sudo systemctl edit ferrofin      # opens an override; add:
-# [Service]
-# ReadWritePaths=/srv/media
-```
-
-For VAAPI/QSV hardware transcoding uncomment the `DeviceAllow=` and
-`SupplementaryGroups=` lines the same way. The unit names ffmpeg, ffprobe and the web
-client explicitly through `FERROFIN_FFMPEG_PATH`, `FERROFIN_FFPROBE_PATH` and
+The unit runs as the `ferrofin` user with no extra sandboxing, like Jellyfin's own unit.
+It adds the `render` group (`SupplementaryGroups=render`) so VAAPI/QSV transcoding can open
+`/dev/dri/renderD*` without changing the user's group membership. The unit names ffmpeg, ffprobe
+and the web client explicitly through `FERROFIN_FFMPEG_PATH`, `FERROFIN_FFPROBE_PATH` and
 `FERROFIN_WEB_DIR`, because systemd's `PATH` does not include `/usr/lib/jellyfin-ffmpeg`
 and discovery would otherwise land on Debian's `/usr/bin/ffmpeg`.
 
