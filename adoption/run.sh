@@ -12,8 +12,9 @@
 #   3. PRAGMA integrity_check / foreign_key_check are clean on the adopted file;
 #   4. a second boot runs no repair and changes no answer;
 #   5. populated metadata survives both boots and an explicit library scan (DB + HTTP).
-# One PASS/FAIL line per fixture; exit status is non-zero if any failed. Roughly two minutes
-# plus a full scan per fixture. Fixtures are NOT in the repository — see adoption/README.md for what DIR
+#   6. watch history survives each stage for every user (DB + HTTP).
+# One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
+# includes two boots and a full scan. Fixtures are NOT in the repository — see adoption/README.md for what DIR
 # must contain and how build-fixtures.sh derives everything from one 10.11.8 snapshot.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +23,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
-  -h|--help) sed -n 2,16p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,18p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
 WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work}
@@ -61,6 +62,14 @@ metadata_check() {
   else
     printf 'PASS metadata %s\n' "$stage" > "$log"
   fi
+  log=$dst.watch-history-${stage// /-}.log
+  if ! result=$(python3 "$HERE/watch_history.py" check "$dst/data/jellyfin.db" "$dst.watch-history.json" \
+      --base-url "http://127.0.0.1:$port" 2>&1); then
+    printf '%s\n' "${result:-check failed}" > "$log"
+    why+=("watch history $stage: ${result:-check failed}")
+  else
+    printf 'PASS watch history %s\n' "$stage" > "$log"
+  fi
 }
 failed=0
 for spec in "${FIXTURE_TABLE[@]}"; do
@@ -72,6 +81,11 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"
   if ! baseline=$(python3 "$HERE/metadata.py" snapshot "$dst/data/jellyfin.db" "$dst.metadata.json" 2>&1); then
     printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "metadata baseline: $baseline"
+    failed=1
+    continue
+  fi
+  if ! baseline=$(python3 "$HERE/watch_history.py" snapshot "$dst/data/jellyfin.db" "$dst.watch-history.json" 2>&1); then
+    printf '%-5s %-9s %-28s %s\n' FAIL "$expected" "$src" "watch history baseline: $baseline"
     failed=1
     continue
   fi

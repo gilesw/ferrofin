@@ -53,6 +53,8 @@ with exit status 0. Later server changes require rerunning this matrix.
    library scan. Both SQLite and the HTTP item responses are checked. A scan must
    produce a new successful completion record; an idle task or an old successful
    result does not pass this check.
+6. Each user's watch history remains unchanged at all three stages, in both the
+   database and movie/episode API responses, including watched flags and progress.
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
 It checks overview, original title, tagline, community/critic ratings, official rating,
@@ -73,6 +75,21 @@ pass. Artwork records, descriptions and ratings are
 still checked for every original item, including items outside the artwork sample.
 The source must contain at least one movie with both an overview and a provider ID,
 so an empty or filename-only fixture cannot pass.
+
+Watch history is also captured before startup and checked after adoption, restart,
+and the completed scan. Every existing `UserData` row must survive unchanged,
+including provider-keyed rows and history belonging to other users. Database checks
+cover all item types. API checks cover every movie and episode with stored history,
+for every user: watched flags, play counts, resume positions, last-played dates, and
+favorites must match the original fixture. Hidden alternate versions are checked
+through their detail endpoints. These checks do not sample watch history.
+Fixtures must include both watched videos and videos with resume progress, so an
+empty history cannot make the gate pass.
+
+The private watch-history baseline stores hashes of database rows and provider
+keys, plus user/item UUIDs and the playback fields needed for API checks. It has
+owner-only permissions, contains no titles or media paths, and stays outside the
+repository. Failure messages contain field names and counts only.
 
 Only fixture copies are scanned; source snapshots remain untouched. All media mounts
 must resolve for the scan, which can otherwise remove unavailable items. The scan
@@ -163,6 +180,8 @@ A `FAIL` line names every check that failed and points at the diff; the copy is 
 `work/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` and the metadata
 presence baseline `<name>.metadata.json` beside it. The per-stage
 `<name>.metadata-after-{adoption,restart,scan}.log` files record the metadata results.
+Watch-history baselines and results use the corresponding `.watch-history.json`
+and `.watch-history-after-{adoption,restart,scan}.log` filenames.
 
 ## Tests
 
@@ -175,7 +194,12 @@ invented library rows and a local HTTP server: partial/total metadata loss, miss
 items, empty baselines, optional fields, valid updates, WAL visibility, HTTP failures,
 batched API reads, scan completion/failure/timeout handling, reproducible artwork
 sampling, corrupt image responses and description/rating loss. Bats invokes these
-Python tests, so CI runs them too. CI runs the Bats tests with `bats adoption/tests`
+Python tests, so CI runs them too. `tests/test_watch_history.py` checks unchanged
+history, changes to each playback field, deleted provider-keyed rows, progress for
+another user, unwatched-to-watched changes, missing API history, hidden versions,
+date/GUID normalization, private baselines, fixtures missing watched/resume data, and
+failure reporting. Its fixtures contain only invented IDs and playback data.
+CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
 
@@ -246,3 +270,18 @@ The regression tests include explicit database and post-scan API checks for miss
 descriptions and ratings, corrupt images, stable sampling and decoder failures.
 Committed test data is synthetic; real snapshots and reports remain local and
 excluded from Git.
+
+## Watch-history gate validation
+
+On **2026-09-29**, all seven fixture paths listed above passed the expanded suite
+with watch-history checks after adoption, restart, and a completed scan. The run
+used fresh fixture copies and the same `ferrofin:adoption-metadata-23` correctness
+image described above. Every stage compared against the original Jellyfin history;
+the database check covered every stored user-data row, and the API check covered
+every movie/episode with stored history for every user.
+
+All **27 Bats harness tests** passed, including **26 metadata tests** and **13 new
+watch-history tests**, along with ShellCheck and shell syntax checks. Deliberately
+clearing watched flags and resume positions in synthetic data made both database
+and API checks fail. No production server or source fixture was scanned or modified
+by this validation.

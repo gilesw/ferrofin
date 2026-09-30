@@ -45,6 +45,8 @@ adoption/work/
 adoption/fixtures/
 **/*.metadata.json
 **/*.metadata-after-*.log
+**/*.watch-history.json
+**/*.watch-history-after-*.log
 **/*.boot.log
 **/*.boot2.log
 **/*.server.log

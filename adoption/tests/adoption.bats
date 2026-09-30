@@ -265,6 +265,11 @@ EOS
   [ "$status" -eq 0 ]
 }
 
+@test "watch history: watched flags and video progress survive in database and API" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_watch_history.py
+  [ "$status" -eq 0 ]
+}
+
 @test "run.sh: an unreadable metadata baseline fails before starting a container" {
   fake_docker
   mkdir -p fixtures/oracle fixtures/jellyfin-12.0/data
