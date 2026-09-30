@@ -1487,8 +1487,8 @@ impl FerrofinDtoService {
     ///
     /// Port of the `_libraryManager.GetGenreId`/`GetStudioId`/… helpers, which
     /// hash-map a clean value to a stable id; here the stored `ItemValues` row
-    /// already carries that id, so a lookup keyed by `(Type, CleanValue)`
-    /// suffices.
+    /// carries the fallback id. Adopted music libraries can have a distinct
+    /// physical artist row, so artist links must prefer that browsable item's id.
     async fn resolve_value_ids(
         &self,
         clean_pairs: &[(i32, String)],
@@ -1510,8 +1510,15 @@ impl FerrofinDtoService {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                r#"SELECT "Type", "CleanValue", "ItemValueId" FROM "ItemValues"
-                   WHERE ("Type", "CleanValue") IN ({ph})"#,
+                r#"SELECT iv."Type", iv."CleanValue",
+                   CASE WHEN iv."Type" IN (0, 1) THEN COALESCE(
+                       (SELECT artist."Id" FROM "BaseItems" artist
+                        WHERE artist."Type" = 'MediaBrowser.Controller.Entities.Audio.MusicArtist'
+                          AND artist."CleanName" = iv."CleanValue"
+                        ORDER BY artist."SortName", artist."Id" LIMIT 1), iv."ItemValueId")
+                   ELSE iv."ItemValueId" END
+                   FROM "ItemValues" iv
+                   WHERE (iv."Type", iv."CleanValue") IN ({ph})"#,
             );
             let mut query = sqlx::query_as::<_, (i32, String, String)>(sqlx::AssertSqlSafe(sql));
             for (t, clean) in chunk {
@@ -7978,6 +7985,34 @@ mod tests {
         assert_eq!(people.len(), 1);
         assert_eq!(people[0].name.as_deref(), Some("Leonardo DiCaprio"));
         assert_eq!(people[0].type_, ferrofin_model::data::PersonKind::Actor);
+    }
+
+    #[tokio::test]
+    async fn adopted_artist_links_use_the_existing_artist_item() {
+        let db = test_db().await;
+        let artist = Uuid::from_u128(0xAB40);
+        crate::test_support::seed_named_item(
+            &db,
+            artist,
+            BaseItemKind::MusicArtist,
+            "Synthetic artist",
+        )
+        .await;
+        crate::test_support::set_clean_name(&db, artist, "Synthetic artist").await;
+        let clean = crate::text_util::get_clean_value("Synthetic artist");
+        for kind in [
+            ferrofin_db::enums::ItemValueType::Artist,
+            ferrofin_db::enums::ItemValueType::AlbumArtist,
+        ] {
+            crate::test_support::seed_item_value(&db, artist, kind, "Synthetic artist").await;
+        }
+        let svc = service(db);
+        let map = svc
+            .resolve_value_ids(&[(0, clean.clone()), (1, clean.clone())])
+            .await
+            .unwrap();
+        assert_eq!(map[&0][&clean], artist);
+        assert_eq!(map[&1][&clean], artist);
     }
 
     #[tokio::test]

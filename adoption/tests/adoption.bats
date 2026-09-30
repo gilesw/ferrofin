@@ -280,3 +280,8 @@ EOS
   [[ "$output" == *"metadata baseline: metadata check could not read"* ]]
   [[ "$output" != *"unexpected docker run"* ]]
 }
+
+@test "synthetic adoption checks detect missing scenarios, changed membership and redundant writes" {
+  run python3 -m unittest discover -s "$ADOPTION/tests" -p test_preservation.py
+  [ "$status" -eq 0 ]
+}

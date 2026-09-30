@@ -285,3 +285,152 @@ watch-history tests**, along with ShellCheck and shell syntax checks. Deliberate
 clearing watched flags and resume positions in synthetic data made both database
 and API checks fail. No production server or source fixture was scanned or modified
 by this validation.
+
+## Synthetic preservation fixture
+
+The original library snapshot does not need parental controls, playlists, manual
+edits, or music. `synthetic.py` builds a separate, small fixture through Jellyfin's
+own setup, library, user, metadata, and playlist APIs. It uses invented accounts,
+titles, tags, provider IDs, solid-color images, silent video, and generated tones.
+It neither reads nor modifies a personal media server.
+
+The fixture has five movie titles (one with two versions), one extra, one series
+with two seasons and six episodes, and six music tracks across two artists and
+two albums. One album spans two discs. English subtitle files accompany every
+movie and episode. Three users provide an administrator, an adult with access to
+every library, and a child with a library restriction and a maximum parental
+rating. Downloads and deletion are disabled for both non-administrator accounts.
+
+| Category | Checks |
+|---|---|
+| User permissions | Preserve policies; compare adult/child browse visibility; reject cross-user history reads/writes, disabled downloads, and disabled deletion. |
+| Playlists and collections | Compare exact membership, playlist order, owner and sharing; verify a shared reader can read but cannot edit, and cannot read a private playlist. |
+| Manual metadata | Preserve a changed title, description, sort title, genres, chosen provider IDs, whole-item/field locks, and uploaded artwork. |
+| Settings | Preserve audio/subtitle preferences, subtitle download languages and skip rules, provider selections and ordering, and library options. |
+| Relationships | Preserve series/season/episode links, alternate media sources, extras, artist/album/track links, and disc/track numbers. |
+| Derived views | Compare Continue Watching and Next Up item order, and series/season watched flags and unplayed counts for both users. |
+| Unchanged second scan | SQLite triggers detect even same-value updates and identical delete/reinsert operations; provider counters and subtitle file hashes detect repeated requests, changed files, or duplicate subtitle files. |
+| Music | Compare track, album and artist metadata and relationships, decode album covers, and preserve an ordered shared music playlist and stored favorites. |
+
+Every stage compares against that **source version's Jellyfin responses**:
+initial adoption, restart, a completed scan, and an unchanged second scan. The
+existing database/API metadata, artwork, and watch-history checks also run at
+every stage. Database integrity, expected adoption generation, and repair-free
+restart checks remain in place.
+
+The builder refuses to accept an empty scenario: restricted items must actually
+be hidden, the uploaded image must be the chosen image, both users must have
+resume/Next Up entries, music must contain the expected tracks/albums/artists,
+and versions, extras, playlist/collection membership, and subtitles must exist.
+Image comparisons allow small decoder rounding differences in the generated
+solid colors. They still reject a different image or dimensions.
+
+### Running the synthetic matrix
+
+Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
+`/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
+FFmpeg installation is needed. Docker must be available to the invoking user.
+Use a fresh fixture directory outside the checkout:
+
+```bash
+python3 adoption/synthetic.py build --fixtures /path/to/synthetic-fixtures
+docker build -t ferrofin:bench .
+python3 adoption/synthetic.py run --fixtures /path/to/synthetic-fixtures --image ferrofin:bench
+```
+
+The seven version/upgrade paths are the same as the original adoption matrix.
+Each upgraded Jellyfin completes a scan before supplying its baseline. `--only`
+selects one named fixture; building an upgraded fixture requires its parent to
+have been built. `--port` changes the localhost-only test port (default 18120).
+The builder records a recipe hash and refuses to reuse a completed fixture after
+its recipe changes; build into a new directory then.
+
+The runner copies each source into `work/`, mounts generated media read-only,
+and blocks provider requests with an unreachable proxy. It configures an
+invented OpenSubtitles key in the disposable copy so a mistaken subtitle search
+is counted. Existing English subtitles should prevent those requests. There is
+no reliance on a paid account or a live provider response.
+
+A failed copy and its local reports remain for inspection. A successful copy is
+removed; the Jellyfin source remains available for another run. No fixture
+snapshots, media files, credentials, or per-item reports belong in Git.
+Adoption remains one-way: Jellyfin is never started against an adopted copy.
+
+The synthetic harness regression tests run through `bats adoption/tests`, along
+with the original metadata and watch-history tests. The live Docker matrix is a
+separate command, so routine CI does not encode or scan these fixtures.
+
+### Synthetic matrix validation
+
+On **2026-09-29**, all seven source paths passed every preservation category,
+including music, against their own Jellyfin baselines:
+
+| Fixture | Adoption | Restart | Completed scan | Unchanged second scan |
+|---|---|---|---|---|
+| `jellyfin-10.11.8` | PASS | PASS | PASS | PASS |
+| `jellyfin-10.11.9` | PASS | PASS | PASS | PASS |
+| `jellyfin-10.11.10` | PASS | PASS | PASS | PASS |
+| `jellyfin-10.11.11` | PASS | PASS | PASS | PASS |
+| `jellyfin-12.0` | PASS | PASS | PASS | PASS |
+| `jellyfin-12.1-from-10` | PASS | PASS | PASS | PASS |
+| `jellyfin-12.1-from-12` | PASS | PASS | PASS | PASS |
+
+The local correctness image was `ferrofin:adoption-preservation`, image ID
+`sha256:8e1fb626afc87277d264a04df1c14fb17eb18278d67339cedcbfe1f4e41d21ff`.
+It packaged the debug server with the existing test image's Jellyfin FFmpeg and
+web assets. Source fixtures were built through the actual Jellyfin releases;
+only disposable copies were adopted. The original personal-library fixtures
+and production server were not modified.
+
+The new scenarios exposed and verified fixes for ignored download/deletion
+permissions, missing maximum-parental-rating filtering, music artist links
+pointing at value IDs instead of artist items, and scans duplicating adopted
+alternate movie versions. A separate HTTP check verified that administrators
+with downloading explicitly disabled also cannot download the file.
+
+Validation also passed **7,347 workspace tests** (five skipped), three doctests,
+all **28 Bats harness tests**, and all **62 Python checks** invoked by the harness
+(26 metadata, 13 watch-history, 23 preservation). Core line coverage was **94.07%**
+and API line coverage was **86.19%**. Formatting, workspace Clippy, ShellCheck,
+and shell syntax checks passed.
+
+Allowed file downloads over local HTTP had a median of **1.76 ms before** and
+**1.53 ms after**, using 50 requests after five warmups on fresh copies of the
+same synthetic source. The restricted adult changed from an incorrect HTTP 200
+to HTTP 403, and an administrator with downloading explicitly disabled returned
+HTTP 400. These are local debug-build measurements, not release benchmarks.
+
+The larger generated benchmark fixture was also measured with
+`bench/run.sh --servers ferrofin --only loaded`, comparing the earlier
+`ferrofin:adoption-metadata-23` image with the correctness image above. Background
+load prevented the default CPU set from passing the 90% idle check. Both runs
+used server CPUs `6,22` and client CPUs `7,23`, which passed that same check.
+
+| Screen median (ms) | Before | After |
+|---|---:|---:|
+| Home | 292 | 293 |
+| Movies | 159 | 157 |
+| Detail | 35,997 | 37,669 |
+| Series | 28,201 | 29,887 |
+| Search | 31,302 | 32,641 |
+| Playback | 43 | 44 |
+
+**The loaded comparison is inconclusive:** these debug builds saturated the
+limited CPU allocation at five screens per second. The baseline dropped 31
+iterations and the updated build dropped 34, so these are not publishable
+performance results or evidence that loaded performance is unchanged.
+
+A separate serial HTTP comparison on that same larger generated library used
+30 requests after five warmups, requesting 100 items with overview, genre, and
+studio fields. Both builds returned identical page and total counts. These
+servers used the host's available CPUs without the loaded run's CPU restriction:
+
+| Listing median (ms) | Before | After |
+|---|---:|---:|
+| Movies | 45.95 | 39.06 |
+| Music albums | 33.23 | 27.47 |
+| Audio tracks | 42.75 | 37.50 |
+
+This checks ordinary listing latency, including artist-link resolution, without
+the loaded run's request backlog. It is a local comparison on a shared host;
+it does not establish a release speedup or replace a valid loaded benchmark.

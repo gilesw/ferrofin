@@ -3609,6 +3609,48 @@ impl LibraryScanner {
             .await
     }
 
+    /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
+    /// those rows by path before refreshing them, so the movie resolver cannot
+    /// create another item for a file that is already a linked version.
+    async fn reuse_adopted_video_versions(
+        &self,
+        planned: &mut [Planned],
+    ) -> Result<(), ServiceError> {
+        let paths: Vec<String> = planned
+            .iter()
+            .filter(|p| p.entity.type_.ends_with(".Movie"))
+            .filter_map(|p| p.entity.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let Some(rows) = self.persistence.items_at_paths(&paths).await? else {
+            return Ok(());
+        };
+        let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let versions: HashMap<String, ItemPathRow> = rows
+            .into_iter()
+            .filter(|row| row.item_type == "MediaBrowser.Controller.Entities.Video")
+            .filter_map(|row| Some((row.path.clone()?, row)))
+            .collect();
+        for item in planned {
+            if item.entity.type_.ends_with(".Movie")
+                && !existing.contains(&item.id)
+                && let Some(row) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| versions.get(path))
+            {
+                item.id = row.id;
+                item.entity.id = guid_to_db(row.id);
+                item.entity.type_.clone_from(&row.item_type);
+                item.entity.is_movie = false;
+            }
+        }
+        Ok(())
+    }
+
     /// The shared scan pipeline over an already-planned item set: probe +
     /// metadata + persistence per item, deleted-item pruning (restricted to
     /// `scope`'s roots when given), the `LibraryChanged` push, and the music
@@ -3645,7 +3687,7 @@ impl LibraryScanner {
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
         let PlanOutput {
-            items: planned,
+            items: mut planned,
             mut unlisted,
             inaccessible,
             date_added,
@@ -3669,6 +3711,7 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
+        self.reuse_adopted_video_versions(&mut planned).await?;
         let options = run.options;
         if let Some(touched) = run.touched {
             touched
