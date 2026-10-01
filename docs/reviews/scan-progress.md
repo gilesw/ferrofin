@@ -188,3 +188,11 @@ Raw results are `/tmp/ferrofin-scan-progress/web12-measure-{before,after}-{1,2,3
 
 All follow-up changes remain on `fix/scan-progress`; homelab deployment confirmation
 is still needed. The logging is intentionally temporary.
+
+
+## Diagnostic logging cleanup
+
+After homelab confirmation of full scans on the dashboard and individual scans on
+Home -> My Media, retained the three detailed progress/subscription diagnostics at
+DEBUG instead of INFO. Existing scan lifecycle and every-100-item INFO messages,
+WebSocket connection logs, and progress-publication warnings keep their levels.

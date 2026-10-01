@@ -398,9 +398,9 @@ async fn report_loop(
                     "RefreshStatus": update.status,
                 })
                 .to_string();
-                // Temporary diagnostics for #15: every timer sample, including
-                // zero/stalled counts, plus the ordered lifecycle transitions.
-                tracing::info!(
+                // Keep every timer sample, including stalled counts, available
+                // for debugging without adding noise to normal scan logs.
+                tracing::debug!(
                     library = %update.progress.library_id,
                     scan_id = update.progress.scan_id,
                     completed = update.progress.completed,

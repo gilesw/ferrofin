@@ -594,10 +594,10 @@ async fn handle_socket(
     );
 }
 
-/// Temporary #15 diagnostics for accepted and ignored task subscriptions.
+/// Debug diagnostics for accepted and ignored task subscriptions.
 fn log_task_subscription(inbound: Inbound, authenticated: bool) {
     if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
-        tracing::info!(
+        tracing::debug!(
             authenticated,
             subscribing = matches!(inbound, Inbound::TasksStart(_)),
             "dashboard task subscription requested"
@@ -814,13 +814,13 @@ async fn tasks_message(state: &AppState) -> Option<String> {
 }
 
 fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<String> {
-    // Temporary diagnostics for #15. This is the dashboard's task feed;
-    // RefreshProgress is a separate, per-library notification.
+    // The dashboard's task feed is distinct from per-library RefreshProgress.
+    // Keep these snapshots available for debugging subscription delivery.
     for task in &tasks {
         if task.key.as_deref() == Some("RefreshLibrary")
             && task.state != ferrofin_model::tasks::TaskState::Idle
         {
-            tracing::info!(
+            tracing::debug!(
                 task = "RefreshLibrary",
                 state = ?task.state,
                 progress = ?task.current_progress_percentage,
