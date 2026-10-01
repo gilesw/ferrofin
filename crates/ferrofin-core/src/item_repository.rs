@@ -3592,29 +3592,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_parent_matches_descendants_via_ancestor_closure() {
+    async fn recursive_parent_uses_library_scope_and_folder_ancestors() {
         let db = test_db().await;
         let repository = repo(&db);
         // library ─ series ─ episode. The episode is a direct child of the series,
-        // NOT of the library, but the library is in its ancestor closure.
+        // not of the library. Persist both its library scope and ancestor closure,
+        // as the scanner does; library queries use TopParentId, folder queries
+        // use the ancestor closure.
         let library = Uuid::from_u128(0xB001);
         let series = Uuid::from_u128(0xB002);
         let episode = Uuid::from_u128(0xB003);
         seed_named_item(&db, library, BaseItemKind::CollectionFolder, "TV").await;
         seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
         seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(series))
-            .bind(guid_to_db(library))
-            .execute(db.writer())
-            .await
-            .expect("series parent");
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(episode))
-            .bind(guid_to_db(series))
-            .execute(db.writer())
-            .await
-            .expect("episode parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("series parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("episode parent");
         for ancestor in [series, library] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
                 .bind(guid_to_db(episode))
@@ -3638,19 +3646,21 @@ mod tests {
                 .is_empty()
         );
 
-        // Recursive: the episode is reached through the ancestor closure.
-        let recursive = InternalItemsQuery {
-            parent_id: library,
-            recursive: true,
-            include_item_types: vec![BaseItemKind::Episode],
-            ..InternalItemsQuery::default()
-        };
-        let rows = repository
-            .get_item_list(&recursive)
-            .await
-            .expect("recursive");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, guid_to_db(episode));
+        // The library and its series both reach the episode recursively.
+        for parent_id in [library, series] {
+            let recursive = InternalItemsQuery {
+                parent_id,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Episode],
+                ..InternalItemsQuery::default()
+            };
+            let rows = repository
+                .get_item_list(&recursive)
+                .await
+                .expect("recursive");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, guid_to_db(episode));
+        }
     }
 
     #[tokio::test]
