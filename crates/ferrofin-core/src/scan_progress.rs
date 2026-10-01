@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ferrofin_traits::events::EventManager;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 
 use uuid::Uuid;
 
@@ -104,7 +105,10 @@ impl ScanProgressTracker {
     pub fn set_events(&self, events: Arc<dyn EventManager>) {
         self.reports.get_or_init(|| {
             let (tx, rx) = mpsc::unbounded_channel();
-            tokio::spawn(report_loop(Arc::downgrade(&self.state), rx, events));
+            tokio::spawn(
+                report_loop(Arc::downgrade(&self.state), rx, events)
+                    .instrument(tracing::info_span!(parent: None, "scan_progress_reporter")),
+            );
             tx
         });
     }
@@ -222,15 +226,15 @@ impl ScanProgressRun {
         let removed = state.runs.remove(&self.id).unwrap_or_default();
         let after = visible(&state);
         let updates = removed
-            .keys()
-            .filter_map(|id| {
+            .iter()
+            .filter_map(|(id, progress)| {
                 // A nested scan never clears the enclosing scan's indicator.
                 if before.get(id).is_none_or(|p| p.scan_id != self.id) {
                     return None;
                 }
                 Some(after.get(id).copied().map_or_else(
                     || Update {
-                        library: *id,
+                        progress: *progress,
                         percent: if completed { 100.0 } else { 0.0 },
                         status: "Idle",
                     },
@@ -309,7 +313,7 @@ fn visible(state: &State) -> BTreeMap<Uuid, LibraryScanProgress> {
 
 #[derive(Debug)]
 struct Update {
-    library: Uuid,
+    progress: LibraryScanProgress,
     percent: f64,
     status: &'static str,
 }
@@ -317,7 +321,7 @@ struct Update {
 impl Update {
     fn active(progress: LibraryScanProgress) -> Self {
         Self {
-            library: progress.library_id,
+            progress,
             percent: progress.percent(),
             status: if progress.phase == ScanPhase::Queued {
                 "Queued"
@@ -389,12 +393,26 @@ async fn report_loop(
         for report in batch {
             for update in report.updates {
                 let payload = serde_json::json!({
-                    "ItemId": update.library.simple().to_string(),
+                    "ItemId": update.progress.library_id.simple().to_string(),
                     "Progress": format!("{:.2}", update.percent),
                     "RefreshStatus": update.status,
                 })
                 .to_string();
-                let _ = events.publish("RefreshProgress", &payload).await;
+                // Temporary diagnostics for #15: every timer sample, including
+                // zero/stalled counts, plus the ordered lifecycle transitions.
+                tracing::info!(
+                    library = %update.progress.library_id,
+                    scan_id = update.progress.scan_id,
+                    completed = update.progress.completed,
+                    total = ?update.progress.total,
+                    phase = ?update.progress.phase,
+                    progress = update.percent,
+                    refresh_status = update.status,
+                    "publishing library scan progress"
+                );
+                if let Err(error) = events.publish("RefreshProgress", &payload).await {
+                    tracing::warn!(library = %update.progress.library_id, %error, "scan progress publication failed");
+                }
             }
             if let Some(delivered) = report.delivered {
                 let _ = delivered.send(());

@@ -74,8 +74,10 @@ async function api(path, body, method = body === undefined ? 'GET' : 'POST') {
     assert(response.ok, `${path}: ${response.status} ${text}`);
     return text ? JSON.parse(text) : null;
 }
-async function connect() {
-    const socket = new WebSocket(`ws://127.0.0.1:${port}/socket?api_key=${token}&deviceId=progress-check`);
+async function connect(legacy = false) {
+    // Web 12's SDK uses ApiKey without deviceId; legacy clients use api_key.
+    const query = legacy ? `api_key=${token}&deviceId=progress-check` : `ApiKey=${token}`;
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/socket?${query}`);
     sockets.push(socket);
     const frames = [];
     socket.addEventListener('message', event => {
@@ -84,7 +86,7 @@ async function connect() {
         if (frame.MessageType === 'ForceKeepAlive') socket.send(JSON.stringify({ MessageType: 'KeepAlive' }));
     });
     await once(socket, 'open');
-    socket.send(JSON.stringify({ MessageType: 'ScheduledTasksInfoStart', Data: '1000,1000' }));
+    socket.send(JSON.stringify({ MessageType: 'ScheduledTasksInfoStart', Data: legacy ? '1000,1000' : '0,1000' }));
     await until(() => frames.some(f => f.MessageType === 'ScheduledTasksInfo'), 'initial task snapshot');
     return { socket, frames };
 }
@@ -110,7 +112,9 @@ try {
         await until(async () => (await taskState()).State === 'Idle', 'task completion');
         assert.equal((await taskState()).LastExecutionResult.Status, 'Completed');
     };
-    const { socket, frames } = await connect();
+    // Measure both binaries using the legacy protocol; old binaries cannot
+    // authenticate the SDK socket whose regression the assertion runs cover.
+    const { socket, frames } = await connect(measure);
     frames.length = 0;
     if (!measure) await hold();
     const start = performance.now();
@@ -127,7 +131,7 @@ try {
         const live = await folderState();
         assert.equal(live.RefreshStatus, 'Active');
         assert.equal(live.RefreshProgress, 0);
-        const reconnect = await connect();
+        const reconnect = await connect(true);
         assert.equal(taskFrames(reconnect.frames)[0].State, 'Running');
         assert.equal(taskFrames(reconnect.frames)[0].CurrentProgressPercentage, 0);
         reconnect.socket.close();

@@ -216,12 +216,13 @@ fn header_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Extracts a query-string parameter value by exact key (no percent-decoding —
-/// access tokens are URL-safe hex).
+/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
+/// The host normalizes the SDK's `ApiKey` to `apiKey` before this handler.
+/// Values stay case-sensitive (no percent-decoding — tokens are URL-safe hex).
 fn query_param(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == key && !v.is_empty()).then(|| v.to_owned())
+        (k.eq_ignore_ascii_case(key) && !v.is_empty()).then(|| v.to_owned())
     })
 }
 
@@ -524,6 +525,7 @@ async fn handle_socket(
                         }
                     }
                     Action::Inbound(inbound) => {
+                        log_task_subscription(inbound, caller.is_some());
                         if caller.is_some() {
                             let message = update_task_subscription(&state, inbound, &mut task_updates).await;
                             if !send_optional(&mut socket, message, &overflowed).await {
@@ -590,6 +592,17 @@ async fn handle_socket(
         elapsed_s = started.elapsed().as_secs(),
         "websocket disconnected"
     );
+}
+
+/// Temporary #15 diagnostics for accepted and ignored task subscriptions.
+fn log_task_subscription(inbound: Inbound, authenticated: bool) {
+    if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
+        tracing::info!(
+            authenticated,
+            subscribing = matches!(inbound, Inbound::TasksStart(_)),
+            "dashboard task subscription requested"
+        );
+    }
 }
 
 async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
@@ -801,6 +814,20 @@ async fn tasks_message(state: &AppState) -> Option<String> {
 }
 
 fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<String> {
+    // Temporary diagnostics for #15. This is the dashboard's task feed;
+    // RefreshProgress is a separate, per-library notification.
+    for task in &tasks {
+        if task.key.as_deref() == Some("RefreshLibrary")
+            && task.state != ferrofin_model::tasks::TaskState::Idle
+        {
+            tracing::info!(
+                task = "RefreshLibrary",
+                state = ?task.state,
+                progress = ?task.current_progress_percentage,
+                "dashboard scan task snapshot"
+            );
+        }
+    }
     Some(envelope(
         "ScheduledTasksInfo",
         &serde_json::to_value(visible_tasks(tasks)).ok()?,
@@ -1035,11 +1062,19 @@ mod tests {
     }
 
     #[test]
-    fn query_param_extracts_by_exact_key() {
+    fn query_param_accepts_jellyfin_and_host_normalized_token_keys() {
         let q = Some("deviceId=dev1&api_key=abc123&x=1");
         assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
         assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
-        assert_eq!(query_param(q, "ApiKey"), None); // case-sensitive
+        assert_eq!(query_param(q, "ApiKey"), None); // underscore is significant
+        for key in ["ApiKey", "apiKey", "apikey", "APIKEY"] {
+            let query = format!("deviceId=dev1&{key}=aBc123&x=1");
+            assert_eq!(
+                query_param(Some(&query), "ApiKey").as_deref(),
+                Some("aBc123")
+            );
+        }
+        assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
         assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
         assert_eq!(query_param(None, "api_key"), None);
     }
