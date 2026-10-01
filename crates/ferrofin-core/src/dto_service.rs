@@ -74,7 +74,7 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserDataManager};
 use ferrofin_traits::options::{DtoOptions, ItemImageInfo};
-use ferrofin_traits::persistence::{ItemCountService, NameItemRow};
+use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
 
 use crate::db_error::db_err;
@@ -85,6 +85,8 @@ use crate::item_type_lookup::kind_from_type_name;
 /// for that item, not "not prefetched".
 #[derive(Default)]
 struct Prefetched {
+    /// Counts of owned extras, loaded only when either count field is requested.
+    extra_counts: HashMap<Uuid, ExtraCounts>,
     /// Image rows per item id (same order as [`FerrofinDtoService::load_images`]).
     images: HashMap<Uuid, Vec<ItemImageInfo>>,
     /// The requesting user's play-state per item id.
@@ -2420,10 +2422,24 @@ impl FerrofinDtoService {
             dto.enable_media_source_display = Some(true);
         }
         if options.contains_field(ItemFields::SpecialFeatureCount) {
-            dto.special_feature_count = Some(0); // no extras subsystem yet
+            dto.special_feature_count = Some(
+                prefetched
+                    .extra_counts
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .special_features,
+            );
         }
         if options.contains_field(ItemFields::LocalTrailerCount) {
-            dto.local_trailer_count = Some(0);
+            dto.local_trailer_count = Some(
+                prefetched
+                    .extra_counts
+                    .get(&item_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .local_trailers,
+            );
         }
 
         // Jellyfin emits an empty [] / {} for these when the field is requested but the item has
@@ -3558,6 +3574,13 @@ impl FerrofinDtoService {
         retrieved_by_id: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
+        let extra_counts = if options.contains_field(ItemFields::SpecialFeatureCount)
+            || options.contains_field(ItemFields::LocalTrailerCount)
+        {
+            self.item_counts.get_extra_counts_batch(&ids).await?
+        } else {
+            HashMap::new()
+        };
         let want_images =
             options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
         let want_user_data = user.is_some() && options.enable_user_data;
@@ -4083,6 +4106,7 @@ impl FerrofinDtoService {
             _ => None,
         };
         Ok(Prefetched {
+            extra_counts,
             images,
             user_data,
             media_streams,
@@ -5332,6 +5356,13 @@ mod tests {
 
     #[async_trait]
     impl ItemCountService for FakeCounts {
+        async fn get_extra_counts_batch(
+            &self,
+            _owner_ids: &[Uuid],
+        ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
+            Ok(HashMap::new())
+        }
+
         async fn get_count(
             &self,
             _filter: &ferrofin_traits::options::InternalItemsQuery,
@@ -5926,6 +5957,79 @@ mod tests {
             Arc::new(FakeChapters),
             Arc::new(FakeTrickplay),
         )
+    }
+
+    #[tokio::test]
+    async fn extra_counts_enable_client_controls_and_honor_field_selection() {
+        let db = test_db().await;
+        let owner = Uuid::new_v4();
+        let empty = Uuid::new_v4();
+        seed_named_item(&db, owner, BaseItemKind::Movie, "With extras").await;
+        seed_named_item(&db, empty, BaseItemKind::Movie, "Without extras").await;
+        // Every known extra type, plus owned non-extras and an invalid type.
+        // Unknown (0) is a special feature; theme media (8/9) are not.
+        for extra_type in (0..=12).map(Some).chain([None]) {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Video, "Extra").await;
+            let mut row = fetch_item(&db, id).await;
+            row.owner_id = Some(guid_to_db(owner));
+            row.extra_type = extra_type;
+            save_item(&db, &row).await;
+        }
+        let movie = fetch_item(&db, owner).await;
+        let empty_movie = fetch_item(&db, empty).await;
+        let mut svc = service(db.clone());
+        svc.item_counts = Arc::new(crate::FerrofinItemCountService::new(db));
+        let both = DtoOptions {
+            fields: vec![
+                ItemFields::SpecialFeatureCount,
+                ItemFields::LocalTrailerCount,
+            ],
+            ..DtoOptions::default()
+        };
+        let dtos = svc
+            .get_base_item_dtos(
+                &[movie.clone(), empty_movie, movie.clone()],
+                &both,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dtos[0].special_feature_count, Some(9));
+        assert_eq!(dtos[0].local_trailer_count, Some(1));
+        assert_eq!(dtos[1].special_feature_count, Some(0));
+        assert_eq!(dtos[1].local_trailer_count, Some(0));
+        assert_eq!(
+            dtos[2].special_feature_count,
+            Some(9),
+            "duplicate owner on a page"
+        );
+        assert_eq!(dtos[2].local_trailer_count, Some(1));
+        for (fields, special, trailers) in [
+            (vec![ItemFields::SpecialFeatureCount], Some(9), None),
+            (vec![ItemFields::LocalTrailerCount], None, Some(1)),
+            (vec![], None, None),
+        ] {
+            let dto = svc
+                .get_base_item_dto(
+                    &movie,
+                    &DtoOptions {
+                        fields,
+                        ..both.clone()
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(dto.special_feature_count, special);
+            assert_eq!(dto.local_trailer_count, trailers);
+            let json = serde_json::to_value(dto).unwrap();
+            assert_eq!(json.get("SpecialFeatureCount").is_some(), special.is_some());
+            assert_eq!(json.get("LocalTrailerCount").is_some(), trailers.is_some());
+        }
     }
 
     // A folder or a by-name item owns no chapter, stream, trickplay or
