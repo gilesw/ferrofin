@@ -166,3 +166,10 @@ regression. Earlier unpinned runs were noisy and are not used in this table.
 Harness: `/tmp/ferrofin-extras-count-perf-pinned.py`.
 Results: `/tmp/ferrofin-extras-count-perf-pinned/results.json`.
 Log: `/tmp/ferrofin-extras-count-perf-pinned.log`.
+
+
+## Follow-up
+
+The remaining cases identified here are addressed in the
+[extras parity follow-up](extras-parity-follow-up.md), including series/season
+extras, grouped owners, music videos, naming exceptions and web theme playback.
