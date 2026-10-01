@@ -5,7 +5,11 @@
 //! indicator while nested refreshes run; their counts are never added twice.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
+
+use ferrofin_traits::events::EventManager;
+use tokio::sync::{mpsc, oneshot};
 
 use uuid::Uuid;
 
@@ -60,15 +64,32 @@ struct State {
 #[derive(Clone, Debug, Default)]
 pub struct ScanProgressTracker {
     state: Arc<Mutex<State>>,
+    reports: Arc<OnceLock<mpsc::UnboundedSender<Report>>>,
 }
 
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl ScanProgressTracker {
+    /// Starts ordered event delivery. The timer is parked while no scans are active.
+    /// Clones share one reporter; it exits when the last tracker is dropped.
+    pub fn set_events(&self, events: Arc<dyn EventManager>) {
+        self.reports.get_or_init(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(report_loop(Arc::downgrade(&self.state), rx, events));
+            tx
+        });
+    }
+
+    fn send(&self, report: Report) {
+        if let Some(tx) = self.reports.get() {
+            let _ = tx.send(report);
+        }
+    }
+
     /// Registers a scan before its filesystem walk starts.
     #[must_use]
     pub fn begin(&self, libraries: impl IntoIterator<Item = Uuid>) -> ScanProgressRun {
@@ -102,29 +123,20 @@ impl ScanProgressTracker {
         ScanProgressRun {
             tracker: self.clone(),
             id,
+            finished: false,
         }
     }
 
     /// Reads the oldest active scan for a library, so nested work cannot reset it.
     #[must_use]
     pub fn library(&self, library_id: Uuid) -> Option<LibraryScanProgress> {
-        lock(&self.state)
-            .runs
-            .values()
-            .find_map(|run| run.get(&library_id).copied())
+        visible(&lock(&self.state)).get(&library_id).copied()
     }
 
     /// Reads the visible progress for every active library in one snapshot.
     #[must_use]
     pub fn libraries(&self) -> Vec<LibraryScanProgress> {
-        let state = lock(&self.state);
-        let mut libraries = BTreeMap::new();
-        for run in state.runs.values() {
-            for (&id, progress) in run {
-                libraries.entry(id).or_insert(*progress);
-            }
-        }
-        libraries.into_values().collect()
+        visible(&lock(&self.state)).into_values().collect()
     }
 }
 
@@ -133,16 +145,62 @@ impl ScanProgressTracker {
 pub struct ScanProgressRun {
     tracker: ScanProgressTracker,
     id: u64,
+    finished: bool,
 }
 
 impl ScanProgressRun {
     /// Marks queued work active before planning begins.
     pub fn activate(&self) {
-        if let Some(run) = lock(&self.tracker.state).runs.get_mut(&self.id) {
+        let mut state = lock(&self.tracker.state);
+        if let Some(run) = state.runs.get_mut(&self.id) {
             for progress in run.values_mut() {
                 progress.phase = ScanPhase::Planning;
             }
         }
+        self.tracker.send(Report::active(&state));
+    }
+
+    /// Waits for the start event to be published before processing any items.
+    pub async fn started(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.tracker.send(Report {
+            updates: Vec::new(),
+            delivered: Some(tx),
+        });
+        let _ = rx.await;
+    }
+
+    /// Publishes terminal state and waits for its delivery to the event seam.
+    pub async fn finish(mut self, completed: bool) {
+        let (tx, rx) = oneshot::channel();
+        self.remove(completed, Some(tx));
+        let _ = rx.await;
+    }
+
+    fn remove(&mut self, completed: bool, delivered: Option<oneshot::Sender<()>>) {
+        self.finished = true;
+        let mut state = lock(&self.tracker.state);
+        let before = visible(&state);
+        let removed = state.runs.remove(&self.id).unwrap_or_default();
+        let after = visible(&state);
+        let updates = removed
+            .keys()
+            .filter_map(|id| {
+                // A nested scan never clears the enclosing scan's indicator.
+                if before.get(id).is_none_or(|p| p.scan_id != self.id) {
+                    return None;
+                }
+                Some(after.get(id).copied().map_or_else(
+                    || Update {
+                        library: *id,
+                        percent: if completed { 100.0 } else { 0.0 },
+                        status: "Idle",
+                    },
+                    Update::active,
+                ))
+            })
+            .collect();
+        self.tracker.send(Report { updates, delivered });
     }
 
     /// Sets the denominator once planning finishes; libraries with no items remain.
@@ -188,7 +246,113 @@ impl ScanProgressRun {
 
 impl Drop for ScanProgressRun {
     fn drop(&mut self) {
-        lock(&self.tracker.state).runs.remove(&self.id);
+        if !self.finished {
+            self.remove(false, None);
+        }
+    }
+}
+
+fn visible(state: &State) -> BTreeMap<Uuid, LibraryScanProgress> {
+    let mut libraries = BTreeMap::new();
+    for run in state.runs.values() {
+        for (&id, progress) in run {
+            let current = libraries.entry(id).or_insert(*progress);
+            if current.phase == ScanPhase::Queued && progress.phase != ScanPhase::Queued {
+                *current = *progress;
+            }
+        }
+    }
+    libraries
+}
+
+#[derive(Debug)]
+struct Update {
+    library: Uuid,
+    percent: f64,
+    status: &'static str,
+}
+
+impl Update {
+    fn active(progress: LibraryScanProgress) -> Self {
+        Self {
+            library: progress.library_id,
+            percent: progress.percent(),
+            status: if progress.phase == ScanPhase::Queued {
+                "Queued"
+            } else {
+                "Active"
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Report {
+    updates: Vec<Update>,
+    delivered: Option<oneshot::Sender<()>>,
+}
+
+impl Report {
+    fn active(state: &State) -> Self {
+        Self {
+            updates: visible(state).into_values().map(Update::active).collect(),
+            delivered: None,
+        }
+    }
+}
+
+/// Lifecycle reports and periodic samples share one ordered delivery loop.
+/// Drain lifecycle changes under the same lock used to capture a tick, so a
+/// sample cannot overtake its start event or follow a newer terminal event.
+async fn report_loop(
+    state: std::sync::Weak<Mutex<State>>,
+    mut rx: mpsc::UnboundedReceiver<Report>,
+    events: Arc<dyn EventManager>,
+) {
+    let mut timer = tokio::time::interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer.tick().await;
+    let mut active = false;
+    loop {
+        let mut batch = Vec::new();
+        let tick = tokio::select! {
+            biased;
+            report = rx.recv() => {
+                let Some(report) = report else { break };
+                batch.push(report);
+                false
+            }
+            _ = timer.tick(), if active => true,
+        };
+        {
+            let Some(state) = state.upgrade() else { break };
+            let state = lock(&state);
+            while let Ok(report) = rx.try_recv() {
+                batch.push(report);
+            }
+            let was_active = active;
+            active = !state.runs.is_empty();
+            if !was_active && active {
+                timer.reset();
+            }
+            if tick && active {
+                batch.push(Report::active(&state));
+            }
+        }
+        for report in batch {
+            for update in report.updates {
+                let payload = serde_json::json!({
+                    "ItemId": update.library.simple().to_string(),
+                    "Progress": format!("{:.2}", update.percent),
+                    "RefreshStatus": update.status,
+                })
+                .to_string();
+                let _ = events.publish("RefreshProgress", &payload).await;
+            }
+            if let Some(delivered) = report.delivered {
+                let _ = delivered.send(());
+            }
+        }
     }
 }
 
@@ -196,6 +360,47 @@ impl Drop for ScanProgressRun {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ticks_publish_counts_while_work_is_stalled_and_finish_is_immediate() {
+        let events = Arc::new(crate::event_manager::FerrofinEventManager::new());
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = Arc::clone(&seen);
+        events.subscribe(
+            "RefreshProgress",
+            Arc::new(move |payload| {
+                lock(&sink).push(serde_json::from_str(payload).unwrap());
+                crate::event_manager::consumer_done()
+            }),
+        );
+        let tracker = ScanProgressTracker::default();
+        tracker.set_events(events);
+        let library = Uuid::new_v4();
+        let run = tracker.begin([library]);
+        run.started().await;
+        assert_eq!(lock(&seen)[0]["Progress"], "0.00");
+        assert_eq!(lock(&seen)[0]["RefreshStatus"], "Active");
+        run.planned([(library, 300)]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&seen).last().unwrap()["Progress"], "0.00");
+        for _ in 0..100 {
+            run.advance(library);
+        }
+        let count = lock(&seen).len();
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&seen).len(), count, "item 100 does not publish");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&seen).last().unwrap()["Progress"], "33.33");
+        run.finish(false).await;
+        assert_eq!(lock(&seen).last().unwrap()["RefreshStatus"], "Idle");
+        assert_eq!(lock(&seen).last().unwrap()["Progress"], "0.00");
+        let count = lock(&seen).len();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&seen).len(), count, "no ticks after stopping");
+    }
 
     #[test]
     fn counts_and_cleanup_follow_the_owning_scan() {

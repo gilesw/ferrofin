@@ -1423,6 +1423,8 @@ pub struct ScanRun<'a> {
     pub cancel: &'a ScanCancel,
     /// Where the scan reports its progress, if anywhere.
     pub progress: Option<&'a ScanProgress>,
+    /// The library indicator counters owned by this scan.
+    tracking: Option<&'a crate::scan_progress::ScanProgressRun>,
     /// Which closing passes it runs.
     pub passes: ScanPasses,
     /// The item refreshes it serves while it runs, if any.
@@ -1458,6 +1460,7 @@ impl<'a> ScanRun<'a> {
             ancestors,
             cancel,
             progress: None,
+            tracking: None,
             passes: ScanPasses::Library,
             lane: None,
             touched: None,
@@ -2496,46 +2499,6 @@ impl<'a> Stored<'a> {
     }
 }
 
-/// Per-library done/total counters driving the `RefreshProgress` pushes.
-struct LibraryProgress {
-    /// Planned items per collection folder.
-    totals: HashMap<Uuid, usize>,
-    /// Items processed so far per collection folder.
-    done: HashMap<Uuid, usize>,
-}
-
-impl LibraryProgress {
-    /// Tallies each library's planned item count. An item's library is the
-    /// first entry of its ancestor closure (always the collection folder).
-    fn new(planned: &[Planned]) -> Self {
-        let mut totals: HashMap<Uuid, usize> = HashMap::new();
-        for item in planned {
-            if let Some(&cf) = item.ancestors.first() {
-                *totals.entry(cf).or_default() += 1;
-            }
-        }
-        Self {
-            totals,
-            done: HashMap::new(),
-        }
-    }
-
-    /// Counts `item` as processed. Returns the library id and its completion
-    /// percentage when a progress push is due — at every `cadence` items
-    /// within the library (`0` disables the cadence) and at the library's
-    /// completion — or `None` between pushes.
-    fn advance(&mut self, item: &Planned, cadence: usize) -> Option<(Uuid, f64)> {
-        let cf = *item.ancestors.first()?;
-        let done = self.done.entry(cf).or_default();
-        *done += 1;
-        let total = self.totals.get(&cf).copied().unwrap_or(0).max(1);
-        let complete = *done >= total;
-        let at_cadence = cadence > 0 && done.is_multiple_of(cadence);
-        #[allow(clippy::cast_precision_loss)]
-        (complete || at_cadence).then(|| (cf, (*done as f64 / total as f64) * 100.0))
-    }
-}
-
 /// How many descendant images feed a library tile collage — upstream
 /// `CollectionFolderImageProvider.GetItemsWithImages` samples 8.
 const LIBRARY_COLLAGE_SOURCES: i32 = 8;
@@ -2637,7 +2600,7 @@ pub struct LibraryScanner {
     progress_every: usize,
     /// Optional domain-event seam. When present the scan publishes
     /// `LibraryChanged` (added/removed items, at scan end) and `RefreshProgress`
-    /// (per-library %, at the progress cadence) — the composition root forwards
+    /// (per-library %, once per second) — the composition root forwards
     /// both to client sessions over the WebSocket, which is how open clients
     /// refresh their views after a scan. Absent in unit tests that don't
     /// exercise events.
@@ -2760,6 +2723,9 @@ impl LibraryScanner {
         mut self,
         tracker: crate::scan_progress::ScanProgressTracker,
     ) -> Self {
+        if let Some(events) = &self.events {
+            tracker.set_events(Arc::clone(events));
+        }
         self.scan_progress = tracker;
         self
     }
@@ -2882,6 +2848,7 @@ impl LibraryScanner {
     /// `RefreshProgress` (forwarded to client sessions by the composition root).
     #[must_use]
     pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.scan_progress.set_events(Arc::clone(&events));
         self.events = Some(events);
         self
     }
@@ -3235,6 +3202,7 @@ impl LibraryScanner {
             let planned = TouchedIds::default();
             let served = ScanRun {
                 progress: None,
+                tracking: None,
                 lane: None,
                 touched: Some(&planned),
                 ..ScanRun::new(&refresh.options, &refresh.ancestors, &refresh.cancel)
@@ -3290,6 +3258,14 @@ impl LibraryScanner {
         let widen = *options == MetadataRefreshOptions::default();
         let folders = self.scoped_folders(only, widen).await?;
         let all_folders = self.virtual_folders.get_virtual_folders().await?;
+        let tracking = self
+            .scan_progress
+            .begin(folders.iter().filter_map(collection_folder_id));
+        tracking.started().await;
+        let run = ScanRun {
+            tracking: Some(&tracking),
+            ..run
+        };
         // One library at a time (sync: `NamingOptions` never crosses an
         // await), serving the lane between two: the walk writes nothing, so
         // a refresh served here needs nothing read again. Every library of
@@ -3301,7 +3277,10 @@ impl LibraryScanner {
         };
         for library in folders.chunks(1) {
             if run.cancel.is_cancelled() {
-                return Ok(ScanOutcome::default());
+                return Ok(ScanOutcome {
+                    stopped: true,
+                    ..ScanOutcome::default()
+                });
             }
             Box::pin(self.serve_lane(run)).await;
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
@@ -3310,9 +3289,16 @@ impl LibraryScanner {
             plan.inaccessible.extend(part.inaccessible);
         }
         if run.cancel.is_cancelled() {
-            return Ok(ScanOutcome::default());
+            return Ok(ScanOutcome {
+                stopped: true,
+                ..ScanOutcome::default()
+            });
         }
-        self.run_scan(&folders, &all_folders, plan, None, run).await
+        let result = self.run_scan(&folders, &all_folders, plan, None, run).await;
+        tracking
+            .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
+            .await;
+        result
     }
 
     /// Scans the library monitor's reported `changed` filesystem paths —
@@ -3582,8 +3568,19 @@ impl LibraryScanner {
             return Ok(ScanOutcome::default());
         }
         if run.cancel.is_cancelled() {
-            return Ok(ScanOutcome::default());
+            return Ok(ScanOutcome {
+                stopped: true,
+                ..ScanOutcome::default()
+            });
         }
+        let tracking = self
+            .scan_progress
+            .begin(affected.iter().filter_map(collection_folder_id));
+        tracking.started().await;
+        let run = ScanRun {
+            tracking: Some(&tracking),
+            ..run
+        };
         // Only the roots' subtrees, the folders above them and the item at
         // `also_path` are resolved — never a walk of the whole library.
         let started = std::time::Instant::now();
@@ -3618,8 +3615,13 @@ impl LibraryScanner {
             pathless: Some(&pathless),
             ..scope
         };
-        self.run_scan(&affected, &folders, plan, Some(scope), run)
-            .await
+        let result = self
+            .run_scan(&affected, &folders, plan, Some(scope), run)
+            .await;
+        tracking
+            .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
+            .await;
+        result
     }
 
     /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
@@ -3737,9 +3739,15 @@ impl LibraryScanner {
                 }));
         }
         log_scan_planned(planned.len(), folders.len(), options);
-        // Per-library progress accounting for the `RefreshProgress` pushes: how
-        // many planned items each library has, and how many are done so far.
-        let mut library_progress = LibraryProgress::new(&planned);
+        if let Some(tracking) = run.tracking {
+            let mut totals = HashMap::new();
+            for item in &planned {
+                if let Some(&library) = item.ancestors.first() {
+                    *totals.entry(library).or_default() += 1;
+                }
+            }
+            tracking.planned(totals);
+        }
         // Item ids that did not exist before this scan (→ `ItemsAdded` in the
         // scan-end `LibraryChanged` push). Only tracked when events are wired.
         let mut items_added: Vec<&Planned> = Vec::new();
@@ -3830,8 +3838,10 @@ impl LibraryScanner {
             // refreshed (`superseded_copies`). Nothing is written for it.
             if refresh.superseded.contains(&scanned) {
                 outcome.unchanged += 1;
-                if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                    self.publish_refresh_progress(cf, pct).await;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
                 }
                 continue;
             }
@@ -3865,8 +3875,10 @@ impl LibraryScanner {
                 }
                 log_scoped_item(item, "context", false);
                 outcome.unchanged += 1;
-                if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                    self.publish_refresh_progress(cf, pct).await;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
                 }
                 continue;
             }
@@ -3964,12 +3976,15 @@ impl LibraryScanner {
                         .await);
                 }
             }
-            // Per-library refresh % for open dashboards (`RefreshProgress`),
-            // at the same bounded cadence as the progress log plus each
-            // library's completion.
-            if let Some((cf, pct)) = library_progress.advance(item, self.progress_every) {
-                self.publish_refresh_progress(cf, pct).await;
+            // The independent timer samples these counters once per second.
+            if let Some(tracking) = run.tracking
+                && let Some(&library) = item.ancestors.first()
+            {
+                tracking.advance(library);
             }
+        }
+        if let Some(tracking) = run.tracking {
+            tracking.finalizing();
         }
         run.report(96.0);
         // A cancellation that landed during the last item skips the pruning
@@ -5724,23 +5739,6 @@ impl LibraryScanner {
             }
         }
         Ok(folders)
-    }
-
-    /// Publishes one library's refresh percentage as a `RefreshProgress` event
-    /// (the C# `RefreshProgressMessage` dictionary shape: string values).
-    /// No-op without an event seam.
-    async fn publish_refresh_progress(&self, library: Uuid, pct: f64) {
-        let Some(events) = &self.events else {
-            return;
-        };
-        // `LibraryChangedNotifier`: the id in Jellyfin's guid spelling (N form) —
-        // jellyfin-web compares it with the card's `data-id` as a plain string.
-        let payload = serde_json::json!({
-            "ItemId": library.simple().to_string(),
-            "Progress": format!("{pct:.2}"),
-        })
-        .to_string();
-        let _ = events.publish("RefreshProgress", &payload).await;
     }
 
     /// Publishes the scan's net changes as a `LibraryChanged` event carrying a
