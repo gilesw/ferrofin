@@ -6073,12 +6073,12 @@ mod tests {
         trailer.owner_id = Some(guid_to_db(alternate));
         trailer.extra_type = Some(2);
         save_item(&db, &trailer).await;
-        sqlx::query(
-            "INSERT INTO LinkedChildren (ParentId, ChildId, ChildType, SortOrder) VALUES (?,?,3,0)",
+        ferrofin_traits::persistence::LinkedChildrenService::upsert_linked_child(
+            &crate::FerrofinLinkedChildrenService::new(db.clone()),
+            primary,
+            alternate,
+            3,
         )
-        .bind(guid_to_db(primary))
-        .bind(guid_to_db(alternate))
-        .execute(db.pool())
         .await
         .unwrap();
         let counts = Arc::new(crate::FerrofinItemCountService::new(db.clone()));

@@ -3708,12 +3708,6 @@ mod tests {
         }
         let store = FerrofinItemPersistenceService::new(db.clone());
         store.save_items(&items).await.unwrap();
-        sqlx::query(
-            "UPDATE BaseItems SET PresentationUniqueKey='same-series' WHERE Type LIKE '%.Series'",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
         let mgr = manager(&db).with_virtual_folders(vf.clone());
         let id = Uuid::parse_str(&items[0].id).unwrap();
         let got = mgr.get_extra_owner_ids_batch(&items).await.unwrap();

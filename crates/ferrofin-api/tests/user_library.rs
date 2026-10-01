@@ -356,6 +356,7 @@ impl LibraryManager for StubLibrary {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use ferrofin_model::entities::ExtraType;
         if !query.extra_types.is_empty() {
             assert_eq!(
                 query.owner_ids,
@@ -364,7 +365,6 @@ impl LibraryManager for StubLibrary {
             );
         }
         // Trailer vs special-feature extras are distinguished by extra_types.
-        use ferrofin_model::entities::ExtraType;
         if query.extra_types.contains(&ExtraType::Trailer) {
             Ok(vec![item_entity(
                 TRAILER_ID,
