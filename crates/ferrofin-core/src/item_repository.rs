@@ -2202,6 +2202,15 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(exists.is_some())
     }
 
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+        grouped_series: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        crate::extra_owners_repository::get_extra_owner_ids_batch(&self.db, items, grouped_series)
+            .await
+    }
+
     async fn get_items_by_primary_version(
         &self,
         primary_id: Uuid,

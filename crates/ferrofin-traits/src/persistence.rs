@@ -211,6 +211,22 @@ pub trait ItemRepository: Send + Sync {
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Batch extra owners for video versions and the series allowed to group.
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+        grouped_series: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        let _ = grouped_series;
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, vec![id]))
+            })
+            .collect())
+    }
+
     /// The library ids `user` is allowed to see — the collection folders and
     /// views left after `BlockedMediaFolders`, `EnableAllFolders` and
     /// `EnabledFolders` are applied.

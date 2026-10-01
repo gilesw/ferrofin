@@ -3577,7 +3577,28 @@ impl FerrofinDtoService {
         let extra_counts = if options.contains_field(ItemFields::SpecialFeatureCount)
             || options.contains_field(ItemFields::LocalTrailerCount)
         {
-            self.item_counts.get_extra_counts_batch(&ids).await?
+            let owners = self.library.get_extra_owner_ids_batch(items).await?;
+            let physical: Vec<Uuid> = owners
+                .values()
+                .flatten()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let counts = self.item_counts.get_extra_counts_batch(&physical).await?;
+            owners
+                .into_iter()
+                .map(|(id, owners)| {
+                    let mut total = ExtraCounts::default();
+                    for owner in owners {
+                        if let Some(count) = counts.get(&owner) {
+                            total.special_features += count.special_features;
+                            total.local_trailers += count.local_trailers;
+                        }
+                    }
+                    (id, total)
+                })
+                .collect()
         } else {
             HashMap::new()
         };
@@ -6030,6 +6051,70 @@ mod tests {
             assert_eq!(json.get("SpecialFeatureCount").is_some(), special.is_some());
             assert_eq!(json.get("LocalTrailerCount").is_some(), trailers.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn extra_counts_include_linked_owners_once_for_every_version() {
+        let db = test_db().await;
+        let primary = Uuid::new_v4();
+        let alternate = Uuid::new_v4();
+        let extra = Uuid::new_v4();
+        for (id, kind) in [
+            (primary, BaseItemKind::Movie),
+            (alternate, BaseItemKind::Movie),
+            (extra, BaseItemKind::Trailer),
+        ] {
+            seed_named_item(&db, id, kind, "Item").await;
+        }
+        let mut version = fetch_item(&db, alternate).await;
+        version.primary_version_id = Some(guid_to_db(primary));
+        save_item(&db, &version).await;
+        let mut trailer = fetch_item(&db, extra).await;
+        trailer.owner_id = Some(guid_to_db(alternate));
+        trailer.extra_type = Some(2);
+        save_item(&db, &trailer).await;
+        sqlx::query(
+            "INSERT INTO LinkedChildren (ParentId, ChildId, ChildType, SortOrder) VALUES (?,?,3,0)",
+        )
+        .bind(guid_to_db(primary))
+        .bind(guid_to_db(alternate))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let counts = Arc::new(crate::FerrofinItemCountService::new(db.clone()));
+        let library = Arc::new(crate::FerrofinLibraryManager::new(
+            Arc::new(crate::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            )),
+            counts.clone(),
+            Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+            Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
+        ));
+        let mut svc = service_with(db.clone(), library);
+        svc.item_counts = counts;
+        let primary_row = fetch_item(&db, primary).await;
+        let dtos = svc
+            .get_base_item_dtos(
+                &[primary_row.clone(), version, primary_row],
+                &DtoOptions {
+                    fields: vec![
+                        ItemFields::SpecialFeatureCount,
+                        ItemFields::LocalTrailerCount,
+                    ],
+                    ..Default::default()
+                },
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(
+            dtos.iter()
+                .all(|dto| dto.local_trailer_count == Some(1)
+                    && dto.special_feature_count == Some(0))
+        );
     }
 
     // A folder or a by-name item owns no chapter, stream, trickplay or
