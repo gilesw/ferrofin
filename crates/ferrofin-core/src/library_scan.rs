@@ -2115,6 +2115,8 @@ struct PlanCtx<'a> {
     scope: PlanScope<'a>,
     /// The directories that failed to list this pass.
     unlisted: std::cell::RefCell<Vec<String>>,
+    /// Paths confirmed excluded by successfully listed discovery entries.
+    excluded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
     /// The library locations of the pass (without a trailing slash).
@@ -2132,6 +2134,7 @@ impl<'a> PlanCtx<'a> {
             naming,
             scope,
             unlisted: std::cell::RefCell::new(Vec::new()),
+            excluded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
@@ -2182,6 +2185,8 @@ fn trimmed_dir(dir: &str) -> &str {
 struct PlanOutput {
     /// The planned items, in plan order.
     items: Vec<Planned>,
+    /// Successfully observed paths the discovery rules exclude.
+    excluded: Vec<String>,
     /// Paths needed to reuse adopted alternate-version owner identities.
     owner_paths: HashMap<Uuid, String>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
@@ -3299,6 +3304,7 @@ impl LibraryScanner {
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
             plan.owner_paths.extend(part.owner_paths);
+            plan.excluded.extend(part.excluded);
             plan.unlisted.extend(part.unlisted);
             plan.inaccessible.extend(part.inaccessible);
         }
@@ -3715,6 +3721,7 @@ impl LibraryScanner {
     ) -> Result<ScanOutcome, ServiceError> {
         let PlanOutput {
             items: mut planned,
+            excluded,
             owner_paths,
             mut unlisted,
             inaccessible,
@@ -3997,7 +4004,8 @@ impl LibraryScanner {
         probes.abort();
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
-        let removed = Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted)).await;
+        let removed =
+            Box::pin(self.prune_after_scan(folders, &planned, scope, &unlisted, &excluded)).await;
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload.
         self.publish_library_changed(&items_added, &removed).await;
@@ -4019,7 +4027,7 @@ impl LibraryScanner {
         Ok(outcome)
     }
 
-    /// Drops the rows whose files vanished since the last scan, so deleted
+    /// Drops rows whose files vanished or whose paths were confirmed excluded, so deleted
     /// media stops being listed and served — within `scope`'s roots on a
     /// path-scoped scan. Best-effort: a failure does not fail the scan. An
     /// item's own refresh removes nothing (upstream's `RefreshSingleItem`
@@ -4031,11 +4039,13 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
+        excluded: &[String],
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         if scope.is_some_and(|scope| !scope.prune) {
             return Vec::new();
         }
-        self.prune_deleted(folders, planned, scope, unlisted).await
+        self.prune_deleted(folders, planned, scope, unlisted, excluded)
+            .await
     }
 
     /// Between two items: the item refreshes waiting in `run`'s lane run
@@ -5860,6 +5870,7 @@ impl LibraryScanner {
         planned: &[Planned],
         scope: Option<PathScope<'_>>,
         unlisted: &[String],
+        excluded: &[String],
     ) -> Vec<(Uuid, Vec<Uuid>)> {
         let mut removed = Vec::new();
         let Some(items) = &self.item_repository else {
@@ -5868,12 +5879,17 @@ impl LibraryScanner {
         // Nothing at or under a directory that failed to list is known to be
         // gone (`Folder.ValidateChildrenInternal2` returns on an
         // `IOException` before it removes a child).
-        let unlisted = Unlisted::of(unlisted);
+        let unlisted = PathRoots::of(unlisted);
+        let excluded = PathRoots::of(excluded);
         let listed = |row_path: Option<&str>| row_path.is_none_or(|rp| !unlisted.covers(rp));
         let planned_paths: std::collections::HashSet<&str> = planned
             .iter()
             .filter_map(|p| p.entity.path.as_deref())
             .collect();
+        let keep_on_disk = |path: Option<&str>| {
+            !path.is_some_and(|path| excluded.covers(path))
+                && self.still_on_disk(path, &planned_paths)
+        };
         let live: std::collections::HashSet<Uuid> = planned.iter().map(|p| p.id).collect();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
@@ -5923,7 +5939,7 @@ impl LibraryScanner {
             };
             let own = LibraryFolders::of(&top_parents, &folder.locations);
             let Some((ids, paths)) = self
-                .stale_rows(cf, &existing, &live, &planned_paths, &listed, &own)
+                .stale_rows(cf, &existing, &live, &keep_on_disk, &listed, &own)
                 .await
             else {
                 continue;
@@ -5942,7 +5958,7 @@ impl LibraryScanner {
                             .collect();
                         log_pruned(&gone);
                     }
-                    tracing::info!(library = %cf, removed = deleted.len(), "pruned items deleted from disk");
+                    tracing::info!(library = %cf, removed = deleted.len(), "pruned missing or excluded items");
                     removed.push((cf, deleted));
                 }
                 Err(err) => {
@@ -5990,7 +6006,7 @@ impl LibraryScanner {
         cf: Uuid,
         existing: &[ItemPathRow],
         live: &std::collections::HashSet<Uuid>,
-        planned_paths: &std::collections::HashSet<&str>,
+        keep_on_disk: &(dyn Fn(Option<&str>) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
     ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
@@ -6020,7 +6036,7 @@ impl LibraryScanner {
             .iter()
             .filter(|row| row_listed(row) && !live.contains(&row.id) && !own.holds(row))
             .filter(|row| {
-                let keep = self.still_on_disk(row.path.as_deref(), planned_paths);
+                let keep = keep_on_disk(row.path.as_deref());
                 if keep {
                     if planner_resolves(&row.item_type) {
                         kept_on_disk += 1;
@@ -8890,6 +8906,7 @@ impl LibraryScanner {
         }
         PlanOutput {
             items: out,
+            excluded: ctx.excluded.into_inner(),
             owner_paths: ctx.owner_paths.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
@@ -8909,7 +8926,14 @@ impl LibraryScanner {
                 ctx.listed_location(dir, entries.is_empty());
                 entries
                     .into_iter()
-                    .filter(|entry| !crate::resolvers::should_ignore_path(&entry.path))
+                    .filter(|entry| {
+                        if crate::resolvers::should_ignore_path(&entry.path) {
+                            ctx.excluded.borrow_mut().push(entry.path.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    })
                     .collect()
             }
             Err(err) => {
@@ -9027,7 +9051,10 @@ impl LibraryScanner {
                 continue;
             }
             let Some(owner) = owner_for_extra(&path, &movies_by_dir) else {
-                continue; // an extra with no resolvable movie is skipped
+                // This candidate was listed, but no eligible containing movie
+                // searches for it. Reconcile legacy rows at this exact path.
+                ctx.excluded.borrow_mut().push(path);
+                continue;
             };
             // The extra's item KIND comes from its extra type, per
             // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
@@ -9184,10 +9211,10 @@ impl LibraryScanner {
             // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
             // file in the library root keeps its clean_date_time-parsed name (year stripped).
             // ProductionYear is still populated either way.
-            let name = if !own_folder {
-                clean_name
-            } else {
+            let name = if own_folder {
                 folder_name(dir).unwrap_or(clean_name)
+            } else {
+                clean_name
             };
             let Some((id, mut entity)) =
                 self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, &entry.path, false)
@@ -10964,12 +10991,12 @@ fn planner_resolves(item_type: &str) -> bool {
     )
 }
 
-/// The directories a plan pass could not list. Looked up by a path's
-/// ancestors, so a mount that dropped thousands of directories costs each
-/// row the prune checks its path depth, not the whole list.
-struct Unlisted<'a>(std::collections::HashSet<&'a str>);
+/// A set of paths and their descendants. Used for unavailable directories
+/// and confirmed discovery exclusions; each membership check costs only the
+/// path depth, even when thousands of entries were excluded or unavailable.
+struct PathRoots<'a>(std::collections::HashSet<&'a str>);
 
-impl<'a> Unlisted<'a> {
+impl<'a> PathRoots<'a> {
     fn of(dirs: &'a [String]) -> Self {
         Self(
             dirs.iter()

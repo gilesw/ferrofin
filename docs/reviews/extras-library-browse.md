@@ -112,3 +112,19 @@ longest version prefix ending at a delimiter, as `Video.GetOwnerIdForExtra` does
 Adopted Video identities are reused for owners even outside a scoped refresh.
 All nine extras integration tests pass (full/scoped versions, stacks, adopted
 identities included). The second independent review approved this phase.
+
+## Phase 4 — reconcile confirmed exclusions
+
+The planner records excluded entries only after successful directory listings,
+and records extra candidates whose listed containing folder has no eligible
+owner. Pruning considers these paths even when their files still exist. Scope,
+unlisted/unavailable locations, cancellation, library roots, and retained-child
+cascade guards still apply. Membership uses path ancestors in a hash set, so it
+does not multiply existing rows by the number of excluded paths.
+
+The twelve extras tests pass, including exact-path and folder cleanup,
+ownerless legacy rows, retained Sample extras, failed listings, missing and empty
+mounts, cancellation after planning, and a stable second scan. Repairing a locked
+extra retains its ID, overview, artwork row, provider ID, and played state.
+Upgrade instructions now describe recovery with one normal scan. No schema
+migration or file deletion is involved.

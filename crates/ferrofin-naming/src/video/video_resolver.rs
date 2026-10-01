@@ -10,6 +10,9 @@ use crate::video::{
 /// Whether MovieResolver excludes a filename while recognizing a movie folder.
 /// Jellyfin's `IsIgnoredRegex` is narrower in purpose than IgnorePatterns:
 /// these files may still be resolved individually or as owned Sample extras.
+///
+/// # Panics
+/// Panics if the fixed sample regex cannot compile (a programming error).
 #[must_use]
 pub fn is_sample_filename(name: &str) -> bool {
     static SAMPLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();

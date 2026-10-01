@@ -8,6 +8,21 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — extras no longer appear as library children
+
+Run **Scan All Libraries** once after upgrading if extras or samples appeared as
+ordinary library items (#32). The scan repairs valid extras' ownership and library
+relationships while retaining their IDs, metadata, artwork, and watch history,
+including locked items. Special features, local trailers, and theme media remain
+available through their owning movie.
+
+The scan also removes database rows for files excluded by Jellyfin's discovery
+rules, including AppleDouble files, ignored directories (#31), and extras in
+folders without an eligible movie owner. It leaves the files on disk. Supported
+sample extras such as `Movie-sample.mkv` remain; `sample.mkv` and
+`Movie.sample.mkv` are ignored. Only successfully scanned locations are cleaned.
+No database reset or forced metadata replacement is needed.
+
 ## Unreleased — subtitles download during library scans
 
 Libraries with subtitle download languages now fetch missing subtitles when a movie
