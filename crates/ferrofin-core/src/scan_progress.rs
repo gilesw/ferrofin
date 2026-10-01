@@ -99,13 +99,26 @@ impl ScanProgressTracker {
     }
 
     /// Starts ordered event delivery. The timer is parked while no scans are active.
-    /// Clones share one reporter; it exits when the last tracker is dropped.
+    /// Clones share one reporter. The host calls `shutdown` after stopping scans;
+    /// dropping the last tracker also closes delivery when no consumer owns it.
     pub fn set_events(&self, events: Arc<dyn EventManager>) {
         self.reports.get_or_init(|| {
             let (tx, rx) = mpsc::unbounded_channel();
             tokio::spawn(report_loop(Arc::downgrade(&self.state), rx, events));
             tx
         });
+    }
+
+    /// Flushes captured transitions and stops the reporter after scan workers stop.
+    /// Explicit shutdown also handles event consumers that own a tracker clone.
+    pub async fn shutdown(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.send(Report {
+            updates: Vec::new(),
+            delivered: Some(tx),
+            stop: true,
+        });
+        let _ = rx.await;
     }
 
     fn send(&self, report: Report) {
@@ -190,6 +203,7 @@ impl ScanProgressRun {
         self.tracker.send(Report {
             updates: Vec::new(),
             delivered: Some(tx),
+            stop: false,
         });
         let _ = rx.await;
     }
@@ -224,7 +238,11 @@ impl ScanProgressRun {
                 ))
             })
             .collect();
-        self.tracker.send(Report { updates, delivered });
+        self.tracker.send(Report {
+            updates,
+            delivered,
+            stop: false,
+        });
     }
 
     /// Sets the denominator once planning finishes; libraries with no items remain.
@@ -312,6 +330,7 @@ impl Update {
 
 #[derive(Debug)]
 struct Report {
+    stop: bool,
     updates: Vec<Update>,
     delivered: Option<oneshot::Sender<()>>,
 }
@@ -321,6 +340,7 @@ impl Report {
         Self {
             updates: visible(state).into_values().map(Update::active).collect(),
             delivered: None,
+            stop: false,
         }
     }
 }
@@ -348,8 +368,7 @@ async fn report_loop(
             }
             _ = timer.tick(), if active => true,
         };
-        {
-            let Some(state) = state.upgrade() else { break };
+        if let Some(state) = state.upgrade() {
             let state = lock(&state);
             while let Ok(report) = rx.try_recv() {
                 batch.push(report);
@@ -362,6 +381,10 @@ async fn report_loop(
             if tick && active {
                 batch.push(Report::active(&state));
             }
+        } else {
+            // Guard cleanup can enqueue terminal state just before the final
+            // tracker drops. Those captured reports need no live counters.
+            active = false;
         }
         for report in batch {
             for update in report.updates {
@@ -375,6 +398,9 @@ async fn report_loop(
             }
             if let Some(delivered) = report.delivered {
                 let _ = delivered.send(());
+            }
+            if report.stop {
+                return;
             }
         }
     }
@@ -454,13 +480,14 @@ mod tests {
         assert!(lock(&seen).iter().all(|v| v["RefreshStatus"] == "Active"));
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        let values = lock(&seen);
-        let a_id = a.simple().to_string();
-        assert_eq!(
-            values.iter().rev().find(|v| v["ItemId"] == a_id).unwrap()["Progress"],
-            "33.33"
-        );
-        drop(values);
+        {
+            let values = lock(&seen);
+            let a_id = a.simple().to_string();
+            assert_eq!(
+                values.iter().rev().find(|v| v["ItemId"] == a_id).unwrap()["Progress"],
+                "33.33"
+            );
+        }
         parent.finalizing();
         parent.finish(true).await;
         assert!(tracker.libraries().is_empty());
@@ -475,9 +502,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn explicit_shutdown_releases_reporter_with_a_consumer_owning_the_tracker() {
+        let events = Arc::new(crate::event_manager::FerrofinEventManager::new());
+        let weak = Arc::downgrade(&events);
+        let tracker = ScanProgressTracker::default();
+        let consumer_tracker = tracker.clone();
+        events.subscribe(
+            "RefreshProgress",
+            Arc::new(move |_| {
+                let _ = consumer_tracker.libraries();
+                crate::event_manager::consumer_done()
+            }),
+        );
+        tracker.set_events(events);
+        let run = tracker.begin([Uuid::new_v4()]);
+        run.started().await;
+        drop(run);
+        tracker.shutdown().await;
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none());
+        // Shutdown is idempotent even when another holder calls it again.
+        tracker.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn dropping_the_last_tracker_releases_the_reporter() {
         let events = Arc::new(crate::event_manager::FerrofinEventManager::new());
         let weak = Arc::downgrade(&events);
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = seen.clone();
+        events.subscribe(
+            "RefreshProgress",
+            Arc::new(move |payload| {
+                lock(&sink).push(serde_json::from_str(payload).unwrap());
+                crate::event_manager::consumer_done()
+            }),
+        );
         let tracker = ScanProgressTracker::default();
         tracker.set_events(events);
         let run = tracker.begin([Uuid::new_v4()]);
@@ -487,6 +547,7 @@ mod tests {
         for _ in 0..3 {
             tokio::task::yield_now().await;
         }
+        assert_eq!(lock(&seen).last().unwrap()["RefreshStatus"], "Idle");
         assert!(
             weak.upgrade().is_none(),
             "reporter does not retain the event manager on shutdown"

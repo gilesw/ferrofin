@@ -718,14 +718,6 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             }
             let library_id = self.collection_folder_id(&path);
             let locations = Self::resolve_locations(&path).await?;
-            let progress = library_id.and_then(|id| self.scan_progress.library(id));
-            let refresh_status = if progress.is_some() {
-                "Active"
-            } else if library_id.is_some_and(|id| self.scan_progress.is_queued(id, &locations)) {
-                "Queued"
-            } else {
-                "Idle"
-            };
             folders.push(VirtualFolderInfo {
                 name,
                 locations,
@@ -734,10 +726,37 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
                 // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
                 // dashboard matches it against `RefreshProgress.ItemId` as a string.
                 item_id: library_id.map(|id| id.simple().to_string()),
-                refresh_progress: progress.map(crate::scan_progress::LibraryScanProgress::percent),
-                refresh_status: Some(refresh_status.to_owned()),
                 ..VirtualFolderInfo::default()
             });
+        }
+        // Capture once after all filesystem/DB awaits, so every library uses
+        // the same scan generation and we build the visible map only once.
+        let progress: std::collections::HashMap<_, _> = self
+            .scan_progress
+            .libraries()
+            .into_iter()
+            .map(|p| (p.library_id.simple().to_string(), p))
+            .collect();
+        for folder in &mut folders {
+            let current = folder.item_id.as_ref().and_then(|id| progress.get(id));
+            let status = if let Some(current) = current {
+                if current.phase == crate::scan_progress::ScanPhase::Queued {
+                    "Queued"
+                } else {
+                    "Active"
+                }
+            } else if folder
+                .item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .is_some_and(|id| self.scan_progress.is_queued(id, &folder.locations))
+            {
+                "Queued"
+            } else {
+                "Idle"
+            };
+            folder.refresh_progress = current.map(|p| p.percent());
+            folder.refresh_status = Some(status.to_owned());
         }
         // Directory enumeration order is unspecified; a stable name sort keeps
         // the response deterministic (Jellyfin sorts by directory listing too).

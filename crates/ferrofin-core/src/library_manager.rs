@@ -79,6 +79,7 @@ pub struct FerrofinLibraryManager {
     /// Bumped whenever a queued scan finishes or the claim is released, so
     /// the callers waiting on a queued scan re-check it.
     scan_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    scan_tracker: Option<crate::scan_progress::ScanProgressTracker>,
     /// Chapter rows, for serving chapter thumbnails. Set by the composition
     /// root; `None` (unit tests) means an item has no chapter images. The
     /// repository (not the `ChapterManager`) is held because the manager is
@@ -969,6 +970,7 @@ impl FerrofinLibraryManager {
             scanner: None,
             scan_queue: Arc::new(Mutex::new(ScanQueue::default())),
             scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
+            scan_tracker: None,
             chapters: None,
             user_root: None,
             years: None,
@@ -979,7 +981,10 @@ impl FerrofinLibraryManager {
 
     /// Exposes queued scan scopes to the shared library progress reader.
     #[must_use]
-    pub fn with_scan_progress(self, tracker: &crate::scan_progress::ScanProgressTracker) -> Self {
+    pub fn with_scan_progress(
+        mut self,
+        tracker: &crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
         let queue = Arc::downgrade(&self.scan_queue);
         tracker.set_queue_reader(Arc::new(move |library, locations| {
             let Some(queue) = queue.upgrade() else {
@@ -1006,6 +1011,7 @@ impl FerrofinLibraryManager {
                     })
                 })
         }));
+        self.scan_tracker = Some(tracker.clone());
         self
     }
 
@@ -1868,11 +1874,14 @@ impl LibraryManager for FerrofinLibraryManager {
         // one item's writes.
         loop {
             if !lock_queue(&self.scan_queue).worker {
-                return;
+                break;
             }
             if progress.changed().await.is_err() {
-                return;
+                break;
             }
+        }
+        if let Some(tracker) = &self.scan_tracker {
+            tracker.shutdown().await;
         }
     }
 }
