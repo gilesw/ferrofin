@@ -3627,6 +3627,8 @@ impl LibraryScanner {
     /// Jellyfin resolves local alternate movie files as `Video` rows. Reuse
     /// those rows by path before refreshing them, so the movie resolver cannot
     /// create another item for a file that is already a linked version.
+    // Keep identity selection and owner remapping together so their priority stays visible.
+    #[allow(clippy::too_many_lines)]
     async fn reuse_adopted_video_versions(
         &self,
         planned: &mut [Planned],
