@@ -76,9 +76,15 @@ fn request_context(provider: &str, url: &reqwest::Url) -> String {
 /// backoff and jitter. Connection failures open the circuit after one attempt.
 /// State persists between calls, including after cancellation.
 /// This coordinates callers within one process, not other clients sharing its IP.
+///
+/// Every logical request (retries excluded) is counted on
+/// `ferrofin_metadata_provider_requests_total` under the limiter's bounded
+/// `provider` label ([`crate::metrics`]).
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     provider: Arc<str>,
+    /// The `provider` label of this limiter's request metrics.
+    metric_label: &'static str,
     settings: Settings,
     state: Arc<Mutex<RequestRate>>,
 }
@@ -87,11 +93,37 @@ impl RateLimiter {
     /// Creates an independent quota gate. Clone it to share cooldowns.
     #[must_use]
     pub fn new(provider: impl Into<Arc<str>>) -> Self {
+        let provider = provider.into();
         Self {
-            provider: provider.into(),
+            metric_label: crate::metrics::provider_label(&provider),
+            provider,
             settings: Settings::from_env(),
             state: Arc::default(),
         }
+    }
+
+    /// This gate — the same pacing, quota and cooldown state, shared with
+    /// every other clone — with its requests counted under the provider
+    /// `label` (bounded like every label: an unknown one is `other`). The
+    /// label only names the caller in the metrics; it never splits the gate.
+    #[must_use]
+    pub(crate) fn counted_as(&self, label: &str) -> Self {
+        Self {
+            metric_label: crate::metrics::provider_label(label),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `other` is a clone of this gate (shares its state).
+    #[cfg(test)]
+    pub(crate) fn shares_gate_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// The `provider` label its requests are counted under.
+    #[cfg(test)]
+    pub(crate) fn metric_label(&self) -> &'static str {
+        self.metric_label
     }
 
     /// Executes a GET with the caller's minimum interval and bounded retries.
@@ -113,7 +145,7 @@ impl RateLimiter {
         if request.method() != reqwest::Method::GET {
             return None;
         }
-        self.execute(http, request, interval)
+        self.execute_observed(http, request, interval)
             .await
             .ok()
             .filter(|response| response.status().is_success())
@@ -133,14 +165,39 @@ impl RateLimiter {
     ) -> Result<reqwest::Response, RequestError> {
         let (http, request) = request.build_split();
         let request = request.map_err(|error| RequestError::Http(error.without_url()))?;
-        self.execute(http, request, interval).await
+        self.execute_observed(http, request, interval).await
     }
 
+    /// [`execute`](Self::execute), counting a failed outcome into the
+    /// caller's [`count_request_failures`] scope and the request into the
+    /// provider request metrics.
+    async fn execute_observed(
+        &self,
+        http: reqwest::Client,
+        request: reqwest::Request,
+        interval: Duration,
+    ) -> Result<reqwest::Response, RequestError> {
+        let mut sent = 0;
+        let result = self.execute(http, request, interval, &mut sent).await;
+        crate::metrics::request_finished(self.metric_label, request_result(&result, sent));
+        let failed = match &result {
+            Err(_) => true,
+            Ok(response) => is_failure_status(response.status()),
+        };
+        if failed {
+            note_request_failure();
+        }
+        result
+    }
+
+    /// Sends `request` with its retries; `sent` counts the attempts that
+    /// actually went out.
     async fn execute(
         &self,
         http: reqwest::Client,
         request: reqwest::Request,
         interval: Duration,
+        sent: &mut u32,
     ) -> Result<reqwest::Response, RequestError> {
         let attempts = if request.method() == reqwest::Method::GET {
             GET_ATTEMPTS
@@ -148,6 +205,9 @@ impl RateLimiter {
             1
         };
         let context = request_context(&self.provider, request.url());
+        // One line per outbound provider call (retries excluded): what counts a
+        // scan's remote traffic. Debug, because it scales with library size.
+        tracing::debug!(provider = %self.provider, %context, "metadata provider request");
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
         for attempt in 1..=attempts {
@@ -171,6 +231,10 @@ impl RateLimiter {
             attempt_request
                 .timeout_mut()
                 .get_or_insert(self.settings.timeout);
+            if *sent > 0 {
+                crate::metrics::retried(self.metric_label);
+            }
+            *sent += 1;
             let response = http.execute(attempt_request).await;
             match response {
                 Ok(resp) => {
@@ -240,7 +304,12 @@ impl RateLimiter {
             tracing::debug!(provider = %self.provider, %context, %status,
                 delay_ms = delay.as_millis(), "Metadata provider request rejected; backing off");
         } else {
-            if !status.is_success() {
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Provider clients and request metrics already classify 404
+                // as an empty result, not an authentication or service failure.
+                tracing::debug!(provider = %self.provider, %context, %status,
+                    "Metadata provider lookup returned no result");
+            } else if !status.is_success() {
                 tracing::warn!(provider = %self.provider, %context, %status,
                     "Metadata provider request rejected");
             } else if rate.succeeded() {
@@ -260,13 +329,117 @@ impl RateLimiter {
     ) -> Option<T> {
         let response = self.send_get(request, interval).await?;
         let context = request_context(&self.provider, response.url());
-        match response.json().await {
+        match response.counted_json().await {
             Ok(body) => Some(body),
             Err(error) => {
                 tracing::warn!(provider = %self.provider, %context, error = %error.without_url(), "Metadata provider response could not be parsed");
                 None
             }
         }
+    }
+}
+
+/// The `result` label of one logical request ([`crate::metrics`]): `skipped`
+/// only when nothing was ever sent (an open circuit or a cooldown longer than
+/// the caller may wait). A request that went out and then gave up — say a
+/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`.
+fn request_result(
+    result: &Result<reqwest::Response, RequestError>,
+    sent: u32,
+) -> crate::metrics::RequestResult {
+    use crate::metrics::RequestResult;
+    match result {
+        Err(RequestError::Cooldown) if sent == 0 => RequestResult::Skipped,
+        Ok(response) if response.status().is_success() => RequestResult::Ok,
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+            RequestResult::NotFound
+        }
+        Ok(_) | Err(_) => RequestResult::Failed,
+    }
+}
+
+tokio::task_local! {
+    /// The failed provider requests of the [`count_request_failures`] scope
+    /// the current task is running in, if any.
+    static REQUEST_FAILURES: std::cell::Cell<u32>;
+}
+
+/// Whether a final response status means the provider failed, rather than
+/// answered. A 404 is an answer ("nothing here"): the provider clients
+/// report it as a miss, the way `TMDbLib` returns `null` for it instead of
+/// throwing. Every other non-success status (a 5xx or 429 that outlived
+/// its retries, an auth failure, a rejected request) is a failure.
+fn is_failure_status(status: reqwest::StatusCode) -> bool {
+    !status.is_success() && status != reqwest::StatusCode::NOT_FOUND
+}
+
+/// Counts one failed provider call into the enclosing
+/// [`count_request_failures`] scope. Outside any scope it does nothing.
+///
+/// Every request through a [`RateLimiter`] is counted already; a provider
+/// that does not go through one (a sandboxed plugin, say) calls this when it
+/// fails, so its failure is told apart from a miss the same way.
+pub fn note_request_failure() {
+    let _ = REQUEST_FAILURES.try_with(|failures| failures.set(failures.get().saturating_add(1)));
+}
+
+/// Runs `future` and returns its output together with how many provider
+/// calls made while it ran **failed**:
+///
+/// - a request through a [`RateLimiter`] that ended in a transport error,
+///   was skipped by an open circuit or a cooldown, or whose final status is
+///   neither a success nor a 404 (a 404 is an answer: "nothing here");
+/// - a response body that could not be read or decoded (every provider
+///   client in this crate reads bodies through a counting reader);
+/// - anything that called [`note_request_failure`] (a provider outside this
+///   crate, such as a sandboxed plugin, or a cached failure being re-read).
+///
+/// This is what tells a provider that *errored* from one that *found
+/// nothing* — the provider clients collapse both into `None` — so a caller
+/// can apply upstream's rule that a refresh with a provider failure is not
+/// recorded as complete (`MetadataService.RefreshMetadata` stamps
+/// `DateLastRefreshed` only when `RefreshResult.Failures == 0`). Requests
+/// made from other tasks (anything `tokio::spawn`ed inside `future`) are not
+/// counted: a task-local does not cross a spawn.
+pub async fn count_request_failures<F: std::future::Future>(future: F) -> (F::Output, u32) {
+    REQUEST_FAILURES
+        .scope(std::cell::Cell::new(0), async move {
+            let output = future.await;
+            (output, REQUEST_FAILURES.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+/// Body reads of a provider response that count a failed read or decode
+/// into the enclosing [`count_request_failures`] scope — a truncated or
+/// malformed `200` is a failure, not an answer. Every provider client in this
+/// crate reads its bodies through these.
+pub(crate) trait CountedBody: Sized {
+    /// `Response::json`, counting an error.
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error>;
+    /// `Response::bytes` (as a `Vec`), counting an error.
+    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error>;
+    /// `Response::text`, counting an error.
+    async fn counted_text(self) -> Result<String, reqwest::Error>;
+}
+
+/// Counts `result`'s error, if any, and hands it back.
+fn counted<T>(result: Result<T, reqwest::Error>) -> Result<T, reqwest::Error> {
+    if result.is_err() {
+        note_request_failure();
+    }
+    result
+}
+
+impl CountedBody for reqwest::Response {
+    async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error> {
+        counted(self.json().await)
+    }
+    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error> {
+        counted(self.bytes().await.map(|b| b.to_vec()))
+    }
+    async fn counted_text(self) -> Result<String, reqwest::Error> {
+        counted(self.text().await)
     }
 }
 
@@ -721,9 +894,56 @@ mod tests {
         }
     }
 
+    fn init_log_capture() {
+        // Cargo runs other provider tests on threads without our scoped
+        // subscriber. If one of those threads first reaches a log callsite,
+        // tracing can cache it as disabled for the capturing test too. Keep
+        // a DEBUG-enabled fallback alive for the entire test process; each
+        // test's scoped subscriber still writes only to its own LogBuffer.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            )
+            .expect("provider tests install their fallback subscriber only once");
+        });
+    }
+
+    #[test]
+    fn log_capture_survives_first_use_on_another_thread() {
+        fn emit() {
+            tracing::warn!("provider log capture regression");
+        }
+
+        init_log_capture();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            // The first visit to this shared callsite comes from outside the
+            // scoped capture, as when another provider test runs concurrently.
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("provider log capture regression").count(),
+            1,
+            "capture must retain its own event and exclude the other thread:\n{logs}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn warnings_identify_failures_and_cooldown_summary_counts_skips() {
         use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
         let _clock = TestClock::start();
         let logs = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -733,7 +953,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         async {
-            let (url, server) = scripted_server(vec![(404, ""), (200, ""), (200, "")]).await;
+            let (url, server) = scripted_server(vec![(401, ""), (200, ""), (200, "")]).await;
             let client = RateLimiter::new("omdb");
             let http = reqwest::Client::new();
             let request = || {
@@ -761,13 +981,70 @@ mod tests {
         assert!(
             logs.lines().any(|line| line.contains("WARN")
                 && line.contains("tt123")
-                && line.contains("404"))
+                && line.contains("401")),
+            "missing rejection warning:\n{logs}"
         );
-        assert!(logs.lines().any(|line| line.contains("WARN")
-            && line.contains("tt123")
-            && line.contains("could not be parsed")));
-        assert!(logs.contains("skipped=2"));
+        assert!(
+            logs.lines().any(|line| line.contains("WARN")
+                && line.contains("tt123")
+                && line.contains("could not be parsed")),
+            "missing parse warning:\n{logs}"
+        );
+        assert!(
+            logs.contains("skipped=2"),
+            "missing cooldown summary:\n{logs}"
+        );
         assert!(!logs.contains("private-key"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_provider_entries_are_debug_but_access_rejections_warn() {
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let _clock = TestClock::start();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        async {
+            let (url, server) = scripted_server(vec![(404, ""), (401, ""), (403, "")]).await;
+            let limiter = RateLimiter::new("fanart");
+            let http = reqwest::Client::new();
+            for status in [404, 401, 403] {
+                let response = limiter
+                    .send_request(http.get(&url), Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), status);
+            }
+            server.await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.lines().any(|line| line.contains("DEBUG")
+                && line.contains("404")
+                && line.contains("lookup returned no result")),
+            "missing lookup debug event:\n{logs}"
+        );
+        assert!(
+            !logs
+                .lines()
+                .any(|line| line.contains("WARN") && line.contains("404")),
+            "lookup incorrectly warned:\n{logs}"
+        );
+        for status in ["401", "403"] {
+            assert!(
+                logs.lines().any(|line| line.contains("WARN")
+                    && line.contains(status)
+                    && line.contains("request rejected")),
+                "missing {status} rejection warning:\n{logs}"
+            );
+        }
     }
 
     #[test]
@@ -856,6 +1133,59 @@ mod tests {
             times
         });
         (url, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_failures_are_counted_but_a_404_is_an_answer() {
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(200, ""), (404, ""), (401, ""), (400, "")]).await;
+        let client = RateLimiter::new("counted");
+        let http = reqwest::Client::new();
+        let (statuses, failures) = count_request_failures(async {
+            let mut statuses = Vec::new();
+            for _ in 0..4 {
+                let response = client
+                    .send_request(http.get(&url), Duration::ZERO)
+                    .await
+                    .unwrap();
+                statuses.push(response.status().as_u16());
+            }
+            statuses
+        })
+        .await;
+        assert_eq!(statuses, vec![200, 404, 401, 400]);
+        assert_eq!(failures, 2, "401 and 400 failed; 200 and 404 answered");
+        assert_eq!(task.await.unwrap().len(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_and_undecodable_requests_count_as_failures() {
+        let _clock = TestClock::start();
+        let blocked = RateLimiter::new("blocked");
+        blocked.state.lock().await.postpone(Duration::from_mins(2));
+        let http = reqwest::Client::new();
+        let ((), skipped) = count_request_failures(async {
+            assert!(
+                blocked
+                    .send_get(http.get("http://127.0.0.1:9/"), Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+        })
+        .await;
+        assert_eq!(skipped, 1, "a cooldown skip is a failure, not a miss");
+
+        let (url, task) = scripted_server(vec![(200, "")]).await;
+        let client = RateLimiter::new("decode");
+        let (value, failures) =
+            count_request_failures(client.get_json::<Vec<u8>>(http.get(&url), Duration::ZERO))
+                .await;
+        assert!(value.is_none());
+        assert_eq!(failures, 1, "an undecodable body is a failure");
+        task.await.unwrap();
+
+        // Outside any scope nothing is counted, and nothing panics.
+        note_request_failure();
     }
 
     #[tokio::test(start_paused = true)]
@@ -953,6 +1283,100 @@ mod tests {
         assert!(
             rate.next.unwrap().saturating_duration_since(Instant::now()) > Duration::from_secs(15)
         );
+    }
+
+    /// The metric result of a request: a 429 whose `Retry-After` outlasts the
+    /// wait for its retry was sent, so it `failed`; the next request, never
+    /// sent because of that cooldown, was `skipped`.
+    #[tokio::test(start_paused = true)]
+    async fn a_sent_request_that_gives_up_on_a_cooldown_failed_the_next_one_skipped() {
+        use crate::metrics::RequestResult;
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let limiter = RateLimiter::new("test");
+        let http = reqwest::Client::new();
+        let mut sent = 0;
+        let first = limiter
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(first, Err(RequestError::Cooldown)));
+        assert_eq!(sent, 1);
+        assert_eq!(request_result(&first, sent), RequestResult::Failed);
+        let mut sent = 0;
+        let second = limiter
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(second, Err(RequestError::Cooldown)));
+        assert_eq!(request_result(&second, sent), RequestResult::Skipped);
+        assert_eq!(task.await.unwrap().len(), 1);
+        // Answers: a success, a 404, and a 503 that outlived its retries.
+        for (script, want, attempts) in [
+            (vec![(200, "")], RequestResult::Ok, 1),
+            (vec![(404, "")], RequestResult::NotFound, 1),
+            (
+                vec![(503, "Retry-After: 0\r\n"); 4],
+                RequestResult::Failed,
+                4,
+            ),
+        ] {
+            let (url, task) = scripted_server(script).await;
+            let limiter = RateLimiter::new("test");
+            let mut sent = 0;
+            let result = limiter
+                .execute(
+                    http.clone(),
+                    http.get(&url).build().unwrap(),
+                    Duration::ZERO,
+                    &mut sent,
+                )
+                .await;
+            assert_eq!(sent, attempts);
+            assert_eq!(request_result(&result, sent), want);
+            task.await.unwrap();
+        }
+    }
+
+    /// A clone counted under another label is the same gate: a cooldown the
+    /// server set through one holds the other back too.
+    #[tokio::test(start_paused = true)]
+    async fn a_relabelled_clone_shares_the_cooldown() {
+        let _clock = TestClock::start();
+        let (url, task) = scripted_server(vec![(429, "Retry-After: 120\r\n")]).await;
+        let artwork = RateLimiter::new("https://cdn.example").counted_as("image");
+        let subtitle = artwork.counted_as("opensubtitles");
+        let http = reqwest::Client::new();
+        let mut sent = 0;
+        let first = artwork
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(first, Err(RequestError::Cooldown)));
+        let mut sent = 0;
+        let second = subtitle
+            .execute(
+                http.clone(),
+                http.get(&url).build().unwrap(),
+                Duration::ZERO,
+                &mut sent,
+            )
+            .await;
+        assert!(matches!(second, Err(RequestError::Cooldown)));
+        assert_eq!(sent, 0, "held back by the other label's cooldown");
+        assert_eq!(task.await.unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
