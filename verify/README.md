@@ -184,3 +184,22 @@ unchanged, 0 probes).
   re-probed and saved it, and row 6 failed with
   `updated 1 (want <= 0);probes 1 (want = 0)`, exit 1. The cleanup still removed every
   scratch file, and the server pruned the scratch items.
+
+## Dashboard scan progress
+
+`node verify/scan-progress.mjs BINARY [LOG_EVERY]` boots a disposable server and
+checks progress over authenticated HTTP and WebSocket connections. It needs Node
+22 or newer and uses controlled ffprobe stubs; no media or existing server is
+modified. Logs and captured events remain in the printed temporary directory.
+
+Run with logging cadences `0`, `1`, and `100` to check that UI notifications do not
+depend on item-count logging. The fixture holds the first probe, reconnects during
+that stall, and checks intermediate ratios, short unchanged scans, scoped
+refreshes, cancellation, terminal cleanup, and an empty library. Controlled-clock
+Rust tests cover exact timer boundaries, item 100, and overlapping scan ownership.
+
+Add `--measure` to compare binaries on the same generated 200-item fixture. It
+prints initial/unchanged scan wall times and library notification counts without
+requiring the baseline to exhibit the corrected behavior. Use three alternating
+baseline/fixed runs and compare medians; these local debug-build measurements are
+not production throughput estimates.
