@@ -500,6 +500,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only an authenticated socket may
     // subscribe — the streams answer as the socket's user.
     let mut streams = Streams::default();
+    let mut task_updates = None;
 
     if open {
         loop {
@@ -524,6 +525,10 @@ async fn handle_socket(
                     }
                     Action::Inbound(inbound) => {
                         if caller.is_some() {
+                            let message = update_task_subscription(&state, inbound, &mut task_updates).await;
+                            if !send_optional(&mut socket, message, &overflowed).await {
+                                break;
+                            }
                             streams.apply(inbound);
                         }
                     }
@@ -557,17 +562,21 @@ async fn handle_socket(
                         break;
                     }
                 }
+                update = next_task_update(&mut task_updates) => {
+                    let msg = task_transition_message(&state, update, &mut task_updates).await;
+                    if !send_optional(&mut socket, msg, &overflowed).await {
+                        break;
+                    }
+                }
                 () = tick(&mut streams.tasks) => {
-                    if let Some(msg) = tasks_message(&state).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = periodic_tasks_message(&state, task_updates.as_ref()).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
                 () = tick(&mut streams.activity) => {
-                    if let Some(msg) = activity_message(&state, &mut streams.activity_since).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                    let message = activity_message(&state, &mut streams.activity_since).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
@@ -575,17 +584,33 @@ async fn handle_socket(
         }
     }
 
+    unregister_socket(&state, registration).await;
+    drop(tx);
+    tracing::info!(
+        elapsed_s = started.elapsed().as_secs(),
+        "websocket disconnected"
+    );
+}
+
+async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
             state.sessions.report_session_ended(&sid)
         })
         .await;
     }
-    drop(tx);
-    tracing::info!(
-        elapsed_s = started.elapsed().as_secs(),
-        "websocket disconnected"
-    );
+}
+
+/// Send a stream update when it contains a payload.
+async fn send_optional(
+    socket: &mut WebSocket,
+    message: Option<String>,
+    overflowed: &tokio::sync::Notify,
+) -> bool {
+    match message {
+        Some(message) => send_frame(socket, Message::Text(message.into()), overflowed).await,
+        None => true,
+    }
 }
 
 /// The one `websocket connected` line, which says whether the socket carries a
@@ -772,11 +797,79 @@ async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<Strin
 /// .Where(i => !i.IsHidden)` — name-ordered (which `get_tasks` already is) and
 /// with hidden tasks dropped, unlike the `GET /ScheduledTasks` listing.
 async fn tasks_message(state: &AppState) -> Option<String> {
-    let tasks = visible_tasks(state.tasks.get_tasks().await.ok()?);
+    task_snapshot_message(state.tasks.get_tasks().await.ok()?)
+}
+
+fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<String> {
     Some(envelope(
         "ScheduledTasksInfo",
-        &serde_json::to_value(tasks).ok()?,
+        &serde_json::to_value(visible_tasks(tasks)).ok()?,
     ))
+}
+
+type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
+
+/// An initial snapshot and its subscription are acquired atomically by the registry.
+async fn update_task_subscription(
+    state: &AppState,
+    inbound: Inbound,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match inbound {
+        Inbound::TasksStart(_) => match state.tasks.subscribe_task_updates() {
+            Some(subscription) => {
+                *receiver = Some(subscription.updates);
+                task_snapshot_message(subscription.snapshot)
+            }
+            None => tasks_message(state).await,
+        },
+        Inbound::TasksStop => {
+            *receiver = None;
+            None
+        }
+        _ => None,
+    }
+}
+
+async fn task_transition_message(
+    state: &AppState,
+    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Option<String> {
+    match update {
+        Ok(tasks) => task_snapshot_message(tasks),
+        // Resubscribe atomically after lag, dropping obsolete queued snapshots.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            update_task_subscription(state, Inbound::TasksStart(Duration::ZERO), receiver).await
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            *receiver = None;
+            None
+        }
+    }
+}
+
+async fn periodic_tasks_message(
+    state: &AppState,
+    receiver: Option<&TaskUpdateReceiver>,
+) -> Option<String> {
+    let message = tasks_message(state).await;
+    // A transition may race the read. Drain captured transitions before sending
+    // any newer periodic snapshot, otherwise a short run can appear out of order.
+    if receiver.is_some_and(|updates| !updates.is_empty()) {
+        None
+    } else {
+        message
+    }
+}
+
+async fn next_task_update(
+    receiver: &mut Option<TaskUpdateReceiver>,
+) -> Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The listener's `.Where(i => !i.IsHidden)` clause.

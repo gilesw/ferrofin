@@ -31,8 +31,7 @@
 //!   add/remove also creates/deletes the library's `CollectionFolder` `BaseItem`,
 //!   and `GetVirtualFolders` projects its deterministic id onto
 //!   [`VirtualFolderInfo::item_id`] (so the library appears in `/UserViews` and is
-//!   editable). `PrimaryImageItemId`/refresh-state still need the image + refresh
-//!   queues and are left unset for now.
+//!   editable). The shared scan tracker supplies live refresh state.
 
 use std::path::{Path, PathBuf};
 
@@ -717,20 +716,26 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
             if let Some(name) = name.as_deref() {
                 self.ensure_collection_folder(&path, name).await?;
             }
+            let library_id = self.collection_folder_id(&path);
+            let locations = Self::resolve_locations(&path).await?;
+            let progress = library_id.and_then(|id| self.scan_progress.library(id));
+            let refresh_status = if progress.is_some() {
+                "Active"
+            } else if library_id.is_some_and(|id| self.scan_progress.is_queued(id, &locations)) {
+                "Queued"
+            } else {
+                "Idle"
+            };
             folders.push(VirtualFolderInfo {
                 name,
-                locations: Self::resolve_locations(&path).await?,
+                locations,
                 collection_type: Self::read_collection_type(&path).await,
                 library_options: Some(Self::load_options(&path).await),
                 // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
                 // dashboard matches it against `RefreshProgress.ItemId` as a string.
-                item_id: self
-                    .collection_folder_id(&path)
-                    .map(|g| g.simple().to_string()),
-                // Jellyfin always reports a non-null refresh status; at rest it is
-                // "Idle" (it becomes "Queued"/"Active" only while a scan is running,
-                // which this manager does not track).
-                refresh_status: Some("Idle".to_string()),
+                item_id: library_id.map(|id| id.simple().to_string()),
+                refresh_progress: progress.map(crate::scan_progress::LibraryScanProgress::percent),
+                refresh_status: Some(refresh_status.to_owned()),
                 ..VirtualFolderInfo::default()
             });
         }
@@ -1049,6 +1054,38 @@ mod tests {
             .with_item_store(persistence)
             .with_items(items);
         (tmp, db, mgr)
+    }
+
+    #[tokio::test]
+    async fn virtual_folders_restore_live_progress_and_clear_it_when_the_scan_stops() {
+        let (tmp, _db, mgr) = manager_with_store().await;
+        let tracker = crate::scan_progress::ScanProgressTracker::default();
+        let mgr = mgr.with_scan_progress(tracker.clone());
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(&[media]),
+        )
+        .await
+        .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        let id = uuid::Uuid::parse_str(folder.item_id.as_deref().unwrap()).unwrap();
+        let run = tracker.begin([id]);
+        let active = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(active.refresh_status.as_deref(), Some("Active"));
+        assert_eq!(active.refresh_progress, Some(0.0));
+        run.planned([(id, 4)]);
+        run.advance(id);
+        let active = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(active.refresh_progress, Some(25.0));
+        drop(run);
+        let idle = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(idle.refresh_status.as_deref(), Some("Idle"));
+        assert_eq!(idle.refresh_progress, None);
+        tracker.set_queue_reader(Arc::new(move |library, _| library == id));
+        let queued = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(queued.refresh_status.as_deref(), Some("Queued"));
     }
 
     /// Every `CollectionFolder` row currently parented to the user root, as

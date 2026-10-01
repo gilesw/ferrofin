@@ -977,6 +977,38 @@ impl FerrofinLibraryManager {
         }
     }
 
+    /// Exposes queued scan scopes to the shared library progress reader.
+    #[must_use]
+    pub fn with_scan_progress(self, tracker: &crate::scan_progress::ScanProgressTracker) -> Self {
+        let queue = Arc::downgrade(&self.scan_queue);
+        tracker.set_queue_reader(Arc::new(move |library, locations| {
+            let Some(queue) = queue.upgrade() else {
+                return false;
+            };
+            let queue = lock_queue(&queue);
+            queue
+                .pending
+                .iter()
+                .chain(queue.lane.iter())
+                .any(|pending| {
+                    let paths = match &pending.request.scope {
+                        ScanTarget::All => return true,
+                        ScanTarget::Library(id) => return *id == library,
+                        ScanTarget::Paths(paths)
+                        | ScanTarget::Changed(paths)
+                        | ScanTarget::Items(paths) => paths,
+                        ScanTarget::Artist { folders, .. } => folders,
+                    };
+                    paths.iter().any(|path| {
+                        locations
+                            .iter()
+                            .any(|location| std::path::Path::new(path).starts_with(location))
+                    })
+                })
+        }));
+        self
+    }
+
     /// Attaches the `UserRootFolder` provisioner so `get_user_root_folder`
     /// creates the root on first use, as Jellyfin's `GetUserRootFolder()` does.
     #[must_use]

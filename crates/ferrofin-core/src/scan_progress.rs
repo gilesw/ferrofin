@@ -61,10 +61,21 @@ struct State {
 }
 
 /// Shared refresh state, injected into the scanner and virtual-folder reader.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ScanProgressTracker {
     state: Arc<Mutex<State>>,
     reports: Arc<OnceLock<mpsc::UnboundedSender<Report>>>,
+    queued: Arc<OnceLock<QueueReader>>,
+}
+
+type QueueReader = Arc<dyn Fn(Uuid, &[String]) -> bool + Send + Sync>;
+
+impl std::fmt::Debug for ScanProgressTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanProgressTracker")
+            .field("active", &self.libraries())
+            .finish_non_exhaustive()
+    }
 }
 
 fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -74,6 +85,19 @@ fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl ScanProgressTracker {
+    /// Connects the worker queue without owning it or creating a reference cycle.
+    pub(crate) fn set_queue_reader(&self, reader: QueueReader) {
+        let _ = self.queued.set(reader);
+    }
+
+    /// Whether work for this library is waiting in the worker queue.
+    #[must_use]
+    pub fn is_queued(&self, library: Uuid, locations: &[String]) -> bool {
+        self.queued
+            .get()
+            .is_some_and(|reader| reader(library, locations))
+    }
+
     /// Starts ordered event delivery. The timer is parked while no scans are active.
     /// Clones share one reporter; it exits when the last tracker is dropped.
     pub fn set_events(&self, events: Arc<dyn EventManager>) {
