@@ -238,3 +238,11 @@ measurements: `before.log` and `after.log` in the same directory.
 This uses native HTTP because Docker is unavailable; the standard `bench/`
 container/load suite was not run. The targeted EXPLAIN regression test separately
 guards owner-scope and path-scope pruning against table scans.
+
+## Follow-up: client visibility and documentation audit
+
+The original HTTP validation missed the movie-detail count fields used by
+Jellyfin web. See [the follow-up audit](extras-client-visibility.md) for the
+`c9b9f854` count fix, real browser playback validation, and remaining extras
+parity gaps. The checks above establish the browse repair; they do not establish
+full parity with Jellyfin's documented extras behavior.
