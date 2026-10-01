@@ -253,3 +253,144 @@ async fn deleting_the_owner_removes_parentless_extras() {
         "database deletion keeps the file"
     );
 }
+
+#[tokio::test]
+async fn nested_release_and_mixed_folders_do_not_lend_the_wrong_owner() {
+    let f = Fixture::new(&[
+        MOVIE,
+        EXTRA,
+        "Heat (1995)/Heat-sample.mkv",
+        "Heat (1995)/Release/Other.mkv",
+        "Heat (1995)/Release/other-sample.mkv",
+        "Mixed/First.mkv",
+        "Mixed/Second.mkv",
+        "Mixed/First-trailer.mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let extras = f
+        .repo
+        .get_item_list(&InternalItemsQuery {
+            has_owner_id: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(extras.len(), 1);
+    assert_eq!(
+        extras[0].owner_id,
+        Some(f.row("Heat (1995)/Release/Other.mkv").await.id)
+    );
+    assert!(f.row(MOVIE).await.is_in_mixed_folder);
+    assert!(
+        !f.row("Heat (1995)/Release/Other.mkv")
+            .await
+            .is_in_mixed_folder
+    );
+}
+
+#[tokio::test]
+async fn scoped_discovery_ignores_files_and_preserves_metadata_sidecars() {
+    let f = Fixture::new(&[MOVIE]).await;
+    let nfo = f.media.join("Heat (1995)/movie.nfo");
+    std::fs::write(
+        &nfo,
+        "<movie><title>Local title</title><plot>Local plot</plot></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(MOVIE).await.overview.as_deref(), Some("Local plot"));
+    for path in [
+        "Heat (1995)/._Heat.mkv",
+        "Heat (1995)/sample.mkv",
+        ".hidden/stray.mkv",
+    ] {
+        let path = f.media.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let result = f
+            .scanner
+            .scan_paths(&[path.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
+        assert_eq!(result.created, 0);
+    }
+    f.assert_browse(1).await;
+    assert_eq!(f.row(MOVIE).await.overview.as_deref(), Some("Local plot"));
+}
+
+#[tokio::test]
+async fn grouped_movies_keep_generic_and_version_specific_extras_in_full_and_scoped_scans() {
+    for scoped in [false, true] {
+        for (movies, owners) in [
+            (
+                vec![
+                    "Film/Film.mkv",
+                    "Film/Film - 4K.mkv",
+                    "Film/Film - 4Kish.mkv",
+                ],
+                vec![
+                    "Film/Film.mkv",
+                    "Film/Film - 4K.mkv",
+                    "Film/Film - 4Kish.mkv",
+                ],
+            ),
+            (
+                vec!["Film/Film cd1.mkv", "Film/Film cd2.mkv"],
+                vec!["Film/Film cd1.mkv"; 3],
+            ),
+        ] {
+            let f = Fixture::new(&movies).await;
+            f.scanner.scan_all().await.unwrap();
+            let extras = [
+                "Film/Extras/clip.mkv",
+                "Film/Film - 4K-trailer.mkv",
+                "Film/Film - 4Kish-trailer.mkv",
+            ];
+            for (extra, owner) in extras.into_iter().zip(owners) {
+                let path = f.media.join(extra);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"").unwrap();
+                if scoped {
+                    f.scanner
+                        .scan_paths(&[path.to_string_lossy().into_owned()])
+                        .await
+                        .unwrap();
+                } else {
+                    f.scanner.scan_all().await.unwrap();
+                }
+                let extra = f.row(extra).await;
+                assert_eq!(extra.owner_id, Some(f.row(owner).await.id));
+                assert!(extra.parent_id.is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn adopted_version_identity_is_reused_for_extra_owners_even_outside_scan_scope() {
+    for scoped in [false, true] {
+        let f = Fixture::new(&["Film/Film.mkv", "Film/Film - 4K.mkv"]).await;
+        f.scanner.scan_all().await.unwrap();
+        let mut version = f.row("Film/Film - 4K.mkv").await;
+        let adopted_id = guid_to_db(Uuid::new_v4());
+        f.store
+            .delete_items(&[Uuid::parse_str(&version.id).unwrap()])
+            .await
+            .unwrap();
+        version.id.clone_from(&adopted_id);
+        version.type_ = "MediaBrowser.Controller.Entities.Video".into();
+        f.store.save_items(&[version]).await.unwrap();
+        let path = "Film/Film - 4K-trailer.mkv";
+        std::fs::write(f.media.join(path), b"").unwrap();
+        if scoped {
+            f.scanner
+                .scan_paths(&[f.media.join(path).to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+        } else {
+            f.scanner.scan_all().await.unwrap();
+        }
+        assert_eq!(f.row(path).await.owner_id, Some(adopted_id));
+    }
+}

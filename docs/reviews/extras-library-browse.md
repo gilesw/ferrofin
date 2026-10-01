@@ -59,3 +59,56 @@ locked unchanged extra and stable DateLastSaved on a second scan. Existing
 row comparison and structural overlays already perform the required repair;
 no new refresh trigger or provider pass is needed. Ignore discovery remains
 for phase 3. An EXPLAIN test guards the new pruning query's index seeks.
+
+### Phase 3: discovery and owner eligibility
+
+The planner filters media entries through the existing ignore rules. Location
+availability is recorded from the raw listing first, so exclusions cannot make
+a mounted location look unavailable. Provider filesystem reads remain raw for
+artwork and sidecars. Full and scoped discovery share the same planner.
+
+Movie-folder recognition now uses VideoListResolver's version grouping and
+MovieResolver's sample regex. A root/mixed folder or a directory with ordinary
+subfolders does not supply an extras owner. This follows
+BaseItem.SearchesContainingFolderForExtras; it also sets IsInMixedFolder and
+uses the filename for movies that do not have their own folder.
+
+Seven integration tests pass, including scoped ignored-file discovery with NFO
+preservation and nested/multiple-movie ownership. A naming test covers the
+reference sample regex's word boundaries.
+
+### Live Jellyfin 12.1 reference
+
+The Docker limitation was worked around by installing a temporary .NET 10 SDK
+under `/tmp` and building the exact `v12.1` source tag. The resulting server
+reports 12.1.0. A disposable server on port 18132 scanned generated one-second
+media with internet metadata disabled. Local results are under
+`/tmp/ferrofin-extras-oracle/` (reference.json and extended.json).
+
+Observed in a single-movie directory:
+
+| Path relative to the movie folder | Stored kind / ExtraType |
+| --- | --- |
+| `Solo.mkv` | Movie / null |
+| `Extras/Deleted.Scenes.avi` | Video / 0 |
+| `Solo-trailer.mkv` | Trailer / 2 |
+| `Solo-sample.mkv` | Video / 7 |
+| `Solo_sample.mkv` | Video / 7 |
+| `samples/clip.mkv` | Video / 7 |
+| `sample.mkv`, `Solo.sample.mkv` | Absent |
+
+All retained extras have an owner and null ParentId/TopParentId. Hidden files
+and ignored directories were absent. In a directory containing a nested release,
+Jellyfin marked the outer movie as mixed and did not create its extras; the
+nested movie retained its own suffix sample. These observations match the new
+ownership tests. Jellyfin also preserves physical folder rows in that layout;
+Ferrofin's existing flattening of ordinary movie subfolders is a separate
+hierarchy mismatch, so whole-library folder counts are not asserted equal.
+
+Phase 3 review caught owner registration treating each stacked part and version
+as an unrelated movie. Registration now uses the grouped title returned by the
+naming resolver. Generic extras choose the primary; named extras choose the
+longest version prefix ending at a delimiter, as `Video.GetOwnerIdForExtra` does.
+Adopted Video identities are reused for owners even outside a scoped refresh.
+All nine extras integration tests pass (full/scoped versions, stacks, adopted
+identities included). The second independent review approved this phase.

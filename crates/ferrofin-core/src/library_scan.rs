@@ -2115,6 +2115,8 @@ struct PlanCtx<'a> {
     scope: PlanScope<'a>,
     /// The directories that failed to list this pass.
     unlisted: std::cell::RefCell<Vec<String>>,
+    /// Resolved movie owners, including files outside a scoped refresh.
+    owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
     /// The library locations of the pass (without a trailing slash).
     locations: std::collections::HashSet<String>,
     /// The locations that listed empty or failed to list this pass.
@@ -2130,6 +2132,7 @@ impl<'a> PlanCtx<'a> {
             naming,
             scope,
             unlisted: std::cell::RefCell::new(Vec::new()),
+            owner_paths: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -2179,6 +2182,8 @@ fn trimmed_dir(dir: &str) -> &str {
 struct PlanOutput {
     /// The planned items, in plan order.
     items: Vec<Planned>,
+    /// Paths needed to reuse adopted alternate-version owner identities.
+    owner_paths: HashMap<Uuid, String>,
     /// The directories that failed to list (`Folder.ValidateChildrenInternal2`
     /// stops on an `IOException`, `Folder.cs:433-452`): what sits under them
     /// is unknown, so nothing at or under them is removed this scan.
@@ -3293,6 +3298,7 @@ impl LibraryScanner {
             Box::pin(self.serve_lane(run)).await;
             let part = self.plan_in(library, &all_folders, PlanScope::ALL, date_added);
             plan.items.extend(part.items);
+            plan.owner_paths.extend(part.owner_paths);
             plan.unlisted.extend(part.unlisted);
             plan.inaccessible.extend(part.inaccessible);
         }
@@ -3615,11 +3621,15 @@ impl LibraryScanner {
     async fn reuse_adopted_video_versions(
         &self,
         planned: &mut [Planned],
+        owner_paths: &HashMap<Uuid, String>,
     ) -> Result<(), ServiceError> {
         let paths: Vec<String> = planned
             .iter()
             .filter(|p| p.entity.type_.ends_with(".Movie"))
             .filter_map(|p| p.entity.path.clone())
+            .chain(owner_paths.values().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect();
         if paths.is_empty() {
             return Ok(());
@@ -3633,7 +3643,24 @@ impl LibraryScanner {
             .filter(|row| row.item_type == "MediaBrowser.Controller.Entities.Video")
             .filter_map(|row| Some((row.path.clone()?, row)))
             .collect();
+        let owner_ids: HashMap<String, String> = owner_paths
+            .iter()
+            .filter(|(id, _)| !existing.contains(id))
+            .filter_map(|(id, path)| {
+                versions
+                    .get(path)
+                    .map(|row| (guid_to_db(*id), guid_to_db(row.id)))
+            })
+            .collect();
         for item in planned {
+            if let Some(owner) = item
+                .entity
+                .owner_id
+                .as_ref()
+                .and_then(|id| owner_ids.get(id))
+            {
+                item.entity.owner_id = Some(owner.clone());
+            }
             if item.entity.type_.ends_with(".Movie")
                 && !existing.contains(&item.id)
                 && let Some(row) = item
@@ -3688,6 +3715,7 @@ impl LibraryScanner {
     ) -> Result<ScanOutcome, ServiceError> {
         let PlanOutput {
             items: mut planned,
+            owner_paths,
             mut unlisted,
             inaccessible,
             date_added,
@@ -3711,7 +3739,8 @@ impl LibraryScanner {
                 unlisted.push(location);
             }
         }
-        self.reuse_adopted_video_versions(&mut planned).await?;
+        self.reuse_adopted_video_versions(&mut planned, &owner_paths)
+            .await?;
         let options = run.options;
         if let Some(touched) = run.touched {
             touched
@@ -8861,6 +8890,7 @@ impl LibraryScanner {
         }
         PlanOutput {
             items: out,
+            owner_paths: ctx.owner_paths.into_inner(),
             unlisted: ctx.unlisted.into_inner(),
             inaccessible: ctx.inaccessible.into_inner(),
             date_added,
@@ -8874,8 +8904,13 @@ impl LibraryScanner {
     fn list(&self, dir: &str, ctx: &PlanCtx<'_>) -> Vec<FileSystemEntryInfo> {
         match self.file_system.try_get_file_system_entries(dir) {
             Ok(entries) => {
+                // Availability is measured before exclusions: a mounted
+                // directory containing only ignored files is still reachable.
                 ctx.listed_location(dir, entries.is_empty());
                 entries
+                    .into_iter()
+                    .filter(|entry| !crate::resolvers::should_ignore_path(&entry.path))
+                    .collect()
             }
             Err(err) => {
                 ctx.failed_to_list(dir, &err);
@@ -9067,7 +9102,29 @@ impl LibraryScanner {
             self.plan_disc_movie(dir, cf, video_type, ctx, out);
             return;
         }
-        for entry in self.list(dir, ctx) {
+        let entries = self.list(dir, ctx);
+        let movie = (dir != root)
+            .then(|| movie_in_own_folder(&entries, naming, root))
+            .flatten();
+        let own_folder = movie.is_some();
+        if let Some(movie) = movie {
+            // Resolve ownership from the same grouped title as FindMovie.
+            // Stacked parts are one owner; alternate versions can own named extras.
+            let owners = movies_by_dir.entry(dir.to_owned()).or_default();
+            for version in std::iter::once(&movie).chain(movie.alternate_versions.iter()) {
+                if let Some(file) = version.files.first()
+                    && let Some(id) = item_type_lookup::derive_item_id_with(
+                        &self.id_derivation,
+                        BaseItemKind::Movie,
+                        &file.path,
+                    )
+                {
+                    owners.push((id, file_stem(&file.path)));
+                    ctx.owner_paths.borrow_mut().insert(id, file.path.clone());
+                }
+            }
+        }
+        for entry in entries {
             if entry.type_ == FileSystemEntryType::Directory {
                 // TODO(parity): a plain subfolder (`Movies/Collection/…`,
                 // not a title's own folder) is flattened: its movies are
@@ -9119,18 +9176,6 @@ impl LibraryScanner {
                 continue;
             }
             if !ctx.scope.keeps(&entry.path) {
-                // Outside a scoped plan's paths: only its id is needed, for
-                // the owner of an extra beside it that is in scope. No stat.
-                if let Some(id) = item_type_lookup::derive_item_id_with(
-                    &self.id_derivation,
-                    BaseItemKind::Movie,
-                    &entry.path,
-                ) {
-                    movies_by_dir
-                        .entry(dir.to_owned())
-                        .or_default()
-                        .push((id, file_stem(&entry.path)));
-                }
                 continue;
             }
             let (clean_name, year) = video_resolver::resolve_file(Some(&entry.path), naming, None)
@@ -9139,7 +9184,7 @@ impl LibraryScanner {
             // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
             // file in the library root keeps its clean_date_time-parsed name (year stripped).
             // ProductionYear is still populated either way.
-            let name = if dir == root {
+            let name = if !own_folder {
                 clean_name
             } else {
                 folder_name(dir).unwrap_or(clean_name)
@@ -9150,13 +9195,10 @@ impl LibraryScanner {
                 continue;
             };
             entity.is_movie = true;
+            entity.is_in_mixed_folder = !own_folder;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
             set_video_type(&mut entity, file_video_type(&entry.path));
-            movies_by_dir
-                .entry(dir.to_owned())
-                .or_default()
-                .push((id, file_stem(&entry.path)));
             ctx.emit(
                 out,
                 Planned {
@@ -10977,39 +11019,72 @@ fn path_is_under(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Resolves which movie an extra belongs to: a movie in the extra's own
-/// directory whose file stem prefixes the extra's (`Movie-trailer.mkv` beside
-/// `Movie.mkv`), the directory's single movie, or the parent directory's
-/// single movie (`Movie (2020)/trailers/x.mkv`). Mirrors upstream's ownership
-/// (extras attach to the item owning their folder).
+/// MovieResolver.FindMovie accepts one resolved movie (including versions)
+/// and no ordinary subdirectories. Only such a movie searches its containing
+/// folder for extras (BaseItem.SearchesContainingFolderForExtras).
+fn movie_in_own_folder(
+    entries: &[FileSystemEntryInfo],
+    naming: &NamingOptions,
+    root: &str,
+) -> Option<ferrofin_naming::video::VideoInfo> {
+    if entries.iter().any(|e| {
+        e.type_ == FileSystemEntryType::Directory
+            && !naming
+                .all_extras_types_folder_names
+                .contains_key(&e.name.to_lowercase())
+    }) {
+        return None;
+    }
+    let videos: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.type_ != FileSystemEntryType::Directory
+                && !video_resolver::is_sample_filename(&e.name)
+        })
+        .filter_map(|e| video_resolver::resolve_file(Some(&e.path), naming, Some(root)))
+        .collect();
+    let movies = ferrofin_naming::video::VideoListResolver::new(naming).resolve(
+        &videos,
+        true,
+        true,
+        Some(root),
+        Some(ferrofin_model::data::CollectionType::movies),
+    );
+    let mut titles = movies
+        .into_iter()
+        .filter(|movie| movie.extra_type.is_none());
+    let movie = titles.next()?;
+    titles.next().is_none().then_some(movie)
+}
+
+/// Video.GetOwnerIdForExtra selects the longest version-name prefix with a
+/// delimiter boundary, otherwise the primary title. Only eligible folders
+/// enter the map; a stack contributes its first part, not each raw file.
 fn owner_for_extra(
     path: &str,
     movies_by_dir: &std::collections::HashMap<String, Vec<(Uuid, String)>>,
 ) -> Option<Uuid> {
-    let dir = std::path::Path::new(path)
-        .parent()?
-        .to_string_lossy()
-        .into_owned();
-    let stem = file_stem(path);
-    if let Some(movies) = movies_by_dir.get(&dir) {
-        if let Some((id, _)) = movies
-            .iter()
-            .find(|(_, movie_stem)| stem.to_lowercase().starts_with(&movie_stem.to_lowercase()))
-        {
-            return Some(*id);
+    let dir = Path::new(path).parent()?;
+    if let Some(movies) = dir.to_str().and_then(|dir| movies_by_dir.get(dir)) {
+        let stem = file_stem(path).to_lowercase();
+        let mut owner = movies.first()?.0;
+        let mut matched = 0;
+        for (id, name) in movies {
+            let name = name.to_lowercase();
+            if name.len() > matched
+                && let Some(rest) = stem.strip_prefix(&name)
+                && rest.starts_with([' ', '-', '_', '.'])
+            {
+                owner = *id;
+                matched = name.len();
+            }
         }
-        if let [(id, _)] = movies.as_slice() {
-            return Some(*id);
-        }
+        return Some(owner);
     }
-    let parent = std::path::Path::new(&dir)
-        .parent()?
-        .to_string_lossy()
-        .into_owned();
-    match movies_by_dir.get(&parent).map(Vec::as_slice) {
-        Some([(id, _)]) => Some(*id),
-        _ => None,
-    }
+    movies_by_dir
+        .get(dir.parent()?.to_str()?)?
+        .first()
+        .map(|(id, _)| *id)
 }
 
 /// The three stat timestamps the creation-time rule reads.
