@@ -2119,6 +2119,8 @@ struct PlanCtx<'a> {
     excluded: std::cell::RefCell<Vec<String>>,
     /// Resolved movie owners, including files outside a scoped refresh.
     owner_paths: std::cell::RefCell<HashMap<Uuid, String>>,
+    /// Raw direct file counts before discovery ignores, for extras folder context.
+    direct_file_counts: std::cell::RefCell<HashMap<String, usize>>,
     /// The library locations of the pass (without a trailing slash).
     locations: std::collections::HashSet<String>,
     /// The locations that listed empty or failed to list this pass.
@@ -2136,6 +2138,7 @@ impl<'a> PlanCtx<'a> {
             unlisted: std::cell::RefCell::new(Vec::new()),
             excluded: std::cell::RefCell::new(Vec::new()),
             owner_paths: std::cell::RefCell::new(HashMap::new()),
+            direct_file_counts: std::cell::RefCell::new(HashMap::new()),
             locations: std::collections::HashSet::new(),
             inaccessible: std::cell::RefCell::new(Vec::new()),
             date_added: DateAdded::default(),
@@ -3632,7 +3635,9 @@ impl LibraryScanner {
         let paths: Vec<String> = planned
             .iter()
             .filter(|p| {
-                p.entity.type_.ends_with(".Movie") || p.entity.type_.ends_with(".MusicVideo")
+                p.entity.type_.ends_with(".Movie")
+                    || p.entity.type_.ends_with(".MusicVideo")
+                    || p.entity.owner_id.is_some()
             })
             .filter_map(|p| p.entity.path.clone())
             .chain(owner_paths.values().cloned())
@@ -3646,6 +3651,15 @@ impl LibraryScanner {
             return Ok(());
         };
         let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let existing_extras: HashMap<String, Uuid> = rows
+            .iter()
+            .filter(|row| {
+                [".Episode", ".Video", ".Trailer", ".Audio"]
+                    .iter()
+                    .any(|kind| row.item_type.ends_with(kind))
+            })
+            .filter_map(|row| Some((row.path.clone()?, row.id)))
+            .collect();
         let existing_movies: HashMap<String, ItemPathRow> = rows
             .iter()
             .filter(|row| {
@@ -3682,6 +3696,17 @@ impl LibraryScanner {
                 if row.item_type == "MediaBrowser.Controller.Entities.Video" {
                     item.entity.type_.clone_from(&row.item_type);
                 }
+            }
+            if item.entity.owner_id.is_some()
+                && !existing.contains(&item.id)
+                && let Some(id) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| existing_extras.get(path))
+            {
+                item.id = *id;
+                item.entity.id = guid_to_db(*id);
             }
             if let Some(owner) = item
                 .entity
@@ -4597,6 +4622,12 @@ impl LibraryScanner {
                 remote_answered: has_remote_metadata,
             },
         );
+        // FindExtras corrects filename-derived names even on existing extras;
+        // an explicit Name field lock is the only opt-out upstream.
+        if entity.owner_id.is_some() && !locked_fields.contains(&MetadataField::Name) {
+            entity.name.clone_from(&item.entity.name);
+            settle_sort_name(&mut entity);
+        }
         self.apply_parental_rating_score(&mut entity);
         // The folder's new mtime is written with the music pass's save, not
         // this one (see `ItemPass::music_pending`).
@@ -8954,6 +8985,13 @@ impl LibraryScanner {
                 // Availability is measured before exclusions: a mounted
                 // directory containing only ignored files is still reachable.
                 ctx.listed_location(dir, entries.is_empty());
+                ctx.direct_file_counts.borrow_mut().insert(
+                    dir.to_owned(),
+                    entries
+                        .iter()
+                        .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
+                        .count(),
+                );
                 entries
                     .into_iter()
                     .filter(|entry| {
@@ -9096,52 +9134,189 @@ impl LibraryScanner {
                 ctx.excluded.borrow_mut().push(path);
                 continue;
             };
-            // The extra's item KIND comes from its extra type, per
-            // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
-            // three-way switch, not a two-way one:
-            //   ExtraType.Trailer   => _trailerResolvers  (GenericVideoResolver<Trailer>)
-            //   ExtraType.ThemeSong => null               ("For audio we'll have
-            //                          to rely on the AudioResolver, which is a
-            //                          'built-in'") — so a theme song is an
-            //                          AUDIO item, not a video one
-            //   _                   => _videoResolvers
-            // A `Trailer` is what makes a `-trailer.*` file visible to
-            // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
-            // theme song is what makes `/Items/{id}/ThemeMedia` return it under
-            // `ThemeSongsResult` rather than as a stray Video row.
-            let (kind, media_type) = match extra_type {
-                ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
-                ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
-                _ => (BaseItemKind::Video, "Video"),
-            };
-            let Some((id, mut entity)) =
-                self.base_item(ctx, kind, cf, cf, file_stem(&path), &path, false)
-            else {
+            self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+        }
+    }
+
+    /// Emit the same owned media shape for movies, series and physical seasons.
+    fn emit_extra(
+        &self,
+        path: &str,
+        extra_type: ferrofin_model::entities::ExtraType,
+        owner: Uuid,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        // The extra's item KIND comes from its extra type, per
+        // `ExtraResolver.GetResolversForExtraType` (v10.11.8), which is a
+        // three-way switch, not a two-way one:
+        //   ExtraType.Trailer   => _trailerResolvers  (GenericVideoResolver<Trailer>)
+        //   ExtraType.ThemeSong => null               ("For audio we'll have
+        //                          to rely on the AudioResolver, which is a
+        //                          'built-in'") — so a theme song is an
+        //                          AUDIO item, not a video one
+        //   _                   => _videoResolvers
+        // A `Trailer` is what makes a `-trailer.*` file visible to
+        // `GET /Trailers` and `/Items?includeItemTypes=Trailer`; an `Audio`
+        // theme song is what makes `/Items/{id}/ThemeMedia` return it under
+        // `ThemeSongsResult` rather than as a stray Video row.
+        let (kind, media_type) = match extra_type {
+            ferrofin_model::entities::ExtraType::Trailer => (BaseItemKind::Trailer, "Video"),
+            ferrofin_model::entities::ExtraType::ThemeSong => (BaseItemKind::Audio, "Audio"),
+            _ => (BaseItemKind::Video, "Video"),
+        };
+        let Some((id, mut entity)) =
+            self.base_item(ctx, kind, cf, cf, file_stem(path), path, false)
+        else {
+            return;
+        };
+        entity.media_type = Some(media_type.to_owned());
+        entity.extra_type = Some(extra_type as i32);
+        entity.owner_id = Some(guid_to_db(owner));
+        // BaseItem.RefreshExtras clears the physical parent. An extra's
+        // library is reached through its owner, not GetTopParent's parent
+        // walk. Keep the collection ancestor (GetCollectionFolders follows
+        // OwnerId), also used by scan policy and progress accounting.
+        entity.parent_id = None;
+        entity.top_parent_id = None;
+        // A video extra resolves through `BaseVideoResolver` like any
+        // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
+        // its `VideoType` from the extension.
+        if media_type == "Video" {
+            set_video_type(&mut entity, file_video_type(path));
+        }
+        ctx.emit(
+            out,
+            Planned {
+                id,
+                entity,
+                ancestors: vec![cf],
+            },
+        );
+    }
+
+    /// Resolve a TV owner's direct extras before its seasons or episodes.
+    /// Sort every candidate before applying scope, so type numbering is stable.
+    fn plan_tv_extras(
+        &self,
+        entries: &[FileSystemEntryInfo],
+        owner_dir: &str,
+        owner: Uuid,
+        cf: Uuid,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) -> std::collections::HashSet<String> {
+        let mut consumed = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+        for entry in entries {
+            if entry.type_ == FileSystemEntryType::Directory {
+                if ctx
+                    .naming
+                    .all_extras_types_folder_names
+                    .contains_key(&entry.name.to_lowercase())
+                {
+                    consumed.insert(entry.path.clone());
+                    ctx.excluded.borrow_mut().push(entry.path.clone());
+                    let files: Vec<_> = self
+                        .list(&entry.path, ctx)
+                        .into_iter()
+                        .filter(|file| file.type_ != FileSystemEntryType::Directory)
+                        .collect();
+                    let mixed = ctx
+                        .direct_file_counts
+                        .borrow()
+                        .get(&entry.path)
+                        .copied()
+                        .unwrap_or(0)
+                        > 1;
+                    candidates.extend(files.into_iter().map(|file| (file.path, mixed)));
+                }
+            } else {
+                candidates.push((entry.path.clone(), false));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        let Some(owner_info) =
+            video_resolver::resolve_directory(Some(owner_dir), ctx.naming, true, Some(owner_dir))
+        else {
+            return consumed;
+        };
+        let mut counts = HashMap::new();
+        for (path, mixed) in candidates {
+            let extra = ferrofin_naming::video::extra_rule_resolver::get_extra_info(
+                &path,
+                ctx.naming,
+                Some(owner_dir),
+            );
+            let Some(extra_type) = extra.extra_type else {
                 continue;
             };
-            entity.media_type = Some(media_type.to_owned());
-            entity.extra_type = Some(extra_type as i32);
-            entity.owner_id = Some(guid_to_db(owner));
-            // BaseItem.RefreshExtras clears the physical parent. An extra's
-            // library is reached through its owner, not GetTopParent's parent
-            // walk. Keep the collection ancestor (GetCollectionFolders follows
-            // OwnerId), also used by scan policy and progress accounting.
-            entity.parent_id = None;
-            entity.top_parent_id = None;
-            // A video extra resolves through `BaseVideoResolver` like any
-            // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
-            // its `VideoType` from the extension.
-            if media_type == "Video" {
-                set_video_type(&mut entity, file_video_type(&path));
+            let Some(rule) = extra.rule.as_ref() else {
+                continue;
+            };
+            if !extra_matches_owner(&path, rule.rule_type, &owner_info, ctx.naming) {
+                continue;
             }
-            ctx.emit(
-                out,
-                Planned {
-                    id,
-                    entity,
-                    ancestors: vec![cf],
-                },
-            );
+            consumed.insert(path.clone());
+            let mut name = video_resolver::resolve_file(Some(&path), ctx.naming, Some(owner_dir))
+                .map_or_else(|| file_stem(&path), |info| info.name);
+            let named_after_owner = extra.rule.is_some_and(|rule| match rule.rule_type {
+                ferrofin_naming::video::ExtraRuleType::Filename => true,
+                ferrofin_naming::video::ExtraRuleType::Suffix => {
+                    name.eq_ignore_ascii_case(&owner_info.name)
+                }
+                _ => false,
+            });
+            if named_after_owner {
+                let count = counts.entry(extra_type as i32).or_insert(0);
+                *count += 1;
+                name = self.extra_type_name(extra_type, *count);
+            }
+            if ctx.scope.keeps(&path) {
+                ctx.excluded.borrow_mut().push(path.clone());
+                let first = out.len();
+                self.emit_extra(&path, extra_type, owner, cf, ctx, out);
+                for item in &mut out[first..] {
+                    item.entity.name = Some(name.clone());
+                    item.entity.is_in_mixed_folder = mixed;
+                }
+            }
+        }
+        consumed
+    }
+
+    fn extra_type_name(&self, extra: ferrofin_model::entities::ExtraType, count: i32) -> String {
+        use ferrofin_model::entities::ExtraType;
+        let key = match extra {
+            ExtraType::Clip => "NameExtraClip",
+            ExtraType::Trailer => "NameExtraTrailer",
+            ExtraType::BehindTheScenes => "NameExtraBehindTheScenes",
+            ExtraType::DeletedScene => "NameExtraDeletedScene",
+            ExtraType::Interview => "NameExtraInterview",
+            ExtraType::Scene => "NameExtraScene",
+            ExtraType::Sample => "NameExtraSample",
+            ExtraType::ThemeSong => "NameExtraThemeSong",
+            ExtraType::ThemeVideo => "NameExtraThemeVideo",
+            ExtraType::Featurette => "NameExtraFeaturette",
+            ExtraType::Short => "NameExtraShort",
+            ExtraType::Unknown => "NameExtraUnknown",
+        };
+        let fallback;
+        let localization = if let Some(localization) = &self.localization {
+            localization.as_ref()
+        } else {
+            fallback = crate::localization_manager::LocalizationManager::new("");
+            &fallback
+        };
+        let name = localization.get_localized_string(key);
+        if count == 1 {
+            name
+        } else {
+            localization
+                .get_localized_string("NameExtraNumbered")
+                .replace("{0}", &name)
+                .replace("{1}", &count.to_string())
         }
     }
 
@@ -9519,7 +9694,15 @@ impl LibraryScanner {
         // navigate (Series→Seasons→Episodes) — without seasons, a show renders
         // with no episodes.
         let mut loose: Vec<String> = Vec::new();
-        for entry in self.list(series_dir, ctx) {
+        ctx.owner_paths
+            .borrow_mut()
+            .insert(series_id, series_dir.to_owned());
+        let entries = self.list(series_dir, ctx);
+        let extras = self.plan_tv_extras(&entries, series_dir, series_id, cf, ctx, out);
+        for entry in entries {
+            if extras.contains(&entry.path) {
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
                     continue;
@@ -9539,6 +9722,9 @@ impl LibraryScanner {
                     ) else {
                         continue;
                     };
+                    ctx.owner_paths
+                        .borrow_mut()
+                        .insert(season_id, entry.path.clone());
                     e.index_number = num.map(i64::from);
                     e.sort_name = Some(season_sort_name(e.index_number, &name));
                     e.series_id = Some(guid_to_db(series_id));
@@ -9564,7 +9750,7 @@ impl LibraryScanner {
                         out,
                     );
                 } else {
-                    // A non-season subfolder (extras, etc.): collect its videos as
+                    // A non-season subfolder: collect its videos as
                     // loose episodes (grouped into virtual seasons below).
                     self.collect_videos(&entry.path, ctx, &mut loose);
                 }
@@ -9710,7 +9896,18 @@ impl LibraryScanner {
         out: &mut Vec<Planned>,
     ) {
         let naming = ctx.naming;
-        for entry in self.list(dir, ctx) {
+        let owner = season.map_or(series_id, |(id, _)| id);
+        let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
+        let entries = self.list(dir, ctx);
+        let extras = if owner_dir.as_deref() == Some(dir) {
+            self.plan_tv_extras(&entries, dir, owner, cf, ctx, out)
+        } else {
+            std::collections::HashSet::new()
+        };
+        for entry in entries {
+            if extras.contains(&entry.path) {
+                continue;
+            }
             if entry.type_ == FileSystemEntryType::Directory {
                 if !ctx.scope.visits(&entry.path) {
                     continue;
@@ -11181,6 +11378,50 @@ fn owner_for_extra(
         .map(|(id, _)| *id)
 }
 
+/// `ExtraResolver.TryGetExtraTypeForOwner`: filename prefix first, then
+/// containing folder (one level higher only for a directory-name rule).
+fn extra_matches_owner(
+    path: &str,
+    rule: ferrofin_naming::video::ExtraRuleType,
+    owner: &ferrofin_naming::video::VideoFileInfo,
+    naming: &NamingOptions,
+) -> bool {
+    fn trimmed(value: &str, delimiters: &[char]) -> String {
+        ferrofin_util::string_extensions::upper_invariant(
+            value.trim_end().trim_end_matches(delimiters).trim_end(),
+        )
+    }
+    let extra = video_resolver::clean_date_time(&file_stem(path), naming);
+    let extra_name = trimmed(&extra.name, &naming.video_flag_delimiters);
+    let owner_file = trimmed(&file_stem(&owner.path), &naming.video_flag_delimiters);
+    let owner_name = trimmed(&owner.name, &naming.video_flag_delimiters);
+    if (!owner_file.is_empty() && extra_name.starts_with(&owner_file))
+        || (!owner_name.is_empty()
+            && extra_name.starts_with(&owner_name)
+            && extra.year == owner.year)
+    {
+        return true;
+    }
+    let parent = Path::new(path)
+        .parent()
+        .and_then(|parent| {
+            if rule == ferrofin_naming::video::ExtraRuleType::DirectoryName {
+                parent.parent()
+            } else {
+                Some(parent)
+            }
+        })
+        .and_then(Path::to_str);
+    let owner_dir = if owner.is_directory {
+        Some(owner.path.as_str())
+    } else {
+        Path::new(&owner.path).parent().and_then(Path::to_str)
+    };
+    parent
+        .zip(owner_dir)
+        .is_some_and(|(parent, owner)| parent.eq_ignore_ascii_case(owner))
+}
+
 /// The three stat timestamps the creation-time rule reads.
 #[derive(Debug, Clone, Copy)]
 struct FileTimes {
@@ -12223,6 +12464,9 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     row.season_name.clone_from(&scanned.season_name);
     if !scanned.type_.ends_with(".Book") {
         row.series_name.clone_from(&scanned.series_name);
+    }
+    if scanned.owner_id.is_some() {
+        row.series_presentation_unique_key = None;
     }
     if scanned.series_presentation_unique_key.is_some() {
         row.series_presentation_unique_key

@@ -1412,6 +1412,7 @@ pub(crate) fn scan_save_changes_row(
                     )
                     .is_some();
                 }
+                "Name" | "CleanName" | "SortName" if saved.owner_id.is_some() => new,
                 col if stored.is_locked && LOCKED_PRESERVED_COLUMNS.contains(&col) => old,
                 _ => new,
             };
@@ -3090,6 +3091,13 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
             format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
         } else {
             r#""IsLocked" = 1"#.to_owned()
+        };
+        // FindExtras owns the filename-derived display name. The scanner
+        // preserves an explicit Name field lock before handing us the row.
+        let kept = if ["Name", "CleanName", "SortName"].contains(col) {
+            format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+        } else {
+            kept
         };
         let locked_value = if *col == "Data" {
             LOCKED_DATA_SQL.to_owned()
@@ -5852,6 +5860,11 @@ mod tests {
                 format!(r#""IsLocked" = 1 AND nullif("{col}", '') IS NOT NULL"#)
             } else {
                 r#""IsLocked" = 1"#.to_owned()
+            };
+            let kept = if ["Name", "CleanName", "SortName"].contains(col) {
+                format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+            } else {
+                kept
             };
             let locked_value = if *col == "Data" {
                 super::LOCKED_DATA_SQL.to_owned()

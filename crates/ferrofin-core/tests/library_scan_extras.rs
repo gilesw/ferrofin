@@ -170,6 +170,15 @@ async fn normal_scan_repairs_locked_unchanged_extra_relationships() {
         .save_items(std::slice::from_ref(&extra))
         .await
         .unwrap();
+    f.store
+        .add_locked_fields(
+            Uuid::parse_str(&id).unwrap(),
+            &[ferrofin_db::enums::metadata_field::to_i32(
+                ferrofin_model::entities::MetadataField::Name,
+            )],
+        )
+        .await
+        .unwrap();
     play(&f.db, &id).await;
     let poster = f.media.join("extra-poster.png");
     std::fs::write(&poster, b"retained image").unwrap();
@@ -693,6 +702,168 @@ async fn plain_space_samples_follow_multi_item_resolution() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Full/scoped repair, unavailable directory and play history in one fixture.
+async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
+    for scoped in [false, true] {
+        let extra_path = "Show/Season 01/Extras/bonus.mkv";
+        let f = Fixture::with_type(
+            &[
+                "Show/Season 01/Show S01E01.mkv",
+                "Show/Extras/bonus.mkv",
+                "Show/Show-trailer.mkv",
+                "Show/theme.mp3",
+                "Show/trailer.mkv",
+                "Show/Extras/sample.mkv",
+                extra_path,
+                "Show/Season 01/Season 01-trailer.mkv",
+                "Show/Season 01/theme.mp3",
+                "Show/Extras/nested/ignored.mkv",
+            ],
+            CollectionTypeOptions::tvshows,
+        )
+        .await;
+        f.scanner.scan_all().await.unwrap();
+        let series = f.row("Show").await;
+        let season = f.row("Show/Season 01").await;
+        for (owner, paths) in [
+            (
+                &series.id,
+                vec![
+                    "Show/Extras/bonus.mkv",
+                    "Show/Show-trailer.mkv",
+                    "Show/theme.mp3",
+                ],
+            ),
+            (
+                &season.id,
+                vec![
+                    extra_path,
+                    "Show/Season 01/Season 01-trailer.mkv",
+                    "Show/Season 01/theme.mp3",
+                ],
+            ),
+        ] {
+            for path in paths {
+                let row = f.row(path).await;
+                assert_eq!(row.owner_id.as_ref(), Some(owner));
+                assert!(row.parent_id.is_none() && row.top_parent_id.is_none());
+                assert!(row.extra_type.is_some());
+            }
+        }
+        assert_eq!(
+            f.row("Show/theme.mp3").await.name.as_deref(),
+            Some("Theme Song")
+        );
+        assert_eq!(
+            f.row("Show/trailer.mkv").await.name.as_deref(),
+            Some("Trailer 2")
+        );
+        assert!(f.row("Show/Extras/bonus.mkv").await.is_in_mixed_folder);
+        assert!(!f.row(extra_path).await.is_in_mixed_folder);
+        std::fs::remove_file(f.media.join("Show/Show-trailer.mkv")).unwrap();
+        f.scanner.scan_all().await.unwrap();
+        assert_eq!(
+            f.row("Show/trailer.mkv").await.name.as_deref(),
+            Some("Trailer")
+        );
+        let episode = f.row("Show/Season 01/Show S01E01.mkv").await;
+        assert_eq!(episode.parent_id.as_ref(), Some(&season.id));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Type LIKE '%.Episode'")
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path LIKE '%ignored.mkv'")
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        // Simulate the old scanner's Episode at the same path, including
+        // locked metadata and episode grouping columns. Identity must survive.
+        let mut old = f.row(extra_path).await;
+        f.store
+            .delete_items(&[Uuid::parse_str(&old.id).unwrap()])
+            .await
+            .unwrap();
+        let old_id = guid_to_db(Uuid::new_v4());
+        old.id = old_id.clone();
+        old.type_ = "MediaBrowser.Controller.Entities.TV.Episode".into();
+        old.owner_id = None;
+        old.extra_type = None;
+        let mut bogus = season.clone();
+        bogus.id = guid_to_db(Uuid::new_v4());
+        bogus.path = Some(
+            f.media
+                .join("Show/Season 01/Extras")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        bogus.name = Some("Extras".into());
+        let bogus_id = Uuid::parse_str(&bogus.id).unwrap();
+        old.parent_id = Some(bogus.id.clone());
+        f.store.save_items(&[bogus]).await.unwrap();
+        old.top_parent_id = Some(guid_to_db(f.library));
+        old.series_presentation_unique_key = Some("old-series".into());
+        old.index_number = Some(42);
+        old.parent_index_number = Some(1);
+        old.name = Some("Kept title".into());
+        old.is_locked = true;
+        f.store.save_items(&[old]).await.unwrap();
+        f.store
+            .add_locked_fields(
+                Uuid::parse_str(&old_id).unwrap(),
+                &[ferrofin_db::enums::metadata_field::to_i32(
+                    ferrofin_model::entities::MetadataField::Name,
+                )],
+            )
+            .await
+            .unwrap();
+        play(&f.db, &old_id).await;
+        *f.fs.fail.lock().unwrap() = Some(
+            f.media
+                .join("Show/Season 01/Extras")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        f.scanner.scan_all().await.unwrap();
+        assert!(f.repo.retrieve_item(bogus_id).await.unwrap().is_some());
+        assert_eq!(f.row(extra_path).await.id, old_id);
+        *f.fs.fail.lock().unwrap() = None;
+        if scoped {
+            f.scanner
+                .scan_paths(&[f.media.join(extra_path).to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+        } else {
+            f.scanner.scan_all().await.unwrap();
+        }
+        let repaired = f.row(extra_path).await;
+        assert_eq!(repaired.id, old_id);
+        assert_eq!(repaired.name.as_deref(), Some("Kept title"));
+        assert!(repaired.is_locked);
+        assert_eq!(repaired.owner_id.as_ref(), Some(&season.id));
+        assert_eq!(repaired.type_, "MediaBrowser.Controller.Entities.Video");
+        assert!(repaired.series_presentation_unique_key.is_none());
+        assert_eq!(repaired.index_number, Some(42)); // locked user metadata
+        let history: (i64, i64) =
+            sqlx::query_as("SELECT Played, PlayCount FROM UserData WHERE ItemId=?")
+                .bind(&old_id)
+                .fetch_one(f.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(history, (1, 1));
+        // An exact-file scan cannot prune the surrounding season; the next
+        // full scan removes it after the extra has been reparented.
+        f.scanner.scan_all().await.unwrap();
+        assert!(f.repo.retrieve_item(bogus_id).await.unwrap().is_none());
+        assert_eq!(f.row(extra_path).await.id, old_id);
+        assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
+    }
+}
+
+#[tokio::test]
 async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
     let main = "Artist/Artist - Song (2020).mkv";
     let extra = "Artist/Extras/clip.mkv";
@@ -742,6 +913,50 @@ async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
         .await
         .unwrap();
     assert_eq!(history, 1);
+}
+
+#[tokio::test]
+async fn tv_extras_match_the_owner_after_media_specific_rule_selection() {
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/Show S01E01.mkv",
+            "Show/Extras/theme.mp3",
+            "Show/theme-music/unrelated-trailer.mkv",
+            "Show/theme-music/Show-trailer.mkv",
+            "Show/Extras/bonus-trailer.mkv",
+            "Show/theme.mp3",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let owner = f.row("Show").await;
+    for rejected in [
+        "Show/Extras/theme.mp3",
+        "Show/theme-music/unrelated-trailer.mkv",
+    ] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path=?")
+            .bind(f.media.join(rejected).to_str().unwrap())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "{rejected}");
+    }
+    for accepted in [
+        "Show/theme-music/Show-trailer.mkv",
+        "Show/Extras/bonus-trailer.mkv",
+        "Show/theme.mp3",
+    ] {
+        assert_eq!(
+            f.row(accepted).await.owner_id.as_ref(),
+            Some(&owner.id),
+            "{accepted}"
+        );
+    }
+    assert_eq!(
+        f.row("Show/Extras/bonus-trailer.mkv").await.extra_type,
+        Some(0)
+    );
 }
 
 #[tokio::test]
