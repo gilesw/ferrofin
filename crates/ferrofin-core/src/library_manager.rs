@@ -80,6 +80,7 @@ pub struct FerrofinLibraryManager {
     /// Bumped whenever a queued scan finishes or the claim is released, so
     /// the callers waiting on a queued scan re-check it.
     scan_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    scan_tracker: Option<crate::scan_progress::ScanProgressTracker>,
     /// Chapter rows, for serving chapter thumbnails. Set by the composition
     /// root; `None` (unit tests) means an item has no chapter images. The
     /// repository (not the `ChapterManager`) is held because the manager is
@@ -971,6 +972,7 @@ impl FerrofinLibraryManager {
             scanner: None,
             scan_queue: Arc::new(Mutex::new(ScanQueue::default())),
             scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
+            scan_tracker: None,
             chapters: None,
             user_root: None,
             years: None,
@@ -986,6 +988,42 @@ impl FerrofinLibraryManager {
         folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
     ) -> Self {
         self.virtual_folders = Some(folders);
+        self
+    }
+
+    /// Exposes queued scan scopes to the shared library progress reader.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        tracker: &crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
+        let queue = Arc::downgrade(&self.scan_queue);
+        tracker.set_queue_reader(Arc::new(move |library, locations| {
+            let Some(queue) = queue.upgrade() else {
+                return false;
+            };
+            let queue = lock_queue(&queue);
+            queue
+                .pending
+                .iter()
+                .chain(queue.lane.iter())
+                .any(|pending| {
+                    let paths = match &pending.request.scope {
+                        ScanTarget::All => return true,
+                        ScanTarget::Library(id) => return *id == library,
+                        ScanTarget::Paths(paths)
+                        | ScanTarget::Changed(paths)
+                        | ScanTarget::Items(paths) => paths,
+                        ScanTarget::Artist { folders, .. } => folders,
+                    };
+                    paths.iter().any(|path| {
+                        locations
+                            .iter()
+                            .any(|location| std::path::Path::new(path).starts_with(location))
+                    })
+                })
+        }));
+        self.scan_tracker = Some(tracker.clone());
         self
     }
 
@@ -1881,11 +1919,14 @@ impl LibraryManager for FerrofinLibraryManager {
         // one item's writes.
         loop {
             if !lock_queue(&self.scan_queue).worker {
-                return;
+                break;
             }
             if progress.changed().await.is_err() {
-                return;
+                break;
             }
+        }
+        if let Some(tracker) = &self.scan_tracker {
+            tracker.shutdown().await;
         }
     }
 }
@@ -2103,8 +2144,10 @@ mod tests {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
         mgr.queue_library_scan().await.expect("queued");
-        // Let the spawned (empty) scan run to completion so its span closes.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for completion rather than assuming the scan finishes within 50 ms.
+        // On this current-thread runtime, the worker closes its span before this
+        // test can observe the idle queue, so the simple exporter has seen it.
+        until_idle(&mgr).await;
         provider.force_flush().expect("flush");
 
         let spans = exporter.get_finished_spans().expect("spans");

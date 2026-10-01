@@ -779,13 +779,15 @@ pub async fn build_app_state(
         id_derivation.clone(),
         paths.default_user_views_path(),
     );
+    let scan_progress = ferrofin_core::scan_progress::ScanProgressTracker::default();
     let virtual_folders_impl = Arc::new(
         ferrofin_core::FerrofinVirtualFolderManager::new(paths.default_user_views_path())
             .with_item_store(Arc::clone(&item_persistence_service))
             .with_items(Arc::clone(&item_repository))
             .with_id_derivation(id_derivation.clone())
             .with_playlists_path(playlists_path.clone())
-            .with_user_root(user_root_store.clone()),
+            .with_user_root(user_root_store.clone())
+            .with_scan_progress(scan_progress.clone()),
     );
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
@@ -1096,7 +1098,9 @@ pub async fn build_app_state(
     // until the collaborators are armed below and while a plugin is
     // disabled).
     scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
-    scanner = scanner.with_events(Arc::clone(&event_manager));
+    scanner = scanner
+        .with_events(Arc::clone(&event_manager))
+        .with_scan_progress(scan_progress.clone());
     let library_scanner = Arc::new(scanner);
     // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
     // (the `dyn LibraryManager` object does not carry that narrow impl).
@@ -1123,6 +1127,7 @@ pub async fn build_app_state(
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
+        .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata
         // edit, a delete) announce themselves after `LibraryUpdateDuration`
         // seconds of quiet. Without this only scans pushed `LibraryChanged`,
@@ -1717,11 +1722,24 @@ pub async fn build_app_state(
             false,
         );
         // Scan % + task completion → the admin dashboard's live displays.
-        forward(
-            &event_bus,
+        // The scan reporter already runs independently of item processing.
+        // Await its delivery here to preserve start/tick/end ordering; spawning
+        // each send independently can resurrect a finished indicator.
+        let progress_sessions = Arc::clone(&sessions);
+        event_bus.subscribe(
             "RefreshProgress",
-            SessionMessageType::RefreshProgress,
-            true,
+            Arc::new(move |payload: &str| {
+                let sessions = Arc::clone(&progress_sessions);
+                let payload = payload.to_owned();
+                Box::pin(async move {
+                    sessions
+                        .send_message_to_admin_sessions(
+                            SessionMessageType::RefreshProgress,
+                            &payload,
+                        )
+                        .await
+                })
+            }),
         );
         forward(
             &event_bus,
