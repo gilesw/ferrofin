@@ -9134,6 +9134,16 @@ impl LibraryScanner {
             .then(|| movie_in_own_folder(&entries, naming, root))
             .flatten();
         let own_folder = movie.is_some();
+        // ResolveMultiple consumes the directory's file list when it finds
+        // any regular movie, and drops sample filenames from that list. If it
+        // finds none, individual-file resolution can still accept a title
+        // whose name contains "sample".
+        let has_movie_files = entries.iter().any(|entry| {
+            entry.type_ != FileSystemEntryType::Directory
+                && !video_resolver::is_sample_filename(&entry.name)
+                && video_resolver::resolve_file(Some(&entry.path), naming, Some(root))
+                    .is_some_and(|video| video.extra_type.is_none())
+        });
         if let Some(movie) = movie {
             // Resolve ownership from the same grouped title as FindMovie.
             // Stacked parts are one owner; alternate versions can own named extras.
@@ -9200,6 +9210,12 @@ impl LibraryScanner {
             // An audio file that matched no extra rule is not a movie: a
             // soundtrack sitting beside the film belongs to a music library.
             if !is_video {
+                continue;
+            }
+            // A sample consumed by ResolveMultiple is neither another movie
+            // nor an extra unless an explicit extra rule matched above.
+            if has_movie_files && video_resolver::is_sample_filename(&entry.name) {
+                ctx.excluded.borrow_mut().push(entry.path);
                 continue;
             }
             if !ctx.scope.keeps(&entry.path) {

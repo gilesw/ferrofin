@@ -633,3 +633,57 @@ async fn play(db: &Database, item: &str) {
     .await
     .expect("user data");
 }
+
+#[tokio::test]
+async fn plain_space_samples_follow_multi_item_resolution() {
+    let path = "Heat (1995)/Bonus sample.mkv";
+    for scoped in [false, true] {
+        let f = Fixture::new(&[
+            MOVIE,
+            path,
+            "Heat (1995)/Heat-sample.mkv",
+            "Loose sample.mkv",
+            "Mixed/One.mkv",
+            "Mixed/Two.mkv",
+            "Mixed/Bonus sample.mkv",
+            "Sample Title/Sample Title.mkv",
+        ])
+        .await;
+        f.scanner.scan_all().await.unwrap();
+        assert!(f.row("Loose sample.mkv").await.extra_type.is_none());
+        assert_eq!(
+            f.row("Heat (1995)/Heat-sample.mkv").await.extra_type,
+            Some(7)
+        );
+        let old = f.legacy(path, false).await;
+        if scoped {
+            f.scanner
+                .scan_paths(&[f.media.join(path).to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+        } else {
+            f.scanner.scan_all().await.unwrap();
+        }
+        assert!(!f.has(&old).await);
+        assert!(f.media.join(path).exists());
+        assert!(
+            f.row("Sample Title/Sample Title.mkv")
+                .await
+                .extra_type
+                .is_none()
+        );
+        let mixed_sample: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path = ?")
+            .bind(
+                f.media
+                    .join("Mixed/Bonus sample.mkv")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(mixed_sample, 0);
+        f.assert_browse(5).await;
+        assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
+    }
+}
