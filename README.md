@@ -179,15 +179,20 @@ support for every 10.11.x or 12.x release.
 >    hidden files and database `-wal`/`-shm` companions if present. Configuration may live
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
-> 3. Copy the complete data and configuration into a clean Ferrofin destination **before
->    its first startup**. Keep the originals and backup intact. An existing `ferrofin.db`
->    or Ferrofin JSON configuration takes precedence over copied Jellyfin files.
+> 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
+>    `root/default/` and `metadata/` to the same relative paths under Ferrofin's data
+>    directory, and its XML configuration into Ferrofin's config directory, **before
+>    Ferrofin's first startup**. [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh)
+>    does this for the Debian layout. Keep the originals and backup intact. An existing
+>    `ferrofin.db` or Ferrofin JSON configuration takes precedence over copied Jellyfin
+>    files.
 >
-> The complete copy preserves library definitions under `root/default/`, images under
-> `metadata/`, and server configuration. In particular, omitting `network.xml` can discard
-> remote-access restrictions and IP filters. Ferrofin imports supported XML settings into
-> JSON; verify the imported settings and investigate import warnings before exposing the
-> server. Jellyfin .NET plugins need Ferrofin-compatible replacements.
+> `root/default/` holds the library definitions and `metadata/` the images. On first start
+> Ferrofin imports the supported settings from `system.xml`, `encoding.xml`, `branding.xml`
+> and `network.xml` into JSON, once; omitting `network.xml` discards remote-access
+> restrictions and IP filters. Verify the imported settings and investigate import
+> warnings before exposing the server. Jellyfin .NET plugins are not copied and need
+> Ferrofin-compatible replacements.
 >
 > Follow the [migration procedure](docs/INSTALL.md#migrate-an-existing-jellyfin-installation)
 > for copying, startup verification, and rollback.
@@ -256,7 +261,8 @@ Not implemented, by design: .NET-style native plugin loading (see above), DLNA s
 discovery (SSDP), and the AMF, VideoToolbox, RKMPP and V4L2M2M hardware transcode paths
 (unverifiable without the hardware; selecting one falls back to software with a logged
 warning). Remote metadata providers (TMDB, TVDB, MusicBrainz, TheAudioDB, fanart) are on
-by default and gated per library exactly as in Jellyfin; OMDb needs an API key.
+by default and gated per library exactly as in Jellyfin, including OMDb. Shared
+provider keys are built in; operator keys are optional overrides.
 
 The tiered matrix with verification depth per area is
 **[`docs/FEATURES.md`](docs/FEATURES.md)**.

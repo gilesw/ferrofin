@@ -710,8 +710,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// `images` — the write path the library scan uses to persist discovered
     /// artwork (posters/backdrops/…) so the image routes can serve it.
     ///
-    /// The default is a no-op (for stub/fake services); the real service deletes
-    /// the item's existing rows and inserts the given set.
+    /// The default is a no-op (for stub/fake services). The real service keeps
+    /// identical rows, updates changed image metadata, inserts new images and
+    /// deletes only images absent from the supplied set.
     ///
     /// # Errors
     ///
