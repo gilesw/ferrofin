@@ -77,6 +77,8 @@ const COLLECTION_EXTENSION: &str = "collection";
 /// over a temp directory.
 #[derive(Clone)]
 pub struct FerrofinVirtualFolderManager {
+    /// Live library counts, shared with dashboard readers.
+    scan_progress: crate::scan_progress::ScanProgressTracker,
     /// The `DefaultUserViewsPath` root under which each virtual folder lives.
     root: PathBuf,
     /// The item store, set by the composition root. When present, adding/removing
@@ -130,6 +132,16 @@ impl std::fmt::Debug for FerrofinVirtualFolderManager {
 }
 
 impl FerrofinVirtualFolderManager {
+    /// Shares scan progress with the library dashboard reader.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        tracker: crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
+        self.scan_progress = tracker;
+        self
+    }
+
     /// Creates a manager rooted at `default_user_views_path`.
     ///
     /// The directory is created lazily on first write; a read of a missing root
@@ -138,6 +150,7 @@ impl FerrofinVirtualFolderManager {
     pub fn new(default_user_views_path: impl Into<PathBuf>) -> Self {
         Self {
             root: default_user_views_path.into(),
+            scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence: None,
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,

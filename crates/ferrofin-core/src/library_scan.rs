@@ -2542,6 +2542,8 @@ const LIBRARY_COLLAGE_SOURCES: i32 = 8;
 
 /// Walks configured libraries and persists their contents as item rows.
 pub struct LibraryScanner {
+    /// Live library counts, shared with dashboard readers.
+    scan_progress: crate::scan_progress::ScanProgressTracker,
     subtitle_downloader: std::sync::OnceLock<Arc<crate::subtitle_downloader::SubtitleDownloader>>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
     file_system: Arc<dyn FileSystem>,
@@ -2718,6 +2720,7 @@ impl LibraryScanner {
         Self {
             virtual_folders,
             file_system,
+            scan_progress: crate::scan_progress::ScanProgressTracker::default(),
             persistence,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             media_encoder: None,
@@ -2749,6 +2752,16 @@ impl LibraryScanner {
             metadata_configuration: None,
             subtitle_downloader: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Shares scan progress with the library dashboard reader.
+    #[must_use]
+    pub fn with_scan_progress(
+        mut self,
+        tracker: crate::scan_progress::ScanProgressTracker,
+    ) -> Self {
+        self.scan_progress = tracker;
+        self
     }
 
     /// Attaches the shared automatic downloader after the library and subtitle
