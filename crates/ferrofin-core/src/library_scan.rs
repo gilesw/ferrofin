@@ -3631,7 +3631,9 @@ impl LibraryScanner {
     ) -> Result<(), ServiceError> {
         let paths: Vec<String> = planned
             .iter()
-            .filter(|p| p.entity.type_.ends_with(".Movie"))
+            .filter(|p| {
+                p.entity.type_.ends_with(".Movie") || p.entity.type_.ends_with(".MusicVideo")
+            })
             .filter_map(|p| p.entity.path.clone())
             .chain(owner_paths.values().cloned())
             .collect::<std::collections::HashSet<_>>()
@@ -3644,6 +3646,13 @@ impl LibraryScanner {
             return Ok(());
         };
         let existing: std::collections::HashSet<Uuid> = rows.iter().map(|row| row.id).collect();
+        let existing_movies: HashMap<String, ItemPathRow> = rows
+            .iter()
+            .filter(|row| {
+                row.item_type.ends_with(".Movie") || row.item_type.ends_with(".MusicVideo")
+            })
+            .filter_map(|row| Some((row.path.clone()?, row.clone())))
+            .collect();
         let versions: HashMap<String, ItemPathRow> = rows
             .into_iter()
             .filter(|row| row.item_type == "MediaBrowser.Controller.Entities.Video")
@@ -3655,10 +3664,25 @@ impl LibraryScanner {
             .filter_map(|(id, path)| {
                 versions
                     .get(path)
+                    .or_else(|| existing_movies.get(path))
                     .map(|row| (guid_to_db(*id), guid_to_db(row.id)))
             })
             .collect();
         for item in planned {
+            if item.entity.type_.ends_with(".MusicVideo")
+                && !existing.contains(&item.id)
+                && let Some(row) = item
+                    .entity
+                    .path
+                    .as_ref()
+                    .and_then(|path| versions.get(path).or_else(|| existing_movies.get(path)))
+            {
+                item.id = row.id;
+                item.entity.id = guid_to_db(row.id);
+                if row.item_type == "MediaBrowser.Controller.Entities.Video" {
+                    item.entity.type_.clone_from(&row.item_type);
+                }
+            }
             if let Some(owner) = item
                 .entity
                 .owner_id
@@ -3667,7 +3691,7 @@ impl LibraryScanner {
             {
                 item.entity.owner_id = Some(owner.clone());
             }
-            if item.entity.type_.ends_with(".Movie")
+            if (item.entity.type_.ends_with(".Movie") || item.entity.type_.ends_with(".MusicVideo"))
                 && !existing.contains(&item.id)
                 && let Some(row) = item
                     .entity
@@ -8885,7 +8909,13 @@ impl LibraryScanner {
                         | CollectionTypeOptions::musicvideos
                         | CollectionTypeOptions::mixed,
                     ) => {
-                        self.plan_movies(location, location, cf, &ctx, &mut out);
+                        let kind =
+                            if folder.collection_type == Some(CollectionTypeOptions::musicvideos) {
+                                BaseItemKind::MusicVideo
+                            } else {
+                                BaseItemKind::Movie
+                            };
+                        self.plan_movies(location, location, cf, kind, &ctx, &mut out);
                         // Upstream folds the separate `photos` collection type
                         // into `homevideos`, where photos are resolved only when
                         // the library enables them (`PhotoResolver.Resolve`).
@@ -9038,6 +9068,7 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
@@ -9045,7 +9076,16 @@ impl LibraryScanner {
         // Movies emitted per directory, for extras owner resolution.
         let mut movies_by_dir: std::collections::HashMap<String, Vec<(Uuid, String)>> =
             std::collections::HashMap::new();
-        self.collect_movie_plan(dir, root, cf, ctx, out, &mut extras, &mut movies_by_dir);
+        self.collect_movie_plan(
+            dir,
+            root,
+            cf,
+            kind,
+            ctx,
+            out,
+            &mut extras,
+            &mut movies_by_dir,
+        );
         for (path, extra_type) in extras {
             if !ctx.scope.keeps(&path) {
                 continue;
@@ -9114,6 +9154,7 @@ impl LibraryScanner {
         dir: &str,
         root: &str,
         cf: Uuid,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
         extras: &mut Vec<(String, ferrofin_model::entities::ExtraType)>,
@@ -9126,12 +9167,12 @@ impl LibraryScanner {
         if dir != root
             && let Some(video_type) = self.disc_video_type(dir, ctx)
         {
-            self.plan_disc_movie(dir, cf, video_type, ctx, out);
+            self.plan_disc_movie(dir, cf, video_type, kind, ctx, out);
             return;
         }
         let entries = self.list(dir, ctx);
         let movie = (dir != root)
-            .then(|| movie_in_own_folder(&entries, naming, root))
+            .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
             .flatten();
         let own_folder = movie.is_some();
         // ResolveMultiple consumes the directory's file list when it finds
@@ -9150,11 +9191,8 @@ impl LibraryScanner {
             let owners = movies_by_dir.entry(dir.to_owned()).or_default();
             for version in std::iter::once(&movie).chain(movie.alternate_versions.iter()) {
                 if let Some(file) = version.files.first()
-                    && let Some(id) = item_type_lookup::derive_item_id_with(
-                        &self.id_derivation,
-                        BaseItemKind::Movie,
-                        &file.path,
-                    )
+                    && let Some(id) =
+                        item_type_lookup::derive_item_id_with(&self.id_derivation, kind, &file.path)
                 {
                     owners.push((id, file_stem(&file.path)));
                     ctx.owner_paths.borrow_mut().insert(id, file.path.clone());
@@ -9182,7 +9220,16 @@ impl LibraryScanner {
                 // `TopParentId` stays the library, and prove it with a
                 // `plan_paths` invariant case plus an adopted-library browse.
                 if ctx.scope.visits(&entry.path) {
-                    self.collect_movie_plan(&entry.path, root, cf, ctx, out, extras, movies_by_dir);
+                    self.collect_movie_plan(
+                        &entry.path,
+                        root,
+                        cf,
+                        kind,
+                        ctx,
+                        out,
+                        extras,
+                        movies_by_dir,
+                    );
                 }
                 continue;
             }
@@ -9227,17 +9274,19 @@ impl LibraryScanner {
             // (`Name = Path.GetFileName(ContainingFolderPath)`, raw — year kept), while a flat
             // file in the library root keeps its clean_date_time-parsed name (year stripped).
             // ProductionYear is still populated either way.
-            let name = if own_folder {
+            let name = if kind == BaseItemKind::MusicVideo {
+                file_stem(&entry.path)
+            } else if own_folder {
                 folder_name(dir).unwrap_or(clean_name)
             } else {
                 clean_name
             };
             let Some((id, mut entity)) =
-                self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, &entry.path, false)
+                self.base_item(ctx, kind, cf, cf, name, &entry.path, false)
             else {
                 continue;
             };
-            entity.is_movie = true;
+            entity.is_movie = kind == BaseItemKind::Movie;
             entity.is_in_mixed_folder = !own_folder;
             entity.media_type = Some("Video".to_owned());
             entity.production_year = year.map(i64::from);
@@ -9286,16 +9335,15 @@ impl LibraryScanner {
         dir: &str,
         cf: Uuid,
         video_type: VideoType,
+        kind: BaseItemKind,
         ctx: &PlanCtx<'_>,
         out: &mut Vec<Planned>,
     ) {
         let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-        let Some((id, mut entity)) =
-            self.base_item(ctx, BaseItemKind::Movie, cf, cf, name, dir, true)
-        else {
+        let Some((id, mut entity)) = self.base_item(ctx, kind, cf, cf, name, dir, true) else {
             return;
         };
-        entity.is_movie = true;
+        entity.is_movie = kind == BaseItemKind::Movie;
         entity.media_type = Some("Video".to_owned());
         set_video_type(&mut entity, video_type);
         ctx.emit(
@@ -11069,6 +11117,7 @@ fn movie_in_own_folder(
     entries: &[FileSystemEntryInfo],
     naming: &NamingOptions,
     root: &str,
+    parse_name: bool,
 ) -> Option<ferrofin_naming::video::VideoInfo> {
     if entries.iter().any(|e| {
         e.type_ == FileSystemEntryType::Directory
@@ -11084,12 +11133,14 @@ fn movie_in_own_folder(
             e.type_ != FileSystemEntryType::Directory
                 && !video_resolver::is_sample_filename(&e.name)
         })
-        .filter_map(|e| video_resolver::resolve_file(Some(&e.path), naming, Some(root)))
+        .filter_map(|e| {
+            video_resolver::resolve(Some(&e.path), false, naming, parse_name, Some(root))
+        })
         .collect();
     let movies = ferrofin_naming::video::VideoListResolver::new(naming).resolve(
         &videos,
         true,
-        true,
+        parse_name,
         Some(root),
         Some(ferrofin_model::data::CollectionType::movies),
     );

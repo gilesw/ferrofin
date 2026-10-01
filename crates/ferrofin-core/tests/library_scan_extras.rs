@@ -32,6 +32,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(files: &[&str]) -> Self {
+        Self::with_type(files, CollectionTypeOptions::movies).await
+    }
+
+    async fn with_type(files: &[&str], kind: CollectionTypeOptions) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("movies");
         for file in files {
@@ -48,7 +52,7 @@ impl Fixture {
         );
         vf.add_virtual_folder(
             "Movies",
-            Some(CollectionTypeOptions::movies),
+            Some(kind),
             &LibraryOptions {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
@@ -685,5 +689,126 @@ async fn plain_space_samples_follow_multi_item_resolution() {
         assert_eq!(mixed_sample, 0);
         f.assert_browse(5).await;
         assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
+    }
+}
+
+#[tokio::test]
+async fn musicvideo_library_owns_extras_and_repairs_existing_movie_identity() {
+    let main = "Artist/Artist - Song (2020).mkv";
+    let extra = "Artist/Extras/clip.mkv";
+    let f = Fixture::with_type(
+        &[
+            main,
+            extra,
+            "Artist/theme.mp3",
+            "Artist/Artist - Song (2020)-trailer.mkv",
+        ],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let mut owner = f.row(main).await;
+    assert_eq!(owner.type_, "MediaBrowser.Controller.Entities.MusicVideo");
+    assert_eq!(owner.name.as_deref(), Some("Artist - Song (2020)"));
+    assert!(!owner.is_movie);
+    assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&owner.id));
+    // Simulate a pre-fix Movie with an identity already used by clients.
+    f.store
+        .delete_items(&[Uuid::parse_str(&owner.id).unwrap()])
+        .await
+        .unwrap();
+    owner.id = guid_to_db(Uuid::new_v4());
+    owner.type_ = "MediaBrowser.Controller.Entities.Movies.Movie".into();
+    owner.is_movie = true;
+    f.store
+        .save_items(std::slice::from_ref(&owner))
+        .await
+        .unwrap();
+    play(&f.db, &owner.id).await;
+    f.scanner.scan_all().await.unwrap();
+    let repaired = f.row(main).await;
+    assert_eq!(repaired.id, owner.id);
+    assert_eq!(
+        repaired.type_,
+        "MediaBrowser.Controller.Entities.MusicVideo"
+    );
+    assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&owner.id));
+    f.assert_browse(1).await;
+    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 0);
+    assert_eq!(f.row(main).await.id, owner.id);
+    let history: i64 = sqlx::query_scalar("SELECT PlayCount FROM UserData WHERE ItemId=?")
+        .bind(&owner.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(history, 1);
+}
+
+#[tokio::test]
+async fn musicvideo_owner_grouping_does_not_parse_filename_years() {
+    let f = Fixture::with_type(
+        &[
+            "Artist/Artist - Song (2020).mkv",
+            "Artist/Artist - Song (2021).mkv",
+            "Artist/Extras/clip.mkv",
+        ],
+        CollectionTypeOptions::musicvideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let extra = f.row("Artist/Extras/clip.mkv").await;
+    assert!(extra.owner_id.is_some());
+    assert!(extra.parent_id.is_none());
+    for path in [
+        "Artist/Artist - Song (2020).mkv",
+        "Artist/Artist - Song (2021).mkv",
+    ] {
+        assert!(!f.row(path).await.is_in_mixed_folder);
+    }
+}
+
+#[tokio::test]
+async fn musicvideo_adopted_video_identity_is_reused_in_full_and_scoped_scans() {
+    for scoped in [false, true] {
+        let main = "Artist/Artist - Song.mkv";
+        let f = Fixture::with_type(&[main], CollectionTypeOptions::musicvideos).await;
+        f.scanner.scan_all().await.unwrap();
+        let mut version = f.row(main).await;
+        f.store
+            .delete_items(&[Uuid::parse_str(&version.id).unwrap()])
+            .await
+            .unwrap();
+        version.id = guid_to_db(Uuid::new_v4());
+        version.type_ = "MediaBrowser.Controller.Entities.Video".into();
+        let adopted = version.id.clone();
+        let mut duplicate = version.clone();
+        duplicate.id = guid_to_db(Uuid::new_v4());
+        duplicate.type_ = "MediaBrowser.Controller.Entities.Movies.Movie".into();
+        f.store.save_items(&[duplicate]).await.unwrap();
+        f.store.save_items(&[version]).await.unwrap();
+        let extra = "Artist/Artist - Song-trailer.mkv";
+        std::fs::write(f.media.join(extra), b"").unwrap();
+        if scoped {
+            f.scanner
+                .scan_paths(&[f.media.join(extra).to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+        } else {
+            f.scanner.scan_all().await.unwrap();
+        }
+        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&adopted));
+        f.scanner.scan_all().await.unwrap();
+        assert_eq!(f.row(main).await.id, adopted);
+        assert_eq!(
+            f.row(main).await.type_,
+            "MediaBrowser.Controller.Entities.Video"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM BaseItems WHERE Path=?")
+            .bind(f.media.join(main).to_str().unwrap())
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(f.row(extra).await.owner_id.as_ref(), Some(&adopted));
     }
 }
