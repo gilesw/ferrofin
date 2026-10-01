@@ -2099,8 +2099,10 @@ mod tests {
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
 
         mgr.queue_library_scan().await.expect("queued");
-        // Let the spawned (empty) scan run to completion so its span closes.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for completion rather than assuming the scan finishes within 50 ms.
+        // On this current-thread runtime, the worker closes its span before this
+        // test can observe the idle queue, so the simple exporter has seen it.
+        until_idle(&mgr).await;
         provider.force_flush().expect("flush");
 
         let spans = exporter.get_finished_spans().expect("spans");
