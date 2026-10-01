@@ -98,7 +98,7 @@ version = "${FERROFIN_VERSION}"
 epoch = "0"
 license = "GPL-3.0-only"
 homepage = "https://github.com/mangoleaf/ferrofin"
-description = """Ferrofin is a Rust implementation of the Jellyfin media server API. It adopts existing Jellyfin databases in place. The package installs the server, a hardened systemd unit, configuration, and service user; ffmpeg and the web client come from jellyfin-ffmpeg8 and jellyfin-web."""
+description = """Ferrofin is a Rust implementation of the Jellyfin media server API. It adopts existing Jellyfin databases in place. The package installs the server, a systemd unit, configuration, and service user; ffmpeg and the web client come from jellyfin-ffmpeg8 and jellyfin-web."""
 depends = ["libc6 (>= 2.34)", "adduser", "jellyfin-ffmpeg8", "jellyfin-web"]
 contents = [
     { src = "contrib/systemd/ferrofin.service", dst = "/lib/systemd/system/ferrofin.service", file_info = { mode = 420 } },
