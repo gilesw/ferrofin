@@ -385,6 +385,114 @@ async fn report_loop(
 mod tests {
     use super::*;
 
+    fn capture() -> (ScanProgressTracker, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let events = Arc::new(crate::event_manager::FerrofinEventManager::new());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        events.subscribe(
+            "RefreshProgress",
+            Arc::new(move |payload| {
+                lock(&sink).push(serde_json::from_str(payload).unwrap());
+                crate::event_manager::consumer_done()
+            }),
+        );
+        let tracker = ScanProgressTracker::default();
+        tracker.set_events(events);
+        (tracker, seen)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_cleans_state_and_a_new_scan_cannot_receive_stale_ticks() {
+        let (tracker, seen) = capture();
+        let library = Uuid::new_v4();
+        let run = tracker.begin([library]);
+        run.started().await;
+        let worker = tokio::spawn(async move {
+            let _run = run;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(tracker.libraries().is_empty());
+        let next = tracker.begin([library]);
+        next.started().await;
+        let states: Vec<_> = lock(&seen)
+            .iter()
+            .map(|v| v["RefreshStatus"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(states, ["Active", "Idle", "Active"]);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            lock(&seen).len(),
+            4,
+            "missed deadlines do not cause catch-up bursts"
+        );
+        next.finish(true).await;
+        assert_eq!(lock(&seen).last().unwrap()["Progress"], "100.00");
+        let count = lock(&seen).len();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lock(&seen).len(), count);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nested_finish_keeps_parent_active_and_empty_scan_finishes_without_a_tick() {
+        let (tracker, seen) = capture();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let parent = tracker.begin([a, b]);
+        parent.started().await;
+        parent.planned([(a, 3)]);
+        parent.advance(a);
+        let nested = tracker.begin([a]);
+        nested.started().await;
+        nested.planned([(a, 1)]);
+        nested.advance(a);
+        nested.finish(true).await;
+        assert!(lock(&seen).iter().all(|v| v["RefreshStatus"] == "Active"));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let values = lock(&seen);
+        let a_id = a.simple().to_string();
+        assert_eq!(
+            values.iter().rev().find(|v| v["ItemId"] == a_id).unwrap()["Progress"],
+            "33.33"
+        );
+        drop(values);
+        parent.finalizing();
+        parent.finish(true).await;
+        assert!(tracker.libraries().is_empty());
+        let empty = tracker.begin([b]);
+        empty.planned([]);
+        empty.finalizing();
+        empty.finish(true).await;
+        let values = lock(&seen);
+        assert_eq!(values[values.len() - 2]["Progress"], "0.00");
+        assert_eq!(values.last().unwrap()["Progress"], "100.00");
+        assert_eq!(values.last().unwrap()["RefreshStatus"], "Idle");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_last_tracker_releases_the_reporter() {
+        let events = Arc::new(crate::event_manager::FerrofinEventManager::new());
+        let weak = Arc::downgrade(&events);
+        let tracker = ScanProgressTracker::default();
+        tracker.set_events(events);
+        let run = tracker.begin([Uuid::new_v4()]);
+        run.started().await;
+        drop(run);
+        drop(tracker);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "reporter does not retain the event manager on shutdown"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn ticks_publish_counts_while_work_is_stalled_and_finish_is_immediate() {
         let events = Arc::new(crate::event_manager::FerrofinEventManager::new());

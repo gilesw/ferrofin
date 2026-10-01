@@ -942,6 +942,41 @@ mod tests {
     use axum::http::HeaderMap;
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
+        use crate::test_support::{
+            FakeLibrary, RecordingTasks, elevated_state_with_library_monitor_and_tasks,
+        };
+        use std::sync::Arc;
+        let state = elevated_state_with_library_monitor_and_tasks(
+            Arc::new(FakeLibrary),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+            Arc::new(RecordingTasks::default()),
+        );
+        let (sender, receiver) = tokio::sync::broadcast::channel(4);
+        let mut receiver = Some(receiver);
+        sender.send(Vec::new()).unwrap();
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_none()
+        );
+        let update = super::next_task_update(&mut receiver).await;
+        assert!(
+            super::task_transition_message(&state, update, &mut receiver)
+                .await
+                .is_some()
+        );
+        assert!(
+            super::periodic_tasks_message(&state, receiver.as_ref())
+                .await
+                .is_some()
+        );
+        super::update_task_subscription(&state, Inbound::TasksStop, &mut receiver).await;
+        assert!(receiver.is_none());
+        assert_eq!(sender.receiver_count(), 0);
+    }
+
     /// A client that stops reading must not make the server buffer without
     /// bound: the sink accepts exactly `PUSH_QUEUE_DEPTH` messages, then drops
     /// the rest and raises the overflow signal that closes the socket.
