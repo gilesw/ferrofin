@@ -392,8 +392,8 @@ impl FerrofinItemRepository {
     ///
     /// `None` means "leave this to the ancestor closure" — the item is not a view
     /// at all (which is what `SetTopParentIdsOrAncestors` does when the parents are
-    /// not all `ICollectionFolder`/`UserView`), or it is a collection folder with no
-    /// physical folders, which on a Ferrofin-written database is every one of them.
+    /// not all `ICollectionFolder`/`UserView`). Native collection folders use
+    /// their own id as the top-parent scope.
     /// `Some(vec![])` is different and deliberate: a *view* that resolves to
     /// nothing, which upstream turns into a match-nothing scope rather than letting
     /// the query widen to every library.
@@ -455,15 +455,14 @@ impl FerrofinItemRepository {
                 .await?
                 .remove(&id)
                 .unwrap_or_default();
-            // A collection folder with NO physical folders means two different
-            // things, and only one of them is "an empty library". On a
-            // Ferrofin-written database no collection folder has them — items hang
-            // off the folder directly and there is no `Data` blob — so answering
-            // "match nothing" here would empty every native browse. Deliberate
-            // divergence, same as the one `resolve_views` already documents: an
-            // unresolvable collection folder falls through to the ancestor closure,
-            // which is right for both database shapes.
-            return Ok((!folders.is_empty()).then_some(folders));
+            // Native libraries use the collection folder as TopParentId.
+            // Always scope a library by top parent: its ancestor closure also
+            // includes parentless extras attached through OwnerId.
+            return Ok(Some(if folders.is_empty() {
+                vec![id]
+            } else {
+                folders
+            }));
         }
         if kind != Some(BaseItemKind::UserView) {
             // C#'s last arm — `item.GetTopParent()` — but only when we got here by

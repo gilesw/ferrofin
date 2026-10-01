@@ -40,3 +40,22 @@ The current tool environment cannot access `/var/run/docker.sock`; passwordless
 sudo is unavailable and no .NET SDK is installed. Existing adoption fixtures are
 present under `/tmp`. Live Jellyfin and container-based adoption checks require
 an accessible runtime. This limitation is not a passed validation result.
+
+### Phase 2: ownership and lifecycle
+
+Extras now have no physical parent or top parent. Their collection ancestor is
+retained for owner-library policy and progress accounting. Native recursive
+library browsing now uses the library's top-parent scope, matching the adopted
+library path. General extras-query predicates are unchanged.
+
+Pruning reads parentless extras through the owner's library, with index seeks
+on the owner's TopParentId and the extra's OwnerId. Scoped scans seek the
+extra's Path and check its owner by primary key, keeping watcher work bounded. Rows returned through both legacy and owned membership
+are deduplicated. Owner deletion already follows OwnerId and needs no change.
+
+The baseline's three regression tests failed as expected. After the ownership
+fix, four ownership/lifecycle integration tests pass, including repair of a
+locked unchanged extra and stable DateLastSaved on a second scan. Existing
+row comparison and structural overlays already perform the required repair;
+no new refresh trigger or provider pass is needed. Ignore discovery remains
+for phase 3. An EXPLAIN test guards the new pruning query's index seeks.

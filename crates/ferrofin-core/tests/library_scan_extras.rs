@@ -211,3 +211,45 @@ async fn scan_ignores_resource_forks_and_dot_samples_but_keeps_owned_suffix_samp
         Some(7)
     );
 }
+
+#[tokio::test]
+async fn removed_parentless_extras_are_pruned_by_full_and_scoped_scans() {
+    for scoped in [false, true] {
+        let f = Fixture::new(&[MOVIE, EXTRA]).await;
+        f.scanner.scan_all().await.unwrap();
+        let extra = f.row(EXTRA).await;
+        let path = f.media.join(EXTRA);
+        std::fs::remove_file(&path).unwrap();
+        let result = if scoped {
+            f.scanner
+                .scan_paths(&[path.to_string_lossy().into_owned()])
+                .await
+                .unwrap()
+        } else {
+            f.scanner.scan_all().await.unwrap()
+        };
+        assert_eq!(result.removed, 1);
+        assert!(
+            f.repo
+                .retrieve_item(Uuid::parse_str(&extra.id).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        f.assert_browse(1).await;
+    }
+}
+
+#[tokio::test]
+async fn deleting_the_owner_removes_parentless_extras() {
+    let f = Fixture::new(&[MOVIE, EXTRA]).await;
+    f.scanner.scan_all().await.unwrap();
+    let movie = Uuid::parse_str(&f.row(MOVIE).await.id).unwrap();
+    let extra = Uuid::parse_str(&f.row(EXTRA).await.id).unwrap();
+    f.store.delete_items(&[movie]).await.unwrap();
+    assert!(f.repo.retrieve_item(extra).await.unwrap().is_none());
+    assert!(
+        f.media.join(EXTRA).exists(),
+        "database deletion keeps the file"
+    );
+}

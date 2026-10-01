@@ -8972,8 +8972,8 @@ impl LibraryScanner {
     /// `theme-music/` / `extras/` directories …), which become owned rows
     /// (`OwnerId` + `ExtraType`) attached to the movie they belong to. Owned
     /// rows are what `/Items/{id}/LocalTrailers`, `/SpecialFeatures`, and the
-    /// hasTrailer/hasThemeSong/… filters read; the browse queries' "unowned"
-    /// predicate keeps them out of the library grid.
+    /// hasTrailer/hasThemeSong/… filters read. They have no physical parent
+    /// or top parent, so library browsing does not return them.
     fn plan_movies(
         &self,
         dir: &str,
@@ -9020,6 +9020,12 @@ impl LibraryScanner {
             entity.media_type = Some(media_type.to_owned());
             entity.extra_type = Some(extra_type as i32);
             entity.owner_id = Some(guid_to_db(owner));
+            // BaseItem.RefreshExtras clears the physical parent. An extra's
+            // library is reached through its owner, not GetTopParent's parent
+            // walk. Keep the collection ancestor (GetCollectionFolders follows
+            // OwnerId), also used by scan policy and progress accounting.
+            entity.parent_id = None;
+            entity.top_parent_id = None;
             // A video extra resolves through `BaseVideoResolver` like any
             // video (`GenericVideoResolver<Trailer>`/`<Video>`), which sets
             // its `VideoType` from the extension.
@@ -23586,7 +23592,7 @@ mod tests {
 
     // Extras (suffix- and directory-classified) become OWNED rows attached to
     // their movie, never Movie rows — feeding /LocalTrailers and the
-    // hasTrailer/… filters while staying out of the library grid.
+    // hasTrailer/… filters. Parent/top-parent scope keeps them out of browse.
     #[tokio::test]
     async fn scan_attaches_extras_to_their_movie() {
         use ferrofin_model::data::BaseItemKind;
