@@ -208,6 +208,7 @@ pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;
 pub mod resolvers;
 pub mod scan_metrics;
+pub mod scan_progress;
 pub mod scheduled_tasks;
 pub mod search_manager;
 pub mod server_discovery;
