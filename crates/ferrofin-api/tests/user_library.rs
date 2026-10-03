@@ -343,12 +343,28 @@ impl LibraryManager for StubLibrary {
             vec![item_entity(ITEM_ID, "Movie", BaseItemKind::Movie)],
         ))
     }
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        Ok(items
+            .iter()
+            .map(|item| (Uuid::parse_str(&item.id).unwrap(), vec![ITEM_ID, ROOT_ID]))
+            .collect())
+    }
     async fn get_item_list(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Trailer vs special-feature extras are distinguished by extra_types.
         use ferrofin_model::entities::ExtraType;
+        if !query.extra_types.is_empty() {
+            assert_eq!(
+                query.owner_ids,
+                vec![ITEM_ID, ROOT_ID],
+                "handler must query all resolved owners"
+            );
+        }
+        // Trailer vs special-feature extras are distinguished by extra_types.
         if query.extra_types.contains(&ExtraType::Trailer) {
             Ok(vec![item_entity(
                 TRAILER_ID,

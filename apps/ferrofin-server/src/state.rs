@@ -1125,6 +1125,7 @@ pub async fn build_app_state(
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
         )
+        .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata

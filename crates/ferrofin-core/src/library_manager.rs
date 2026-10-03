@@ -64,6 +64,7 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 #[derive(Clone)]
 pub struct FerrofinLibraryManager {
     items: Arc<dyn ItemRepository>,
+    virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     counts: Arc<dyn ItemCountService>,
     persistence: Arc<dyn ItemPersistenceService>,
     people: Arc<dyn PeopleRepository>,
@@ -964,6 +965,7 @@ impl FerrofinLibraryManager {
     ) -> Self {
         Self {
             items,
+            virtual_folders: None,
             counts,
             persistence,
             people,
@@ -977,6 +979,16 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
         }
+    }
+
+    /// Attach library options for request-time series grouping decisions.
+    #[must_use]
+    pub fn with_virtual_folders(
+        mut self,
+        folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    ) -> Self {
+        self.virtual_folders = Some(folders);
+        self
     }
 
     /// Exposes queued scan scopes to the shared library progress reader.
@@ -1314,6 +1326,39 @@ impl LibraryManager for FerrofinLibraryManager {
 
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         self.items.get_item_ids(query).await
+    }
+
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        let folders = if items.iter().any(|item| item.type_.ends_with(".Series")) {
+            if let Some(folders) = &self.virtual_folders {
+                folders.get_virtual_folders().await?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let grouped_series: Vec<Uuid> = items
+            .iter()
+            .filter(|item| {
+                item.type_.ends_with(".Series")
+                    && crate::item_persistence_service::series_key_scope(
+                        &folders,
+                        "",
+                        item.top_parent_id.as_deref(),
+                        item.path.as_deref(),
+                        None,
+                    )
+                    .enable_automatic_series_grouping
+            })
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        self.items
+            .get_extra_owner_ids_batch(items, &grouped_series)
+            .await
     }
 
     async fn get_item_list(
@@ -3669,6 +3714,55 @@ mod tests {
             Arc::new(FerrofinItemPersistenceService::new(db.clone())),
             Arc::new(FerrofinPeopleRepository::new(db.clone())),
         )
+    }
+
+    #[tokio::test]
+    async fn extra_series_owners_honor_live_library_grouping_options() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_traits::library::VirtualFolderManager;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        vf.add_virtual_folder(
+            "TV",
+            Some(ferrofin_model::entities::CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: tmp.path().to_string_lossy().into_owned(),
+                }],
+                enable_automatic_series_grouping: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut items = Vec::new();
+        for name in ["A", "B"] {
+            items.push(BaseItemEntity {
+                id: guid_to_db(Uuid::new_v4()),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                path: Some(tmp.path().join(name).to_string_lossy().into_owned()),
+                name: Some(name.into()),
+                presentation_unique_key: Some("same-series".into()),
+                ..Default::default()
+            });
+        }
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        store.save_items(&items).await.unwrap();
+        let mgr = manager(&db).with_virtual_folders(vf.clone());
+        let id = Uuid::parse_str(&items[0].id).unwrap();
+        let got = mgr.get_extra_owner_ids_batch(&items).await.unwrap();
+        assert_eq!(got[&id], vec![id]);
+        let folder = vf.get_virtual_folders().await.unwrap().remove(0);
+        let mut options = folder.library_options.unwrap();
+        options.enable_automatic_series_grouping = true;
+        vf.update_library_options("TV", &options).await.unwrap();
+        assert_eq!(
+            mgr.get_extra_owner_ids_batch(&items).await.unwrap()[&id].len(),
+            2
+        );
     }
 
     /// `GET /MusicGenres/{name}` (and its `/Genres`, `/Studios`, `/Artists`
