@@ -175,6 +175,7 @@ pub mod dto_service;
 pub mod dynamic_images;
 pub mod event_manager;
 pub mod external_data_manager;
+mod extra_owners_repository;
 pub mod file_system;
 pub mod item_count_service;
 pub mod item_data;
@@ -205,7 +206,10 @@ pub mod people_repository;
 pub mod playback_metrics;
 pub mod plugin_manager;
 pub mod quick_connect_manager;
+use ferrofin_providers::refresh_plan;
 pub mod resolvers;
+pub mod scan_metrics;
+pub mod scan_progress;
 pub mod scheduled_tasks;
 pub mod search_manager;
 pub mod server_discovery;
@@ -214,6 +218,7 @@ pub mod session_manager;
 pub mod session_websocket_listener;
 pub mod similar_items_manager;
 mod similar_items_repository;
+pub mod subtitle_downloader;
 pub mod subtitle_manager;
 pub mod sync_play_manager;
 pub mod system_manager;
@@ -263,7 +268,10 @@ pub use library_manager::FerrofinLibraryManager;
 pub use library_monitor::{
     FerrofinLibraryMonitor, LibraryScanTrigger, NoopFileSystemWatcher, WatchRootsSource,
 };
-pub use library_scan::LibraryScanner;
+pub use library_scan::{
+    LaneRefresh, LibraryScanner, PriorityLane, ScanCancel, ScanOutcome, ScanPasses, ScanProgress,
+    ScanRun,
+};
 pub use linked_children_service::FerrofinLinkedChildrenService;
 pub use localization_manager::LocalizationManager;
 pub use lyric_manager::FerrofinLyricManager;
