@@ -24,7 +24,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::entities::ExtraType;
+use ferrofin_model::entities::{ExtraType, ImageType};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::dto::DtoService;
@@ -1272,6 +1272,42 @@ async fn get_items_forwards_the_artist_id_filters() {
         assert_eq!(query.exclude_artist_ids, [excluded], "{uri}");
         assert!(query.artist_ids.is_empty(), "{uri}");
     }
+}
+
+/// Wholphin's genre grid asks each genre for one random item that has a
+/// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
+/// an item without a backdrop yields a null URL that crashes the whole grid
+/// (`ConcurrentHashMap.put(genreId, null)`). The image type set must reach the
+/// repository query; unknown tokens drop like the binder's.
+#[tokio::test]
+async fn get_items_forwards_the_image_types_filter() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5B),
+        adopted_tree: false,
+        last_query: Arc::default(),
+    };
+    let seen = Arc::clone(&library.last_query);
+    // Wholphin's request, verbatim apart from the ids.
+    let uri = format!(
+        "/Items?userId={USER_ID}&limit=1&recursive=true&parentId={}&fields=Genres\
+         &includeItemTypes=MusicAlbum&imageTypes=Backdrop,Nonsense&sortBy=Random\
+         &imageTypeLimit=1&genreIds={}&enableTotalRecordCount=false&enableImages=true",
+        Uuid::from_u128(0x5C).simple(),
+        Uuid::from_u128(0x5D).simple(),
+    );
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(&uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.image_types, [ImageType::Backdrop]);
 }
 
 /// A `GET /Items` with an unknown enum token is a `400`.

@@ -210,6 +210,11 @@ struct ItemsQuery {
     /// Comma-delimited [`ItemFilter`](ferrofin_model::querying::ItemFilter) flags.
     #[serde(default)]
     filters: Option<String>,
+    /// Comma-delimited [`ImageType`](ferrofin_model::entities::ImageType)s an
+    /// item must have — Wholphin's genre grid asks for one `Backdrop` item per
+    /// genre and crashes on an item without one.
+    #[serde(default)]
+    image_types: Option<String>,
     /// Comma-delimited [`ItemFields`](ferrofin_model::querying::ItemFields) to populate
     /// on each returned DTO (e.g. `Path`, `Genres`). Absent/empty ⇒ the base DTO.
     #[serde(default)]
@@ -411,6 +416,7 @@ async fn get_items(
         include_item_types: parse_csv_enums_lenient(query.include_item_types.as_deref()),
         exclude_item_types: parse_csv_enums_lenient(query.exclude_item_types.as_deref()),
         media_types: parse_csv_enums_lenient(query.media_types.as_deref()),
+        image_types: parse_csv_enums_lenient(query.image_types.as_deref()),
         order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         item_ids: parse_csv_uuids(query.ids.as_deref())?,
         exclude_item_ids: parse_csv_uuids(query.exclude_item_ids.as_deref())?,
@@ -1444,7 +1450,6 @@ mod tests {
         "hasParentalRating",
         "hasTmdbId",
         "hasTvdbId",
-        "imageTypes",
         "isKids",
         "isMissing",
         "isNews",
