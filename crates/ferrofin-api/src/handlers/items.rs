@@ -244,6 +244,17 @@ struct ItemsQuery {
     /// Comma-delimited artist ids.
     #[serde(default)]
     artist_ids: Option<String>,
+    /// Comma-delimited artist ids to exclude.
+    #[serde(default)]
+    exclude_artist_ids: Option<String>,
+    /// Comma-delimited album artist ids — jellyfin-web's artist page sends
+    /// this for its Albums section.
+    #[serde(default)]
+    album_artist_ids: Option<String>,
+    /// Comma-delimited contributing artist ids — the artist page's
+    /// "Appears On" section.
+    #[serde(default)]
+    contributing_artist_ids: Option<String>,
     /// Comma-delimited album ids.
     #[serde(default)]
     album_ids: Option<String>,
@@ -411,6 +422,9 @@ async fn get_items(
         studio_ids: parse_csv_uuids(query.studio_ids.as_deref())?,
         person_ids: parse_csv_uuids(query.person_ids.as_deref())?,
         artist_ids: parse_csv_uuids(query.artist_ids.as_deref())?,
+        exclude_artist_ids: parse_csv_uuids(query.exclude_artist_ids.as_deref())?,
+        album_artist_ids: parse_csv_uuids(query.album_artist_ids.as_deref())?,
+        contributing_artist_ids: parse_csv_uuids(query.contributing_artist_ids.as_deref())?,
         album_ids: parse_csv_uuids(query.album_ids.as_deref())?,
         is_favorite: query.is_favorite,
         is_played: query.is_played,
