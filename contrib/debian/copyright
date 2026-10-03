@@ -5,42 +5,37 @@ Source: https://github.com/mangoleaf/ferrofin
 
 Files: *
 Copyright: Ferrofin contributors
-           Jellyfin contributors
-           Intro Skipper contributors
-           File Transformation contributors
 License: GPL-3
-Comment: Ferrofin is a Rust port of the Jellyfin media server
- (https://github.com/jellyfin/jellyfin). It also ports the GPL-3.0
- Jellyfin plugins Intro Skipper
- (https://github.com/intro-skipper/intro-skipper), File Transformation
- (https://github.com/IAmParadox27/jellyfin-plugin-file-transformation),
- TheTVDB (https://github.com/jellyfin/jellyfin-plugin-tvdb) and
- OpenSubtitles (https://github.com/jellyfin/jellyfin-plugin-opensubtitles).
+Comment: Ferrofin is derived from the Jellyfin media server
+ (https://github.com/jellyfin/jellyfin), which it was written against as a
+ reference. It is an independent project, not affiliated with, endorsed by
+ or supported by the Jellyfin project.
  .
  /usr/bin/ferrofin-server statically links third-party Rust crates and C
  libraries, which keep their own permissive licenses (among them MIT,
  Apache-2.0, BSD and ISC); SQLite is public domain and jemalloc is
  BSD-2-Clause.
 
-Files: crates/ferrofin-api/src/handlers/merge_versions.rs
-       crates/ferrofin-extensions/assets/mergeversions/*
-       crates/ferrofin-extensions/src/merge_versions.rs
-       crates/ferrofin-traits/src/merge_versions.rs
-Copyright: 2019 Claus Vium
-           Ferrofin contributors
-License: GPL-3 and Expat
-Comment: The settings page is vendored unchanged from, and the Rust code is
- ported from, the Merge Versions Jellyfin plugin
- (https://github.com/danieladov/jellyfin-plugin-mergeversions), published
- under the Expat (MIT) license.
+Files: crates/ferrofin-extensions/assets/introskipper/*
+Copyright: Intro Skipper contributors
+License: GPL-3
+Comment: The Intro Skipper plugin's settings page, copied from
+ https://github.com/intro-skipper/intro-skipper at the revision pinned in
+ crates/ferrofin-extensions/build.rs.
 
-Files: crates/ferrofin-providers/src/fanart.rs
-Copyright: 2019 Jellyfin
-           Ferrofin contributors
-License: GPL-3 and Expat
-Comment: Ported from the Fanart Jellyfin plugin
- (https://github.com/jellyfin/jellyfin-plugin-fanart), published under the
- Expat (MIT) license.
+Files: crates/ferrofin-extensions/assets/filetransformation/*
+Copyright: File Transformation contributors
+License: GPL-3
+Comment: The File Transformation plugin's settings page, copied from
+ https://github.com/IAmParadox27/jellyfin-plugin-file-transformation at the
+ revision pinned in crates/ferrofin-extensions/build.rs.
+
+Files: crates/ferrofin-extensions/assets/mergeversions/*
+Copyright: 2019 Claus Vium
+License: Expat
+Comment: The Merge Versions plugin's settings page, copied from
+ https://github.com/danieladov/jellyfin-plugin-mergeversions at the
+ revision pinned in crates/ferrofin-extensions/build.rs.
 
 License: GPL-3
  This program is free software: you can redistribute it and/or modify
