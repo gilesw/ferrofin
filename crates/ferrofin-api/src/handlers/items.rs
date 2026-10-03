@@ -1427,7 +1427,7 @@ mod tests {
         keys
     }
 
-    /// `GET /Items` parameters in the vendored contract that [`ItemsQuery`]
+    /// `GET /Items` parameters in the vendored contracts that [`ItemsQuery`]
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
@@ -1435,6 +1435,8 @@ mod tests {
         "adjacentTo",
         "albums",
         "artists",
+        // 12.1.0 only.
+        "audioLanguages",
         "collapseBoxSetItems",
         "hasImdbId",
         "hasOfficialRating",
@@ -1462,30 +1464,45 @@ mod tests {
         "personTypes",
         "seriesStatus",
         "studios",
+        // 12.1.0 only.
+        "subtitleLanguages",
     ];
 
-    /// Every `GET /Items` parameter in the vendored contract is bound by
-    /// [`ItemsQuery`] or listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops
-    /// an unknown query key without a word, so a missing field is a filter the
-    /// client asked for and never got: `albumArtistIds` was one, and every
-    /// artist page listed every album in the library.
+    /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
+    /// route gate's pin, and 12.1.0, the latest Jellyfin, which adds
+    /// `audioLanguages` and `subtitleLanguages` — is bound by [`ItemsQuery`] or
+    /// listed in [`UNBOUND_ITEMS_PARAMETERS`]. serde drops an unknown query key
+    /// without a word, so a missing field is a filter the client asked for and
+    /// never got: `albumArtistIds` was one, and every artist page listed every
+    /// album in the library.
     #[test]
     fn items_query_binds_every_contract_parameter() {
-        let spec: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../contracts/jellyfin-openapi-10.11.8.json"
-        ))
-        .expect("vendored contract parses");
-        let contract: BTreeSet<&str> = spec["paths"]["/Items"]["get"]["parameters"]
-            .as_array()
-            .expect("GET /Items lists its parameters")
-            .iter()
-            .filter_map(|p| p["name"].as_str())
-            .collect();
+        let mut contract = BTreeSet::new();
+        for (version, raw) in [
+            (
+                "10.11.8",
+                include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
+            ),
+            (
+                "12.1.0",
+                include_str!("../../../../contracts/jellyfin-openapi-12.1.0.json"),
+            ),
+        ] {
+            let spec: serde_json::Value = serde_json::from_str(raw).expect("contract parses");
+            let parameters = spec["paths"]["/Items"]["get"]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{version}: GET /Items lists its parameters"));
+            contract.extend(
+                parameters
+                    .iter()
+                    .filter_map(|p| p["name"].as_str().map(str::to_owned)),
+            );
+        }
         let keys = items_query_keys();
         assert!(keys.contains(&"albumArtistIds"), "keys captured: {keys:?}");
         let unbound: BTreeSet<&str> = contract
             .iter()
-            .copied()
+            .map(String::as_str)
             .filter(|name| !keys.contains(name))
             .collect();
         let listed: BTreeSet<&str> = UNBOUND_ITEMS_PARAMETERS.iter().copied().collect();
