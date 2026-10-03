@@ -43,10 +43,15 @@ Download the `.deb` for your architecture from the
 `jellyfin-ffmpeg8` and `jellyfin-web` with it:
 
 ```sh
-V=1.0.1; A=amd64                                  # or arm64
+V=$(curl -fsSL https://api.github.com/repos/mangoleaf/ferrofin/releases/latest \
+  | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')   # latest release, without its v
+A=$(dpkg --print-architecture)                        # amd64 or arm64
 curl -fsSLO "https://github.com/mangoleaf/ferrofin/releases/download/v$V/ferrofin_${V}_$A.deb"
 sudo apt-get install -y "./ferrofin_${V}_$A.deb"
 ```
+
+v1.3.1 is the only release whose packages are named `ferrofin_1.3.1-1_$A.deb`
+([#36](https://github.com/mangoleaf/ferrofin/issues/36)); apt upgrades from it normally.
 
 The package creates the `ferrofin` system user and `/var/lib/ferrofin`, installs the
 unit, and **does not enable or start it**: configure a password or be ready to complete
