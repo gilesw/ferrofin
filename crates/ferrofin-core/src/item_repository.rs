@@ -392,8 +392,8 @@ impl FerrofinItemRepository {
     ///
     /// `None` means "leave this to the ancestor closure" — the item is not a view
     /// at all (which is what `SetTopParentIdsOrAncestors` does when the parents are
-    /// not all `ICollectionFolder`/`UserView`), or it is a collection folder with no
-    /// physical folders, which on a Ferrofin-written database is every one of them.
+    /// not all `ICollectionFolder`/`UserView`). Native collection folders use
+    /// their own id as the top-parent scope.
     /// `Some(vec![])` is different and deliberate: a *view* that resolves to
     /// nothing, which upstream turns into a match-nothing scope rather than letting
     /// the query widen to every library.
@@ -455,15 +455,14 @@ impl FerrofinItemRepository {
                 .await?
                 .remove(&id)
                 .unwrap_or_default();
-            // A collection folder with NO physical folders means two different
-            // things, and only one of them is "an empty library". On a
-            // Ferrofin-written database no collection folder has them — items hang
-            // off the folder directly and there is no `Data` blob — so answering
-            // "match nothing" here would empty every native browse. Deliberate
-            // divergence, same as the one `resolve_views` already documents: an
-            // unresolvable collection folder falls through to the ancestor closure,
-            // which is right for both database shapes.
-            return Ok((!folders.is_empty()).then_some(folders));
+            // Native libraries use the collection folder as TopParentId.
+            // Always scope a library by top parent: its ancestor closure also
+            // includes parentless extras attached through OwnerId.
+            return Ok(Some(if folders.is_empty() {
+                vec![id]
+            } else {
+                folders
+            }));
         }
         if kind != Some(BaseItemKind::UserView) {
             // C#'s last arm — `item.GetTopParent()` — but only when we got here by
@@ -2203,6 +2202,15 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(exists.is_some())
     }
 
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+        grouped_series: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        crate::extra_owners_repository::get_extra_owner_ids_batch(&self.db, items, grouped_series)
+            .await
+    }
+
     async fn get_items_by_primary_version(
         &self,
         primary_id: Uuid,
@@ -3593,29 +3601,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recursive_parent_matches_descendants_via_ancestor_closure() {
+    async fn recursive_parent_uses_library_scope_and_folder_ancestors() {
         let db = test_db().await;
         let repository = repo(&db);
         // library ─ series ─ episode. The episode is a direct child of the series,
-        // NOT of the library, but the library is in its ancestor closure.
+        // not of the library. Persist both its library scope and ancestor closure,
+        // as the scanner does; library queries use TopParentId, folder queries
+        // use the ancestor closure.
         let library = Uuid::from_u128(0xB001);
         let series = Uuid::from_u128(0xB002);
         let episode = Uuid::from_u128(0xB003);
         seed_named_item(&db, library, BaseItemKind::CollectionFolder, "TV").await;
         seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
         seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(series))
-            .bind(guid_to_db(library))
-            .execute(db.writer())
-            .await
-            .expect("series parent");
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(episode))
-            .bind(guid_to_db(series))
-            .execute(db.writer())
-            .await
-            .expect("episode parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("series parent");
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "ParentId" = ?2, "TopParentId" = ?3 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .bind(guid_to_db(library))
+        .execute(db.writer())
+        .await
+        .expect("episode parent");
         for ancestor in [series, library] {
             sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
                 .bind(guid_to_db(episode))
@@ -3639,19 +3655,21 @@ mod tests {
                 .is_empty()
         );
 
-        // Recursive: the episode is reached through the ancestor closure.
-        let recursive = InternalItemsQuery {
-            parent_id: library,
-            recursive: true,
-            include_item_types: vec![BaseItemKind::Episode],
-            ..InternalItemsQuery::default()
-        };
-        let rows = repository
-            .get_item_list(&recursive)
-            .await
-            .expect("recursive");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, guid_to_db(episode));
+        // The library and its series both reach the episode recursively.
+        for parent_id in [library, series] {
+            let recursive = InternalItemsQuery {
+                parent_id,
+                recursive: true,
+                include_item_types: vec![BaseItemKind::Episode],
+                ..InternalItemsQuery::default()
+            };
+            let rows = repository
+                .get_item_list(&recursive)
+                .await
+                .expect("recursive");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, guid_to_db(episode));
+        }
     }
 
     #[tokio::test]
