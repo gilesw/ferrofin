@@ -1412,6 +1412,7 @@ pub(crate) fn scan_save_changes_row(
                     )
                     .is_some();
                 }
+                "Name" | "CleanName" | "SortName" if saved.owner_id.is_some() => new,
                 col if stored.is_locked && LOCKED_PRESERVED_COLUMNS.contains(&col) => old,
                 _ => new,
             };
@@ -2364,14 +2365,23 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if top_parent_ids.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let sql = library_items_sql(top_parent_ids.len());
-        let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
-        for library in top_parent_ids {
-            query = query.bind(guid_to_db(*library));
+        let mut out = Vec::new();
+        for sql in [
+            library_items_sql(top_parent_ids.len()),
+            owned_extra_items_sql(top_parent_ids.len(), 0),
+        ] {
+            let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
+            for library in top_parent_ids {
+                query = query.bind(guid_to_db(*library));
+            }
+            out.extend(path_rows(
+                query.fetch_all(self.db.pool()).await.map_err(db_err)?,
+            ));
         }
-        Ok(Some(
-            path_rows(query.fetch_all(self.db.pool()).await.map_err(db_err)?).collect(),
-        ))
+        // Extras written by older scans may also match their own TopParentId.
+        let mut seen = std::collections::HashSet::with_capacity(out.len());
+        out.retain(|row| seen.insert(row.id));
+        Ok(Some(out))
     }
 
     async fn items_in_scope(
@@ -2390,6 +2400,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             for sql in [
                 items_under_roots_sql(libraries.len(), chunk.len()),
                 pathless_children_sql(libraries.len(), chunk.len()),
+                owned_extra_items_sql(libraries.len(), chunk.len()),
             ] {
                 let mut query = sqlx::query_as::<_, PathRow>(sqlx::AssertSqlSafe(sql.as_str()));
                 for library in &libraries {
@@ -3081,6 +3092,13 @@ fn build_scan_upsert_sql(writes_date_created: bool) -> String {
         } else {
             r#""IsLocked" = 1"#.to_owned()
         };
+        // FindExtras owns the filename-derived display name. The scanner
+        // preserves an explicit Name field lock before handing us the row.
+        let kept = if ["Name", "CleanName", "SortName"].contains(col) {
+            format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+        } else {
+            kept
+        };
         let locked_value = if *col == "Data" {
             LOCKED_DATA_SQL.to_owned()
         } else {
@@ -3531,6 +3549,29 @@ pub(crate) fn items_under_roots_sql(libraries: usize, n: usize) -> String {
     format!(
         r#"SELECT bi."Id", bi."Type", bi."Path", bi."ParentId" FROM "BaseItems" AS bi
             WHERE {terms} AND ({roots})"#
+    )
+}
+
+/// Parentless extras belong to the library through their owner. A full scan
+/// seeks owners by top parent then extras by OwnerId. A scoped scan instead
+/// seeks extras by Path and checks each owner by primary key, so a watcher
+/// event does not walk every owner in the library.
+fn owned_extra_items_sql(libraries: usize, roots: usize) -> String {
+    let tops = numbered_placeholders(libraries);
+    if roots > 0 {
+        let paths = root_terms(libraries, roots).replace("\"Path\"", "e.\"Path\"");
+        return format!(
+            r#"SELECT e."Id", e."Type", e."Path", e."ParentId"
+                FROM "BaseItems" AS e CROSS JOIN "BaseItems" AS p
+                WHERE ({paths}) AND +e."ExtraType" IS NOT NULL
+                  AND p."Id" = e."OwnerId" AND +p."TopParentId" IN ({tops})"#
+        );
+    }
+    format!(
+        r#"SELECT e."Id", e."Type", e."Path", e."ParentId"
+            FROM "BaseItems" AS p CROSS JOIN "BaseItems" AS e
+            WHERE p."TopParentId" IN ({tops}) AND e."OwnerId" = p."Id"
+              AND e."ExtraType" IS NOT NULL"#
     )
 }
 
@@ -5820,6 +5861,11 @@ mod tests {
             } else {
                 r#""IsLocked" = 1"#.to_owned()
             };
+            let kept = if ["Name", "CleanName", "SortName"].contains(col) {
+                format!(r#"({kept}) AND excluded."OwnerId" IS NULL"#)
+            } else {
+                kept
+            };
             let locked_value = if *col == "Data" {
                 super::LOCKED_DATA_SQL.to_owned()
             } else {
@@ -7186,6 +7232,31 @@ mod tests {
             .into_iter()
             .map(|(_, _, _, detail)| detail)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn owned_extra_pruning_seeks_only_its_scope() {
+        let db = test_db().await;
+        for roots in [0, 1, 3] {
+            let plan =
+                query_plan(&db, &super::owned_extra_items_sql(2, roots), 2 + 3 * roots).await;
+            let (owner_key, extra_key) = if roots == 0 {
+                ("TopParentId=?", "OwnerId=?")
+            } else {
+                ("Id=?", "IX_BaseItems_Path")
+            };
+            assert!(
+                plan.iter()
+                    .any(|s| s.contains("SEARCH p") && s.contains(owner_key)),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.contains("SEARCH e") && s.contains(extra_key)),
+                "{plan:?}"
+            );
+            assert!(!plan.iter().any(|s| s.starts_with("SCAN")), "{plan:?}");
+        }
     }
 
     /// Both folder aggregates must reach each folder by its primary key and

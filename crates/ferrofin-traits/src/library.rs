@@ -271,6 +271,21 @@ pub trait LibraryManager: Send + Sync {
     /// Gets a single item row by id, or `None` if it does not exist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
+    /// Resolve the distinct physical owners whose extras an item presents.
+    /// Concrete managers batch movie-version links and grouped-series folders.
+    async fn get_extra_owner_ids_batch(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        Ok(items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, vec![id]))
+            })
+            .collect())
+    }
+
     /// Whether an item with `id` exists.
     ///
     /// Semantically `get_item_by_id(id).is_some()` — which is the default — but
