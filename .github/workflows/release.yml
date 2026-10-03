@@ -153,10 +153,17 @@ jobs:
           img="ghcr.io/$GITHUB_REPOSITORY"
           echo "previous release: $prev"
           docker volume create upg >/dev/null
-          docker run -d --rm --name old -v upg:/data "$img:$prev"
+          # Probe from the runner: release images do not include curl.
+          docker run -d --rm --name old -v upg:/data -p 127.0.0.1:8096:8096 "$img:$prev"
+          ok=
           for _ in $(seq 1 60); do
-            docker exec old curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1 && break; sleep 1
+            if curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1; then ok=1; break; fi
+            docker ps -q --filter name=old | grep -q . || break
+            sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "the $prev image did not become healthy"; docker logs old 2>&1 | tail -20; exit 1
+          fi
           docker rm -f old
           docker run -d --rm --name new -v upg:/data -p 8096:8096 "$img:$GITHUB_REF_NAME"
           ok=
