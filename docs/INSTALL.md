@@ -9,7 +9,7 @@ Jellyfin's own apt repository.
 |---|---|
 | `/usr/bin/ferrofin-server` | the binary (the `.deb` puts it here) |
 | `/etc/ferrofin/config.toml` | configuration ([`docs/CONFIG.md`](CONFIG.md)); a conffile, never overwritten on upgrade |
-| `/usr/lib/systemd/system/ferrofin.service` | the unit ([`contrib/systemd/ferrofin.service`](../contrib/systemd/ferrofin.service)) |
+| `/lib/systemd/system/ferrofin.service` | the unit ([`contrib/systemd/ferrofin.service`](../contrib/systemd/ferrofin.service)) |
 | `/var/lib/ferrofin` | `jellyfin.db`, `cache/` (transcodes), `log/`, `plugins/`, `config/` |
 | `/usr/lib/jellyfin-ffmpeg/` | jellyfin-ffmpeg (`ffmpeg`, `ffprobe`), from the `jellyfin-ffmpeg8` package |
 | `/usr/share/jellyfin/web/` | jellyfin-web's built client, from the `jellyfin-web` package, served at `/web` |

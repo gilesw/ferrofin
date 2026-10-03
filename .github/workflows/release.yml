@@ -280,7 +280,7 @@ jobs:
             test "$(stat -c %U:%G:%a /etc/ferrofin/config.toml)" = "root:ferrofin:640"
             su -s /bin/sh ferrofin -c "test -r /etc/ferrofin/config.toml && test ! -w /etc/ferrofin/config.toml"
             su -s /bin/sh nobody -c "test ! -r /etc/ferrofin/config.toml"
-            test -f /usr/lib/systemd/system/ferrofin.service
+            test -f /lib/systemd/system/ferrofin.service
             su -s /bin/sh ferrofin -c "FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg \
               FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
               /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \

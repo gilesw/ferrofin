@@ -117,10 +117,8 @@ from jellyfin-ffmpeg8 and jellyfin-web."""
 # if the binary needs anything newer. Change both together.
 depends = ["libc6 (>= 2.34)", "adduser", "jellyfin-ffmpeg8", "jellyfin-web"]
 contents = [
-    # /usr/lib, not the /lib alias (lintian aliased-location). Moving it from /lib
-    # within this one package is safe: dpkg will not remove an obsolete path that
-    # resolves to a file the new version installs.
-    { src = "contrib/systemd/ferrofin.service", dst = "/usr/lib/systemd/system/ferrofin.service", file_info = { mode = 420 } },
+    # /lib, where Jellyfin's jellyfin-server package puts its unit too.
+    { src = "contrib/systemd/ferrofin.service", dst = "/lib/systemd/system/ferrofin.service", file_info = { mode = 420 } },
     { src = "contrib/debian/config.toml", dst = "/etc/ferrofin/config.toml", type = "config", file_info = { mode = 416 } },
     { src = "contrib/debian/copyright", dst = "/usr/share/doc/ferrofin/copyright", file_info = { mode = 420 } },
     { src = "README.md", dst = "/usr/share/doc/ferrofin/README.md", file_info = { mode = 420 } },

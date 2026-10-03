@@ -72,7 +72,7 @@ fn render() -> String {
              and plugins.",
         )])
         .control("TP", [])
-        .text([italic("/usr/lib/systemd/system/ferrofin.service")])
+        .text([italic("/lib/systemd/system/ferrofin.service")])
         .text([roman(
             "The systemd unit. The package does not enable or start it.",
         )])
