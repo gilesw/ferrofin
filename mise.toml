@@ -1,6 +1,7 @@
 [tools]
 rust = "1.98.1"
 "cargo:cargo-nfpm" = "0.1.3"
+git-cliff = "2.14.2"
 
 [tasks.deb]
 description = "Build a Debian package for this Linux host"
@@ -8,7 +9,9 @@ run = '''
 set -eu
 mkdir -p dist
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-FERROFIN_VERSION="$version" cargo nfpm package -p ferrofin-server -f deb -o dist/
+export FERROFIN_VERSION="$version"
+contrib/debian/gen-docs.sh
+cargo nfpm package -p ferrofin-server -f deb -o dist/
 find dist -maxdepth 1 -name 'ferrofin_*.deb' -print -quit
 '''
 
@@ -20,6 +23,8 @@ test "$(uname -m)" = "x86_64" || { echo "deb:amd64 must run on an x86_64 Linux h
 cargo build --release -p ferrofin-server
 mkdir -p dist
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-FERROFIN_VERSION="$version" cargo nfpm package --no-build -p ferrofin-server -f deb -o dist/
+export FERROFIN_VERSION="$version"
+contrib/debian/gen-docs.sh
+cargo nfpm package --no-build -p ferrofin-server -f deb -o dist/
 find dist -maxdepth 1 -name 'ferrofin_*.deb' -print -quit
 '''
